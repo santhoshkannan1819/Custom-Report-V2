@@ -1,0 +1,11 @@
+{
+  "title": "Custom Reports V2.0",
+  "description": "Build and customize detailed project reports with an intuitive interface designed for streamlined client collaboration and progress tracking.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

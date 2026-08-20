@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk 'NR==3442,NR==3620' \"/Users/santhoshkannanb/Documents/Claude/Figma Apps/Revamp report building page/src/App.tsx\")"
+    ]
+  }
+}
