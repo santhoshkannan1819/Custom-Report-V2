@@ -4,8 +4,22 @@ import { createPortal } from "react-dom"
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 type FieldType = "number" | "date" | "text" | "person" | "money" | "hours" | "percent" | "boolean"
-type ZoneKey = "columns" | "rows" | "values"
+// The pivot builder's three shelves, plus the tabular builder's two. Distinct keys rather than
+// reusing "columns" for both: a tabular column is a raw record field, a pivot column is a
+// grouping dimension — same word, unrelated behaviour, and modifierOptions has to tell them apart.
+// Kept as two narrow unions so each builder's handlers can index its own field object safely;
+// ZoneKey is the wide union for components (DropZone, FieldChip) that serve both.
+type PivotZoneKey = "columns" | "rows" | "values"
+type TabularZoneKey = "tabColumns" | "tabGroupBy"
+type ZoneKey = PivotZoneKey | TabularZoneKey
 type ReportView = "detail" | "compact"
+// "create" = the builder (source picker, field browser, Columns/Rows/Values drop areas all
+// visible). "view" = the same report rendered read-only-ish, with all of those build-time
+// controls hidden — just the configured table (plus Filters, still shown as-is).
+type ReportMode = "create" | "view"
+// The three things the Analytics nav switches between. Reports is the pivot builder; Tabular is
+// a separate, flat report entity with its own state and saved payload.
+type AppMode = "reports" | "dashboard" | "tabular"
 
 interface Field {
   name: string
@@ -35,9 +49,40 @@ interface PivotFields {
   values: PivotItem[]
 }
 
+// A Tabular report is a flat list of records — one row per record at the report's grain, with
+// the chosen fields as columns. `groupBy` fields render as the LEFTMOST columns, each value
+// shown once spanning the rows that share it. No aggregation anywhere: summarising is what the
+// pivot builder is for.
+interface TabularFields {
+  columns: PivotItem[]
+  groupBy: PivotItem[]
+}
+
 let pivotItemCounter = 0
 function nextPivotItemId(): string {
   return `item-${pivotItemCounter++}`
+}
+
+// Dev only: Vite swaps this module on every hot update, which resets the counter to 0 while the
+// React state that survived the update still holds ids minted from it. The next field dropped
+// would then be handed an id a live chip already owns, and React warns about duplicate keys.
+// Stashing the counter in the HMR data bag carries it across updates so ids stay unique for the
+// life of the tab. No effect on a real page load, where the module is only ever evaluated once.
+const viteHot = (import.meta as { hot?: { data: Record<string, unknown>; dispose: (cb: (data: Record<string, unknown>) => void) => void } }).hot
+if (viteHot) {
+  pivotItemCounter = (viteHot.data.pivotItemCounter as number) ?? 0
+  viteHot.dispose((data) => { data.pivotItemCounter = pivotItemCounter })
+}
+
+// The counter restarts at 0 on every page load, so a restored report would otherwise hand out
+// ids that collide with its own — and with the other report type's, since the pivot and tabular
+// builders both draw from this counter and each restores from its own saved payload. Bumping
+// past everything restored keeps every id unique for the life of the session.
+function reserveItemIds(items: PivotItem[]): void {
+  items.forEach(({ id }) => {
+    const m = /^item-(\d+)$/.exec(id ?? "")
+    if (m) pivotItemCounter = Math.max(pivotItemCounter, Number(m[1]) + 1)
+  })
 }
 
 // ── Timeline metric constants ───────────────────────────────────────────────
@@ -793,11 +838,28 @@ const Ic = {
       <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" /><circle cx="12" cy="12" r="3" />
     </svg>
   ),
-  EyeOff: ({ size = 14 }: { size?: number }) => (
+  Pencil: ({ size = 14 }: { size?: number } = {}) => (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
-      <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
-      <line x1="1" y1="1" x2="23" y2="23" />
+      <path d="M12 20h9" /><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+    </svg>
+  ),
+  Download: ({ size = 14 }: { size?: number } = {}) => (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+    </svg>
+  ),
+  Printer: ({ size = 14 }: { size?: number } = {}) => (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="6 9 6 2 18 2 18 9" />
+      <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" />
+      <rect x="6" y="14" width="12" height="8" />
+    </svg>
+  ),
+  Save: ({ size = 14 }: { size?: number } = {}) => (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+      <polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" />
     </svg>
   ),
   SortIcon: () => (
@@ -2061,6 +2123,45 @@ function rowPassesFilters(grainModule: string, row: Row, rules: FilterRule[]): b
   return true
 }
 
+// ── Tabular (flat) filtering ──────────────────────────────────────────────────────
+// A tabular report lists records, so EVERY filter compares the record's own value — there are
+// no pivot groups to aggregate over. That is the one real semantic difference from the pivot
+// builder, and it has to be explicit: `ruleMatches` above short-circuits numeric rules to true
+// on the promise that applyGroupLevelFilters prunes them later, so reusing it unchanged would
+// leave a tabular numeric filter silently doing nothing.
+function tabularRuleMatches(grainModule: string, row: Row, rule: FilterRule, relativeThreshold?: number): boolean {
+  const raw = resolveFieldForRow(grainModule, row, rule.field, null)
+  if (rule.type === "date") return dateRuleMatches(raw, rule)
+  if (rule.type === "boolean") return booleanRuleMatches(raw, rule)
+  if (isNumericType(rule.type)) return numericRuleMatches(raw, rule, relativeThreshold)
+  return textRuleMatches(raw, rule)
+}
+
+function isRelativeNumericRule(rule: FilterRule): boolean {
+  return isNumericType(rule.type) && (rule.numMode ?? "actual") === "relative"
+}
+
+// Two passes, because Top/Bottom-N can only be judged once the other rules have decided who is
+// in the running: apply every absolute rule first, then rank the survivors per relative rule.
+function filterRowsFlat(grainModule: string, rows: Row[], rules: FilterRule[]): Row[] {
+  const absolute = rules.filter((r) => !isRelativeNumericRule(r))
+  let result = rows.filter((row) => absolute.every((rule) => tabularRuleMatches(grainModule, row, rule)))
+
+  rules.filter(isRelativeNumericRule).forEach((rule) => {
+    const values = result
+      .map((row) => Number(resolveFieldForRow(grainModule, row, rule.field, null)))
+      .filter((n) => !Number.isNaN(n))
+    if (values.length === 0) return
+    const dir = rule.relativeDirection ?? "Top"
+    const sorted = [...values].sort((a, b) => (dir === "Bottom" ? a - b : b - a))
+    const n = Math.min(Math.max(1, Math.floor(rule.relativeN) || 5), sorted.length)
+    const threshold = sorted[n - 1]
+    result = result.filter((row) => tabularRuleMatches(grainModule, row, rule, threshold))
+  })
+
+  return result
+}
+
 // ── Row/column label building (grouping) ──────────────────────────────────────────
 function formatMoneyish(n: number): string {
   if (Math.abs(n) >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
@@ -2363,10 +2464,35 @@ function previewSetMembershipOverlap(
   return { matching, total: groups.length, bestOverlap }
 }
 
+// A View filter's value picker must only offer values that survive the BASE filters — a viewer
+// should never see an option the report's own scope already excluded (picking it would just
+// yield an empty report). Resolves through resolveFieldForRow at the report's real grain, so the
+// list matches how filtering ACTUALLY behaves rather than the raw dataset. Mirrors fieldValues'
+// contract exactly (Yes/No for boolean, null for non-categorical, null when empty) so it's a
+// drop-in override for it.
+//   grainRules  = base + view combined, so the grain matches the report's own
+//   scopeRules  = base only — the narrowing this list must respect
+function relevantFieldValues(
+  source: string, fields: PivotFields, grainRules: FilterRule[], scopeRules: FilterRule[],
+  fieldKey: string, type: FieldType,
+): string[] | null {
+  if (type === "boolean") return ["Yes", "No"]
+  if (type !== "text" && type !== "person") return null
+  const grainModule = pickGrain(source, fields, grainRules)
+  const values = new Set<string>()
+  ;(MODULE_ROWS[grainModule] ?? []).forEach((row) => {
+    if (!rowPassesFilters(grainModule, row, scopeRules)) return
+    const v = resolveFieldForRow(grainModule, row, fieldKey, null)
+    if (v != null && v !== "") values.add(String(v))
+  })
+  return values.size > 0 ? [...values].sort((a, b) => a.localeCompare(b)) : null
+}
+
 // ── Full report computation: filter → group (rows × first column) → aggregate ────────
 interface ComputedReport {
   displayRows: string[][]
   colValues: string[]
+  colTuples: string[][]
   hasColumns: boolean
   hasValues: boolean
   cellNum: (ri: number, ci: number, vi: number) => number
@@ -2380,20 +2506,29 @@ function computeReportData(
   fields: PivotFields,
   aggregations: Record<string, string>,
   filterRules: FilterRule[],
+  viewFilterRules: FilterRule[],
   timelineFilters: Record<string, MetricFilter>,
   rangeConfigs: Record<string, RangeConfig>,
 ): ComputedReport {
-  const grainModule = pickGrain(source, fields, filterRules)
+  // Base Filters are the report's own locked scope; View filters run on top of that result.
+  // Concatenating in THIS order is what encodes the hierarchy: applyGroupLevelFilters narrows
+  // sequentially, so a view-level Top-N ranks only among the groups base filters left standing.
+  const allRules = viewFilterRules.length > 0 ? [...filterRules, ...viewFilterRules] : filterRules
+  const grainModule = pickGrain(source, fields, allRules)
   const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
-  const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, filterRules))
+  const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, allRules))
 
   const rowLabelers = fields.rows.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs))
-  const colItem = fields.columns[0]
-  const colLabeler = colItem ? buildLabeler(grainModule, filteredRows, colItem, aggregations, rangeConfigs) : null
+  // Every Columns field participates. Each distinct combination gets one composite key (joined
+  // for map-lookup purposes) but keeps its per-field label tuple around too (colLabelParts), so
+  // the header can render true nested tiers — one row per Columns field, colSpan-grouped by
+  // shared prefix — instead of flattening into a single joined label.
+  const colLabelers = fields.columns.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs))
 
   const SEP = "␟"
   const comboMap = new Map<string, { combo: string[]; sortTuple: (number | string)[]; cols: Map<string, Row[]> }>()
-  const colLabelSort = new Map<string, number | string>()
+  const colLabelSort = new Map<string, (number | string)[]>()
+  const colLabelParts = new Map<string, string[]>()
 
   filteredRows.forEach((row) => {
     const combo = rowLabelers.map((l) => l.label(row))
@@ -2401,10 +2536,14 @@ function computeReportData(
     const comboKey = combo.join(SEP)
     if (!comboMap.has(comboKey)) comboMap.set(comboKey, { combo, sortTuple, cols: new Map() })
     const entry = comboMap.get(comboKey)!
-    const colLabel = colLabeler ? colLabeler.label(row) : ""
+    const colParts = colLabelers.map((l) => l.label(row))
+    const colLabel = colParts.join(SEP)
     if (!entry.cols.has(colLabel)) entry.cols.set(colLabel, [])
     entry.cols.get(colLabel)!.push(row)
-    if (colLabeler && !colLabelSort.has(colLabel)) colLabelSort.set(colLabel, colLabeler.sortKey(row))
+    if (colLabelers.length > 0 && !colLabelSort.has(colLabel)) {
+      colLabelSort.set(colLabel, colLabelers.map((l) => l.sortKey(row)))
+      colLabelParts.set(colLabel, colParts)
+    }
   })
 
   const compareKey = (a: number | string, b: number | string) =>
@@ -2417,15 +2556,24 @@ function computeReportData(
     }
     return 0
   })
-  const groupLevelRules = filterRules.filter(isGroupLevelFilterRule)
+  const groupLevelRules = allRules.filter(isGroupLevelFilterRule)
   const comboEntries = groupLevelRules.length > 0
     ? applyGroupLevelFilters(sortedEntries, groupLevelRules, grainModule)
     : sortedEntries
   const displayRows = comboEntries.map((e) => e.combo).slice(0, 200)
 
-  const colValues = colLabeler
-    ? [...colLabelSort.entries()].sort((a, b) => compareKey(a[1], b[1])).map(([label]) => label).slice(0, 8)
+  const colValues = colLabelers.length > 0
+    ? [...colLabelSort.entries()].sort((a, b) => {
+        for (let i = 0; i < a[1].length; i++) {
+          const c = compareKey(a[1][i], b[1][i])
+          if (c !== 0) return c
+        }
+        return 0
+      }).map(([label]) => label).slice(0, 8)
     : []
+  // Per-field label tuple for each entry in colValues, same order/index — lets the header
+  // render true nested tiers (one row per Columns field) instead of colValues' joined key.
+  const colTuples = colValues.map((label) => colLabelParts.get(label) ?? [])
 
   const hasColumns = colValues.length > 0
   const hasValues = fields.values.length > 0
@@ -2450,13 +2598,149 @@ function computeReportData(
     , 0)
   )
 
-  return { displayRows, colValues, hasColumns, hasValues, cellNum, grandTotals, bucketRows, grainModule }
+  return { displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, grandTotals, bucketRows, grainModule }
+}
+
+// Groups a sorted list of column-label tuples into per-level colSpan runs for nested pivot
+// headers — level 0 is the outermost tier (the first Columns field), the last level is
+// innermost. Relies on colTuples already being sorted so shared prefixes are contiguous
+// (guaranteed by computeReportData's composite sort over the same field order).
+function buildColumnHeaderTiers(colTuples: string[][]): { label: string; span: number }[][] {
+  const numLevels = colTuples[0]?.length ?? 0
+  const tiers: { label: string; span: number }[][] = []
+  for (let level = 0; level < numLevels; level++) {
+    const row: { label: string; span: number }[] = []
+    let i = 0
+    while (i < colTuples.length) {
+      let j = i + 1
+      while (j < colTuples.length && colTuples[j].slice(0, level + 1).every((v, idx) => v === colTuples[i][idx])) j++
+      row.push({ label: colTuples[i][level], span: j - i })
+      i = j
+    }
+    tiers.push(row)
+  }
+  return tiers
+}
+
+// ── Tabular report computation ────────────────────────────────────────────────────
+
+// Several helpers built for the pivot builder (pickGrain, FieldBrowser, relevantFieldValues,
+// allAddedFields) take a PivotFields and only ever READ the union of its three arrays. Rather
+// than widen all of their signatures — and risk the working pivot path — a tabular report
+// presents itself as one: its columns and its group-by fields, with an empty values shelf.
+function asPivotFields(f: TabularFields): PivotFields {
+  return { columns: f.columns, rows: f.groupBy, values: [] }
+}
+
+const TABULAR_ROW_CAP = 500
+
+interface TabularCell { raw: any; text: string }
+interface TabularRow { groupLabels: string[]; cells: TabularCell[] }
+interface ComputedTabular {
+  grainModule: string
+  rows: TabularRow[]
+  totalCount: number   // before the display cap, so the UI can say "showing X of N"
+}
+
+// One row per record at the report's grain. Group-by fields are labelled with the SAME
+// buildLabeler the pivot uses for row grouping, so date granularity and numeric Range banding
+// behave identically in both builders.
+function computeTabularData(
+  source: string,
+  fields: TabularFields,
+  groupByAggregations: Record<string, string>,
+  filterRules: FilterRule[],
+  viewFilterRules: FilterRule[],
+  rangeConfigs: Record<string, RangeConfig>,
+  fieldFormats: Record<string, FieldFormat>,
+  groupSortDir: "asc" | "desc",
+  showProjectCurrency: boolean,
+): ComputedTabular {
+  // Base filters scope the report; view filters run on top — same ordering as computeReportData.
+  const allRules = viewFilterRules.length > 0 ? [...filterRules, ...viewFilterRules] : filterRules
+  const pivotShape = asPivotFields(fields)
+  const grainModule = pickGrain(source, pivotShape, allRules)
+  const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
+  const filtered = filterRowsFlat(grainModule, allRows, allRules)
+
+  const groupLabelers = fields.groupBy.map((item) =>
+    buildLabeler(grainModule, filtered, item, groupByAggregations, rangeConfigs))
+
+  const compareKey = (a: number | string, b: number | string) =>
+    typeof a === "number" && typeof b === "number" ? a - b : String(a).localeCompare(String(b))
+
+  // Sort by the group tuple so rows sharing a group are contiguous — that contiguity is what
+  // lets the renderer span a group's label cell down its rows.
+  const decorated = filtered.map((row) => ({
+    row,
+    labels: groupLabelers.map((l) => l.label(row)),
+    sortKeys: groupLabelers.map((l) => l.sortKey(row)),
+  }))
+  if (groupLabelers.length > 0) {
+    const dir = groupSortDir === "desc" ? -1 : 1
+    decorated.sort((a, b) => {
+      for (let i = 0; i < a.sortKeys.length; i++) {
+        const c = compareKey(a.sortKeys[i], b.sortKeys[i])
+        if (c !== 0) return c * dir
+      }
+      return 0
+    })
+  }
+
+  const rows: TabularRow[] = decorated.slice(0, TABULAR_ROW_CAP).map(({ row, labels }) => ({
+    groupLabels: labels,
+    cells: fields.columns.map((item) => {
+      const raw = resolveFieldForRow(grainModule, row, item.field, null)
+      let text = tabularCellText(raw, item, fieldFormats)
+      // Simpler than the pivot's version of this setting: a tabular row IS one record, so its
+      // currency is unambiguous — no mixed-currency group to suppress the tag for.
+      if (showProjectCurrency && text !== "" && getFieldType(item.field) === "money") {
+        const cur = resolveFieldForRow(grainModule, row, "Project::Project currency", null)
+        if (cur != null && cur !== "") text += ` ${cur}`
+      }
+      return { raw, text }
+    }),
+  }))
+
+  return { grainModule, rows, totalCount: decorated.length }
+}
+
+// formatCellValue only knows numbers, and a flat table shows dates, text and booleans too —
+// so non-numeric values get sensible plain rendering and skip the numeric formatter entirely.
+function tabularCellText(raw: any, item: PivotItem, fieldFormats: Record<string, FieldFormat>): string {
+  if (raw == null || raw === "") return ""
+  const type = getFieldType(item.field)
+  if (isNumericType(type)) {
+    const n = Number(raw)
+    return Number.isNaN(n) ? String(raw) : formatCellValue(n, fieldFormats[item.id])
+  }
+  if (type === "boolean") return raw ? "Yes" : "No"
+  if (type === "date") {
+    const d = raw instanceof Date ? raw : new Date(raw)
+    return Number.isNaN(d.getTime()) ? String(raw) : d.toISOString().slice(0, 10)
+  }
+  return String(raw)
+}
+
+// A numeric view filter in a flat report slides over the records' own values, not over
+// per-group aggregates — the flat counterpart to previewGroupAggregates. Mirrors
+// relevantFieldValues' shape: grain from all rules, narrowing from the base rules only.
+function flatFieldNumericValues(
+  source: string, fields: PivotFields, grainRules: FilterRule[], scopeRules: FilterRule[], fieldKey: string,
+): number[] {
+  const grainModule = pickGrain(source, fields, grainRules)
+  const out: number[] = []
+  filterRowsFlat(grainModule, MODULE_ROWS[grainModule] ?? [], scopeRules).forEach((row) => {
+    const n = Number(resolveFieldForRow(grainModule, row, fieldKey, null))
+    if (!Number.isNaN(n)) out.push(n)
+  })
+  return out
 }
 
 
 // ── Left nav ───────────────────────────────────────────────────────────────────
 
-function LeftNav({ appMode, setAppMode }: { appMode: string; setAppMode: (m: "reports" | "dashboard") => void }) {
+function LeftNav({ appMode, setAppMode }: { appMode: string; setAppMode: (m: AppMode) => void }) {
   const [showMenu, setShowMenu] = useState(false)
 
   return (
@@ -2508,6 +2792,17 @@ function LeftNav({ appMode, setAppMode }: { appMode: string; setAppMode: (m: "re
                 Reports
                 {appMode === "reports" && <span className="ml-auto w-1.5 h-1.5 rounded-full bg-indigo-400" />}
               </button>
+              <button
+                onClick={() => { setAppMode("tabular"); setShowMenu(false) }}
+                className={`flex items-center gap-3 w-full px-4 py-3 text-[14px] transition-colors hover:bg-white/10
+                  ${appMode === "tabular" ? "text-white font-semibold" : "text-gray-200"}`}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M10 9v12"/>
+                </svg>
+                Tabular
+                {appMode === "tabular" && <span className="ml-auto w-1.5 h-1.5 rounded-full bg-indigo-400" />}
+              </button>
             </div>
           </>
         )}
@@ -2529,6 +2824,56 @@ function LeftNav({ appMode, setAppMode }: { appMode: string; setAppMode: (m: "re
   )
 }
 
+// ── Export ─────────────────────────────────────────────────────────────────────
+
+// Serializes the rendered report table to a grid, honouring colSpan/rowSpan so nested column
+// tiers and Detail view's spanning row labels land in the right cells. Reading the DOM rather
+// than re-deriving from computeReportData is deliberate: the export then matches exactly what
+// the user is looking at — same layout, same formatting, same totals — with no second
+// implementation to drift.
+function reportTableToGrid(table: HTMLTableElement): string[][] {
+  const grid: string[][] = []
+  Array.from(table.rows).forEach((tr, r) => {
+    if (!grid[r]) grid[r] = []
+    let c = 0
+    Array.from(tr.cells).forEach((cell) => {
+      while (grid[r][c] !== undefined) c++
+      const text = (cell.innerText || "").replace(/\s+/g, " ").trim()
+      for (let i = 0; i < cell.rowSpan; i++) {
+        for (let j = 0; j < cell.colSpan; j++) {
+          if (!grid[r + i]) grid[r + i] = []
+          // Only the origin cell carries the text; the cells it spans stay blank so columns
+          // still line up in a spreadsheet.
+          grid[r + i][c + j] = i === 0 && j === 0 ? text : ""
+        }
+      }
+      c += cell.colSpan
+    })
+  })
+  return grid.map((row) => Array.from(row, (v) => v ?? ""))
+}
+
+function csvEscape(v: string): string {
+  return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v
+}
+
+function exportReportCsv(): boolean {
+  const table = document.querySelector<HTMLTableElement>("[data-report-table]")
+  if (!table) return false
+  const csv = reportTableToGrid(table).map((row) => row.map(csvEscape).join(",")).join("\r\n")
+  // BOM so Excel opens UTF-8 correctly instead of mangling accented names.
+  const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8;" })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement("a")
+  a.href = url
+  a.download = `custom-report-${new Date().toISOString().slice(0, 10)}.csv`
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+  return true
+}
+
 function NavBtn({ children, label, active = false, nav = false }: {
   children: React.ReactNode; label: string; active?: boolean; nav?: boolean
 }) {
@@ -2546,20 +2891,107 @@ function NavBtn({ children, label, active = false, nav = false }: {
 
 // ── Page header ────────────────────────────────────────────────────────────────
 
-function PageHeader() {
+function PageHeader({ reportMode, onReportModeChange, onSave, justSaved }: {
+  reportMode: ReportMode
+  onReportModeChange: (m: ReportMode) => void
+  onSave: () => void
+  justSaved: boolean
+}) {
+  const [showExport, setShowExport] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
+  const exportBtnRef = useRef<HTMLButtonElement>(null)
   return (
-    <div className="flex items-center justify-between px-5 pt-3.5 pb-3 border-b border-gray-200 bg-white">
+    <div className="flex items-center justify-between px-5 pt-3.5 pb-3 border-b border-gray-200 bg-white print-hide">
       <div>
         <p className="text-[10px] font-semibold text-indigo-500 mb-0.5 tracking-widest uppercase">Reports</p>
         <h1 className="text-[22px] font-semibold text-gray-900 leading-tight">Custom Reports V2.0</h1>
+        {exportError && (
+          <p className="text-[11px] text-amber-600 mt-0.5">
+            {exportError}{" "}
+            <button onClick={() => setExportError(null)} className="underline hover:text-amber-700">Dismiss</button>
+          </p>
+        )}
       </div>
       <div className="flex items-center gap-2">
-        <button className="flex items-center gap-1.5 text-[13px] text-gray-600 border border-gray-200 rounded-md px-3 py-1.5 bg-white hover:bg-gray-50 hover:shadow-sm transition-all">
-          <Ic.Globe /><span>Visibility</span>
-        </button>
-        <button className="flex items-center gap-1.5 text-[13px] text-white bg-gray-900 rounded-md px-3 py-1.5 shadow-sm hover:bg-gray-800 hover:shadow transition-all font-medium">
-          <Ic.Sidebar /><span>Create</span>
-        </button>
+        {/* Export is a consumption action, not a build one — it appears once the builder has
+            switched into view mode, where the report is finished and being read. */}
+        {reportMode === "view" && (
+        <div className="relative">
+          <button
+            ref={exportBtnRef}
+            onClick={() => setShowExport((p) => !p)}
+            title="Export this report"
+            className={`flex items-center gap-1.5 text-[13px] border rounded-md px-3 py-1.5 transition-all
+              ${showExport
+                ? "text-indigo-600 border-indigo-300 bg-indigo-50"
+                : "text-gray-600 border-gray-200 bg-white hover:bg-gray-50 hover:shadow-sm"}`}
+          >
+            <Ic.Download size={14} /><span>Export</span><Ic.ChevDown size={10} />
+          </button>
+          {showExport && (
+            <ChipPortalMenu anchorRef={exportBtnRef} onClose={() => setShowExport(false)}>
+              <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl py-1 w-56 overflow-hidden">
+                <button
+                  onClick={() => {
+                    // Exports exactly what's rendered — current filters, formatting and layout all
+                    // already applied, so there's nothing to keep in sync.
+                    if (!exportReportCsv()) setExportError("Nothing to export yet — build a report first.")
+                    else setExportError(null)
+                    setShowExport(false)
+                  }}
+                  className="flex items-start gap-2.5 w-full px-3 py-2 text-left hover:bg-indigo-50 transition-colors"
+                >
+                  <span className="text-gray-400 mt-0.5"><Ic.Download size={13} /></span>
+                  <span>
+                    <span className="block text-[13px] text-gray-800">Download CSV</span>
+                    <span className="block text-[11px] text-gray-400 leading-snug">The table as shown, for Excel or Sheets.</span>
+                  </span>
+                </button>
+                <button
+                  onClick={() => { setShowExport(false); setTimeout(() => window.print(), 0) }}
+                  className="flex items-start gap-2.5 w-full px-3 py-2 text-left hover:bg-indigo-50 transition-colors"
+                >
+                  <span className="text-gray-400 mt-0.5"><Ic.Printer size={13} /></span>
+                  <span>
+                    <span className="block text-[13px] text-gray-800">Print / Save as PDF</span>
+                    <span className="block text-[11px] text-gray-400 leading-snug">Opens your print dialog — choose "Save as PDF".</span>
+                  </span>
+                </button>
+              </div>
+            </ChipPortalMenu>
+          )}
+        </div>
+        )}
+        {reportMode === "create" && (
+          <button
+            onClick={onSave}
+            title="Save this report's fields, filters, and formatting"
+            className={`flex items-center gap-1.5 text-[13px] rounded-md px-3 py-1.5 shadow-sm transition-all font-medium
+              ${justSaved
+                ? "text-emerald-600 border border-emerald-200 bg-emerald-50"
+                : "text-gray-600 border border-gray-200 bg-white hover:bg-gray-50 hover:shadow-sm"}`}
+          >
+            {justSaved ? <Ic.Check /> : <Ic.Save size={14} />}
+            <span>{justSaved ? "Saved" : "Save"}</span>
+          </button>
+        )}
+        {reportMode === "create" ? (
+          <button
+            onClick={() => onReportModeChange("view")}
+            title="Switch to view mode — hides the source picker, field browser, and Columns/Rows/Values drop areas"
+            className="flex items-center gap-1.5 text-[13px] text-white bg-gray-900 rounded-md px-3 py-1.5 shadow-sm hover:bg-gray-800 hover:shadow transition-all font-medium"
+          >
+            <Ic.Eye size={14} /><span>View</span>
+          </button>
+        ) : (
+          <button
+            onClick={() => onReportModeChange("create")}
+            title="Back to edit mode"
+            className="flex items-center gap-1.5 text-[13px] text-white bg-gray-900 rounded-md px-3 py-1.5 shadow-sm hover:bg-gray-800 hover:shadow transition-all font-medium"
+          >
+            <Ic.Pencil size={14} /><span>Edit</span>
+          </button>
+        )}
       </div>
     </div>
   )
@@ -2567,7 +2999,7 @@ function PageHeader() {
 
 // ── Toolbar ────────────────────────────────────────────────────────────────────
 
-function Toolbar({ source, setSource, fields, lookupRoles, onLookupRoleChange, reportView, onReportViewChange, showTotals, onShowTotalsChange, fieldFormats, onFieldFormatChange, showModuleTag, onShowModuleTagChange, showProjectCurrency, onShowProjectCurrencyChange }: {
+function Toolbar({ source, setSource, fields, lookupRoles, onLookupRoleChange, reportView, onReportViewChange, showTotals, onShowTotalsChange, fieldFormats, onFieldFormatChange, showModuleTag, onShowModuleTagChange, showProjectCurrency, onShowProjectCurrencyChange, reportMode }: {
   source: string; setSource: (s: string) => void
   fields: PivotFields
   lookupRoles: Record<string, string>
@@ -2582,45 +3014,50 @@ function Toolbar({ source, setSource, fields, lookupRoles, onLookupRoleChange, r
   onShowModuleTagChange: (v: boolean) => void
   showProjectCurrency: boolean
   onShowProjectCurrencyChange: (v: boolean) => void
+  reportMode: ReportMode
 }) {
   const [open, setOpen] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   return (
-    <div className="flex items-center gap-3 px-5 py-2 border-b border-gray-200 bg-white text-[13px]">
-      {/* Source chooser */}
-      <div className="relative">
-        <button
-          onClick={() => setOpen((p) => !p)}
-          className="flex items-center gap-1.5 text-gray-700 pr-3 border-r border-gray-200 hover:text-gray-900 transition-colors"
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-            <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
-          </svg>
-          <span className="font-semibold">{source}</span>
-          <Ic.ChevDown size={12} />
-        </button>
-        {open && (
-          <>
-            <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-            <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-xl py-1 w-44">
-              <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-3 pt-2 pb-1">Source</p>
-              {SOURCE_OPTIONS.map((opt) => (
-                <button
-                  key={opt}
-                  onClick={() => { setSource(opt); setOpen(false) }}
-                  className={`flex items-center justify-between w-full px-3 py-1.5 text-[13px] hover:bg-indigo-50 transition-colors
-                    ${source === opt ? "text-indigo-600 font-medium" : "text-gray-700"}`}
-                >
-                  {opt}
-                  {source === opt && <Ic.Check />}
-                </button>
-              ))}
-            </div>
-          </>
-        )}
-      </div>
+    <div className="flex items-center gap-3 px-5 py-2 border-b border-gray-200 bg-white text-[13px] print-hide">
+      {/* Source chooser + Lookups — build-time-only, hidden in view mode */}
+      {reportMode === "create" && (
+        <>
+          <div className="relative">
+            <button
+              onClick={() => setOpen((p) => !p)}
+              className="flex items-center gap-1.5 text-gray-700 pr-3 border-r border-gray-200 hover:text-gray-900 transition-colors"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
+              </svg>
+              <span className="font-semibold">{source}</span>
+              <Ic.ChevDown size={12} />
+            </button>
+            {open && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+                <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-xl py-1 w-44">
+                  <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-3 pt-2 pb-1">Source</p>
+                  {SOURCE_OPTIONS.map((opt) => (
+                    <button
+                      key={opt}
+                      onClick={() => { setSource(opt); setOpen(false) }}
+                      className={`flex items-center justify-between w-full px-3 py-1.5 text-[13px] hover:bg-indigo-50 transition-colors
+                        ${source === opt ? "text-indigo-600 font-medium" : "text-gray-700"}`}
+                    >
+                      {opt}
+                      {source === opt && <Ic.Check />}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
 
-      <LookupsControl fields={fields} lookupRoles={lookupRoles} onChange={onLookupRoleChange} />
+          <LookupsControl fields={fields} lookupRoles={lookupRoles} onChange={onLookupRoleChange} />
+        </>
+      )}
 
       <div className="flex items-center gap-1 ml-auto">
         {/* Compact / Detail view toggle — also in the settings panel; both stay in sync */}
@@ -3041,8 +3478,8 @@ function FieldBrowser({
 }: {
   fields: PivotFields
   source: string
-  onAdd: (zone: ZoneKey, field: string, type: FieldType) => void
-  onRemove: (zone: ZoneKey, id: string) => void
+  onAdd: (zone: PivotZoneKey, field: string, type: FieldType) => void
+  onRemove: (zone: PivotZoneKey, id: string) => void
   onDupAlert: (field: string, count: number) => void
   onDragStart: (field: string, type: FieldType) => void
   onDragEnd: () => void
@@ -3114,12 +3551,12 @@ function FieldBrowser({
       return
     }
     if (count === 1) {
-      for (const z of ["columns", "rows", "values"] as ZoneKey[]) {
+      for (const z of ["columns", "rows", "values"] as PivotZoneKey[]) {
         const item = fields[z].find((it) => it.field === key)
         if (item) { onRemove(z, item.id); break }
       }
     } else {
-      const zone: ZoneKey = isNumericType(field.type) ? "values" : "rows"
+      const zone: PivotZoneKey = isNumericType(field.type) ? "values" : "rows"
       onAdd(zone, key, field.type)
     }
   }
@@ -3398,10 +3835,10 @@ interface DropZoneBarProps {
   timelineFilters: Record<string, MetricFilter>
   rangeConfigs: Record<string, RangeConfig>
   fieldFormats: Record<string, FieldFormat>
-  onDrop: (zone: ZoneKey, field: string, type: FieldType) => void
-  onMove: (from: ZoneKey, to: ZoneKey, id: string) => void
-  onReorder: (zone: ZoneKey, id: string, toIndex: number) => void
-  onRemove: (zone: ZoneKey, id: string) => void
+  onDrop: (zone: PivotZoneKey, field: string, type: FieldType) => void
+  onMove: (from: PivotZoneKey, to: PivotZoneKey, id: string) => void
+  onReorder: (zone: PivotZoneKey, id: string, toIndex: number) => void
+  onRemove: (zone: PivotZoneKey, id: string) => void
   onAggChange: (id: string, agg: string) => void
   onTimelineChange: (id: string, f: MetricFilter | null) => void
   onRangeConfigChange: (id: string, cfg: RangeConfig) => void
@@ -3411,14 +3848,14 @@ interface DropZoneBarProps {
 function DropZoneBar(props: DropZoneBarProps) {
   const { fields, dragging, dragType, aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange } = props
 
-  const zones: { key: ZoneKey; label: string; suggestValues?: boolean }[] = [
+  const zones: { key: PivotZoneKey; label: string; suggestValues?: boolean }[] = [
     { key: "columns", label: "Columns" },
     { key: "rows", label: "Rows" },
     { key: "values", label: "Values", suggestValues: true },
   ]
 
   return (
-    <div className="flex gap-3 border-b border-gray-200 bg-white px-3 py-3 h-[192px] shrink-0">
+    <div className="flex gap-3 border-b border-gray-200 bg-white px-3 py-3 h-[192px] shrink-0 print-hide">
       {zones.map(({ key, label, suggestValues }) => (
         <DropZone
           key={key}
@@ -3445,19 +3882,22 @@ function DropZoneBar(props: DropZoneBarProps) {
   )
 }
 
-function DropZone({
+// Generic over its zone key so each builder keeps its own narrow zone union end to end — the
+// pivot's handlers index PivotFields, the tabular one's index TabularFields, and neither can be
+// handed the other's zone by mistake.
+function DropZone<Z extends ZoneKey>({
   zone, label, chips, dragging, isSuggested,
   aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange,
 }: {
-  zone: ZoneKey; label: string; chips: PivotItem[]; dragging: boolean
+  zone: Z; label: string; chips: PivotItem[]; dragging: boolean
   isSuggested: boolean; aggregations: Record<string, string>
   timelineFilters: Record<string, MetricFilter>
   rangeConfigs: Record<string, RangeConfig>
   fieldFormats: Record<string, FieldFormat>
-  onDrop: (zone: ZoneKey, field: string, type: FieldType) => void
-  onMove: (from: ZoneKey, to: ZoneKey, id: string) => void
-  onReorder: (zone: ZoneKey, id: string, toIndex: number) => void
-  onRemove: (zone: ZoneKey, id: string) => void
+  onDrop: (zone: Z, field: string, type: FieldType) => void
+  onMove: (from: Z, to: Z, id: string) => void
+  onReorder: (zone: Z, id: string, toIndex: number) => void
+  onRemove: (zone: Z, id: string) => void
   onAggChange: (id: string, agg: string) => void
   onTimelineChange: (id: string, f: MetricFilter | null) => void
   onRangeConfigChange: (id: string, cfg: RangeConfig) => void
@@ -3468,7 +3908,7 @@ function DropZone({
 
   const parseField = (e: React.DragEvent) =>
     JSON.parse(e.dataTransfer.getData("application/field")) as {
-      id?: string; field: string; type: FieldType; fromZone?: ZoneKey
+      id?: string; field: string; type: FieldType; fromZone?: Z
     }
 
   const handleZoneDragOver = (e: React.DragEvent) => { e.preventDefault(); setOver(true) }
@@ -3595,11 +4035,14 @@ function modifierOptions(zone: ZoneKey, fieldType: FieldType): string[] | null {
     if (isNumericType(fieldType)) return AGG_OPTIONS
     return ["Count", "Distinct Count"]
   }
-  if (zone === "columns" || zone === "rows") {
+  // A tabular column shows the record's own value — nothing to modify.
+  if (zone === "tabColumns") return null
+  if (zone === "columns" || zone === "rows" || zone === "tabGroupBy") {
+    // Grouping a measure is only meaningful as exact values or bands, in either builder.
     if (isNumericType(fieldType)) return ["Dimension", "Range"]
     if (fieldType === "date") return null // handled separately with date granularity picker
   }
-  return null // text / person / boolean in rows or columns: no badge
+  return null // text / person / boolean used for grouping: no badge
 }
 
 function MetricDatePicker({ filter, onChange, onClose }: {
@@ -3873,7 +4316,11 @@ function FieldChip({ id, name, zone, modifier, timelineFilter, rangeConfig, fiel
   const formatBtnRef = useRef<HTMLButtonElement>(null)
   const fieldType = getFieldType(name)
   const options = modifierOptions(zone, fieldType)
-  const isDateDimension = (zone === "columns" || zone === "rows") && fieldType === "date"
+  const isDateDimension = (zone === "columns" || zone === "rows" || zone === "tabGroupBy") && fieldType === "date"
+  // A flat table has no Values shelf, so a tabular column's default alignment follows the field
+  // type instead: measures right, everything else left.
+  const defaultAlign: "left" | "right" =
+    zone === "values" || (zone === "tabColumns" && isNumericType(fieldType)) ? "right" : "left"
   const hasBadge = options !== null || isDateDimension
   const isTimelineMetric = zone === "values" && TIMELINE_METRICS_SET.has(name)
 
@@ -3972,7 +4419,7 @@ function FieldChip({ id, name, zone, modifier, timelineFilter, rangeConfig, fiel
           <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-xl p-2.5 w-72">
             <FieldFormatFields
               item={{ id, field: name }}
-              defaultAlign={zone === "values" ? "right" : "left"}
+              defaultAlign={defaultAlign}
               format={fieldFormat ?? DEFAULT_FIELD_FORMAT}
               onChange={onFieldFormatChange}
             />
@@ -4124,6 +4571,60 @@ interface FilterRule {
   numMode: "actual" | "range" | "relative"
   relativeDirection: "Top" | "Bottom"
   relativeN: number
+  // ── View-filter presentation ──────────────────────────────────────────────────
+  // Only meaningful for a rule in the View filters pane, which renders as an always-visible
+  // inline control rather than a chip + modal. Harmless defaults on a base-Filters rule.
+  // Deliberately narrower than the base filter modals: no wildcard, no single-value slider,
+  // no Top-N — a viewer picks values or a range, nothing more.
+  vfDisplayName: string                       // "" = use the field's own name
+  vfComponent: ViewFilterComponent | ""       // "" = the field type's default component
+  vfListMode: "all" | "selected"              // offer every value, or only vfOfferedValues
+  vfOfferedValues: string[]                   // the builder's allow-list when vfListMode="selected"
+}
+
+// How a view filter draws itself. The first group applies to text/person/boolean/date fields,
+// the second to numeric ones; `viewFilterComponents` maps a field type to its valid options.
+type ViewFilterComponent =
+  | "singleList" | "singleDropdown" | "multiList" | "multiDropdown" | "multiCustomList"
+  | "sliderDouble" | "multiSelectBox"
+
+const VF_CATEGORICAL_COMPONENTS: { key: ViewFilterComponent; label: string }[] = [
+  { key: "singleList", label: "Single Value (list)" },
+  { key: "singleDropdown", label: "Single Value (dropdown)" },
+  { key: "multiList", label: "Multiple Values (list)" },
+  { key: "multiDropdown", label: "Multiple Values (dropdown)" },
+  { key: "multiCustomList", label: "Multiple Values (custom list)" },
+]
+const VF_NUMERIC_COMPONENTS: { key: ViewFilterComponent; label: string }[] = [
+  { key: "sliderDouble", label: "Slider-Double" },
+  { key: "multiSelectBox", label: "Multi Select Box" },
+]
+// A date's values are period labels, so it reuses the same select/list widgets under the
+// reference's "…Select Box" naming. Which periods those are comes from the granularity
+// dropdown; whether the viewer picks periods at all comes from dateMode (see VF_DATE_PERIODS).
+const VF_DATE_COMPONENTS: { key: ViewFilterComponent; label: string }[] = [
+  { key: "singleDropdown", label: "Single Select Box" },
+  { key: "multiList", label: "Multi Select Box" },
+]
+
+// A date filter's "period type" — the app's existing dateMode, surfaced under the reference's
+// wording. "Actual Period" picks named periods; the other two need no value list at all.
+const VF_DATE_PERIODS: { key: "actual" | "relative" | "range"; label: string }[] = [
+  { key: "actual", label: "Actual Period" },
+  { key: "relative", label: "Relative Period" },
+  { key: "range", label: "Range" },
+]
+
+function viewFilterComponents(type: FieldType): { key: ViewFilterComponent; label: string }[] {
+  if (isNumericType(type)) return VF_NUMERIC_COMPONENTS
+  if (type === "date") return VF_DATE_COMPONENTS
+  return VF_CATEGORICAL_COMPONENTS
+}
+
+// The component actually in force: the builder's explicit pick, else the type's default.
+function resolveViewFilterComponent(rule: FilterRule): ViewFilterComponent {
+  if (rule.vfComponent) return rule.vfComponent
+  return isNumericType(rule.type) ? "sliderDouble" : "multiList"
 }
 
 // Categorical (text/person) "Wildcard" tab match types — one condition row per entry,
@@ -4192,6 +4693,25 @@ function filterIsRange(operator: FilterOperator): boolean {
   return operator === "between" || operator === "is between"
 }
 
+// A freshly-dropped filter's defaults. Shared by both filter lists — the report's own base
+// Filters and the View filters a viewer can tweak — so the two can never drift apart on what
+// an unconfigured rule means.
+function makeFilterRule(name: string, type: FieldType): FilterRule {
+  const ops = filterOperators(type)
+  return {
+    field: name, type, operator: ops[0], value: "", value2: "", values: [],
+    dateMode: "actual", dateGranularity: "Month & Year",
+    dateRangeOp: "after", dateFrom: "", dateTo: "",
+    dateRelativeOpt: "", dateRelativeN: 1, dateIncludeNull: false,
+    catMode: "actual", catMatchMode: "any",
+    wildcardConditions: [{ matchType: "Contains", value: "" }], wildcardIncludeEmpty: true,
+    catTreatment: "categorical",
+    numFunction: isNumericType(type) ? "Sum" : "Count",
+    numMode: "actual", relativeDirection: "Top", relativeN: 5,
+    vfDisplayName: "", vfComponent: "", vfListMode: "all", vfOfferedValues: [],
+  }
+}
+
 function DupFieldAlert({ name, count, onClose }: { name: string; count: number; onClose: () => void }) {
   return createPortal(
     <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/30">
@@ -4227,6 +4747,43 @@ function DupFieldAlert({ name, count, onClose }: { name: string; count: number; 
 
 // Shown when the user tries to drop a field into Filters before the report has any
 // Columns/Rows/Values field yet — a filter with nothing to filter isn't meaningful.
+// A tabular report lists one row per record, so a field can only earn one column. Dropping a
+// field that is already on the other shelf is refused outright rather than silently ignored —
+// the user needs to know where the existing copy lives so they can move it if that's the intent.
+function FieldAlreadyUsedAlert({ name, zone, onClose }: { name: string; zone: string; onClose: () => void }) {
+  return createPortal(
+    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/30">
+      <div className="bg-white rounded-2xl shadow-2xl w-[420px] overflow-hidden border-t-4 border-amber-400">
+        <div className="flex items-start gap-4 p-6 pb-4">
+          <div className="shrink-0 w-10 h-10 rounded-full border-2 border-amber-400 flex items-center justify-center text-amber-500">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+              <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+              <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+          </div>
+          <div>
+            <p className="text-[15px] font-bold text-gray-900 mb-1">Field already in use</p>
+            <p className="text-[13px] text-gray-600 leading-relaxed">
+              &ldquo;{name}&rdquo; is already in <strong className="font-semibold text-gray-800">{zone}</strong>. A field
+              can only be used once in a tabular report &mdash; drag it across if you want it there instead.
+            </p>
+          </div>
+        </div>
+        <div className="px-6 pb-5 flex justify-center">
+          <button
+            onClick={onClose}
+            className="px-10 py-2 bg-indigo-600 text-white text-[13px] font-semibold rounded-lg
+              hover:bg-indigo-700 transition-colors border-2 border-indigo-400"
+          >
+            OK
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  )
+}
+
 function FilterNeedsFieldAlert({ onClose }: { onClose: () => void }) {
   return createPortal(
     <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/30">
@@ -4596,13 +5153,20 @@ function DateFilterModal({ rule, onChange, onClose }: {
 // Mirrors DateFilterModal's structure (portalled backdrop + centered card, tab pills in
 // the header, Apply/Clear footer) so the two "big modal" filter experiences feel like one
 // consistent system rather than two unrelated ones.
-function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, rangeConfigs, onChange, onClose }: {
+function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, rangeConfigs, valueOptions, flat, onChange, onClose }: {
   rule: FilterRule
   allRules: FilterRule[]
   source: string
   fields: PivotFields
   aggregations: Record<string, string>
   rangeConfigs: Record<string, RangeConfig>
+  // Optional override for the Actual-tab value list — View filters pass the base-filtered
+  // subset so a viewer is never offered a value the report's own scope already excluded.
+  valueOptions?: string[] | null
+  // Flat (tabular) mode: one value per record, so the Count / Distinct-Count treatments and the
+  // "all of" / "only" set operators have no meaning — they'd degenerate silently. Hidden, not
+  // reinterpreted.
+  flat?: boolean
   onChange: (patch: Partial<FilterRule>) => void
   onClose: () => void
 }) {
@@ -4641,7 +5205,7 @@ function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, 
   const relativeDirection = rule.relativeDirection ?? "Top"
   const [search, setSearch] = useState("")
 
-  const allValues = fieldValues(rule.field, rule.type) ?? []
+  const allValues = (valueOptions !== undefined ? valueOptions : fieldValues(rule.field, rule.type)) ?? []
   const filteredOptions = allValues.filter((v) => v.toLowerCase().includes(search.toLowerCase()))
 
   const toggleValue = (v: string) => {
@@ -4725,11 +5289,13 @@ function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, 
         <div className="flex items-center gap-2.5 px-5 py-4 border-b border-gray-100">
           {fieldTypeIcon(rule.type, 15)}
           <span className="text-[15px] font-semibold text-gray-900">{fieldDisplayName(rule.field)}</span>
-          <div className="flex items-center gap-1 ml-4">
-            {treatmentButton("Categorical", "categorical")}
-            {treatmentButton("Count", "count")}
-            {treatmentButton("Distinct Count", "distinctCount")}
-          </div>
+          {!flat && (
+            <div className="flex items-center gap-1 ml-4">
+              {treatmentButton("Categorical", "categorical")}
+              {treatmentButton("Count", "count")}
+              {treatmentButton("Distinct Count", "distinctCount")}
+            </div>
+          )}
           <button onClick={onClose} className="ml-auto text-gray-400 hover:text-gray-700 transition-colors p-1 rounded-lg hover:bg-gray-100">
             <Ic.X size={14} />
           </button>
@@ -4788,7 +5354,7 @@ function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, 
                   {showMatchModeMenu && (
                     <ChipPortalMenu anchorRef={matchModeBtnRef} onClose={() => setShowMatchModeMenu(false)}>
                       <div className="bg-white border border-gray-200 rounded-lg shadow-xl py-1 w-40 mt-1">
-                        {(["any", "none", "all", "only"] as const).map((key) => (
+                        {((flat ? ["any", "none"] : ["any", "none", "all", "only"]) as ("any" | "none" | "all" | "only")[]).map((key) => (
                           <button
                             key={key}
                             onClick={() => { onChange({ catMatchMode: key }); setShowMatchModeMenu(false) }}
@@ -5008,13 +5574,16 @@ function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, 
 // the field (see applyGroupLevelFilters), never the field's own raw per-row value. "Actual" /
 // "Range" / "Relative" (secondary, subdued) then work the same way CategoricalFilterModal's
 // Count/Distinct-Count tabs do, sourced from a live preview of the current grouping.
-function NumericFilterModal({ rule, allRules, source, fields, aggregations, rangeConfigs, onChange, onClose }: {
+function NumericFilterModal({ rule, allRules, source, fields, aggregations, rangeConfigs, flat, onChange, onClose }: {
   rule: FilterRule
   allRules: FilterRule[]
   source: string
   fields: PivotFields
   aggregations: Record<string, string>
   rangeConfigs: Record<string, RangeConfig>
+  // Flat (tabular) mode: the filter compares the record's own value, so there is no aggregate
+  // function to choose and the value list comes from the records themselves.
+  flat?: boolean
   onChange: (patch: Partial<FilterRule>) => void
   onClose: () => void
 }) {
@@ -5025,7 +5594,11 @@ function NumericFilterModal({ rule, allRules, source, fields, aggregations, rang
   const [showFnMenu, setShowFnMenu] = useState(false)
   const fnBtnRef = useRef<HTMLButtonElement>(null)
 
-  const groupAggValues = previewGroupAggregates(source, fields, aggregations, allRules, rule.field, fn, rangeConfigs)
+  // The bounds this filter offers must be what's reachable BEFORE it applies — scoping them by
+  // the rule's own current setting would let the slider walk itself inward on every drag.
+  const groupAggValues = flat
+    ? flatFieldNumericValues(source, fields, allRules, allRules.filter((r) => r.field !== rule.field), rule.field)
+    : previewGroupAggregates(source, fields, aggregations, allRules, rule.field, fn, rangeConfigs)
   const distinctAggValues = [...new Set(groupAggValues)].sort((a, b) => a - b)
   const aggMin = distinctAggValues.length ? distinctAggValues[0] : 0
   const aggMax = distinctAggValues.length ? distinctAggValues[distinctAggValues.length - 1] : 0
@@ -5063,15 +5636,19 @@ function NumericFilterModal({ rule, allRules, source, fields, aggregations, rang
         <div className="flex items-center gap-2.5 px-5 py-4 border-b border-gray-100">
           {fieldTypeIcon(rule.type, 15)}
           <span className="text-[15px] font-semibold text-gray-900">{fieldDisplayName(rule.field)}</span>
-          <button
-            ref={fnBtnRef}
-            onClick={() => setShowFnMenu((p) => !p)}
-            className="flex items-center gap-1 ml-4 px-3 py-1.5 rounded-full text-[13px] font-medium bg-indigo-600 text-white shadow-sm hover:bg-indigo-700 transition-colors"
-          >
-            {fn}
-            <Ic.ChevDown size={11} />
-          </button>
-          {showFnMenu && (
+          {flat ? (
+            <span className="ml-4 text-[11px] text-gray-400">record value</span>
+          ) : (
+            <button
+              ref={fnBtnRef}
+              onClick={() => setShowFnMenu((p) => !p)}
+              className="flex items-center gap-1 ml-4 px-3 py-1.5 rounded-full text-[13px] font-medium bg-indigo-600 text-white shadow-sm hover:bg-indigo-700 transition-colors"
+            >
+              {fn}
+              <Ic.ChevDown size={11} />
+            </button>
+          )}
+          {!flat && showFnMenu && (
             <ChipPortalMenu anchorRef={fnBtnRef} onClose={() => setShowFnMenu(false)}>
               <div className="bg-white border border-gray-200 rounded-lg shadow-xl py-1 w-40 mt-1">
                 {AGG_OPTIONS.map((opt) => (
@@ -5221,8 +5798,10 @@ function NumericFilterModal({ rule, allRules, source, fields, aggregations, rang
   )
 }
 
+// The report's own base filters — the builder's locked-in data scope, create-mode only (the
+// call site gates it). View filters, which viewers can tweak, live in ViewFilterPane instead.
 function FilterBar({
-  rules, dragging, source, fields, aggregations, rangeConfigs, onDrop, onRemove, onRuleChange,
+  rules, dragging, source, fields, aggregations, rangeConfigs, onDrop, onRemove, onRuleChange, justDropped, flat,
 }: {
   rules: FilterRule[]
   dragging: boolean
@@ -5233,6 +5812,10 @@ function FilterBar({
   onDrop: (name: string, type: FieldType) => void
   onRemove: (field: string) => void
   onRuleChange: (field: string, patch: Partial<FilterRule>) => void
+  justDropped: string | null
+  // Tabular reports have no pivot groups, so every rule compares the record's own value. The
+  // modals use this to hide controls that would be meaningless (see CategoricalFilterModal).
+  flat?: boolean
 }) {
   const [over, setOver] = useState(false)
 
@@ -5251,7 +5834,7 @@ function FilterBar({
   const highlight = over || (dragging && rules.length === 0)
 
   return (
-    <div className={`relative z-10 flex items-center gap-2 px-4 py-2 border-b border-gray-200 min-h-[44px] shadow-sm transition-colors
+    <div className={`print-hide relative z-10 flex items-center gap-2 px-4 py-2 border-b border-gray-200 min-h-[44px] shadow-sm transition-colors
       ${highlight ? "bg-amber-50" : "bg-white"}`}
     >
       {/* Drop target area — filters */}
@@ -5284,6 +5867,9 @@ function FilterBar({
             rangeConfigs={rangeConfigs}
             onRemove={() => onRemove(rule.field)}
             onChange={(patch) => onRuleChange(rule.field, patch)}
+            canRemove
+            autoOpen={rule.field === justDropped}
+            flat={flat}
           />
         ))}
       </div>
@@ -5291,7 +5877,16 @@ function FilterBar({
   )
 }
 
-function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs, onRemove, onChange }: {
+// One filter pill + its configuration modal. Shared by both filter surfaces: the base FILTERS
+// bar and the View filters pane. The three flags below are all the two surfaces differ by.
+//   canRemove   — show the remove X (build-time action; false for a viewer)
+//   autoOpen    — open the modal on mount (a freshly-dropped filter wants configuring; a
+//                 view-mode page load does not, or every chip would pop a modal)
+//   valueOptions— override the categorical value list (View filters restrict it to values that
+//                 survive the base filters, via relevantFieldValues)
+//   panelAlign  — which edge the boolean/fallback inline panel hangs off; "right" keeps it from
+//                 overflowing when the chip sits in the narrow right-hand pane
+function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs, onRemove, onChange, canRemove, autoOpen, flat }: {
   rule: FilterRule
   allRules: FilterRule[]
   source: string
@@ -5300,8 +5895,11 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
   rangeConfigs: Record<string, RangeConfig>
   onRemove: () => void
   onChange: (patch: Partial<FilterRule>) => void
+  canRemove: boolean
+  autoOpen: boolean
+  flat?: boolean
 }) {
-  const [open, setOpen] = useState(true)
+  const [open, setOpen] = useState(autoOpen)
   const [search, setSearch] = useState("")
   const ref = useRef<HTMLDivElement>(null)
   const operators = filterOperators(rule.type)
@@ -5453,16 +6051,18 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
           </span>
         )}
         {summaryValue && (
-          <span className="text-indigo-600 max-w-[120px] truncate">{summaryValue}</span>
+          <span className="max-w-[120px] truncate text-indigo-600">{summaryValue}</span>
         )}
         <Ic.ChevDown size={10} />
 
-        <span
-          onClick={(e) => { e.stopPropagation(); onRemove() }}
-          className="text-gray-300 hover:text-gray-600 transition-colors ml-0.5"
-        >
-          <Ic.X size={10} />
-        </span>
+        {canRemove && (
+          <span
+            onClick={(e) => { e.stopPropagation(); onRemove() }}
+            className="text-gray-300 hover:text-gray-600 transition-colors ml-0.5"
+          >
+            <Ic.X size={10} />
+          </span>
+        )}
       </button>
 
       {/* Date modal */}
@@ -5474,6 +6074,7 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
       {open && isCategoricalField && (
         <CategoricalFilterModal
           rule={rule} allRules={allRules} source={source} fields={fields} aggregations={aggregations} rangeConfigs={rangeConfigs}
+          flat={flat}
           onChange={onChange} onClose={() => setOpen(false)}
         />
       )}
@@ -5482,6 +6083,7 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
       {open && isNumericField && (
         <NumericFilterModal
           rule={rule} allRules={allRules} source={source} fields={fields} aggregations={aggregations} rangeConfigs={rangeConfigs}
+          flat={flat}
           onChange={onChange} onClose={() => setOpen(false)}
         />
       )}
@@ -5635,6 +6237,1277 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
     </div>
   )
 }
+
+// ── View filters pane ──────────────────────────────────────────────────────────
+
+// One view filter, rendered as an always-open inline control rather than a chip that opens a
+// modal — a viewer should be able to see and change the criteria without discovering a click
+// target first. The control follows the field's type:
+//   text / person / boolean  → multi-select checkbox list (with "(All)")
+//   date (Actual mode)       → the same list, over the granularity's period labels
+//   number / money / …       → dual-handle range slider over the group aggregate
+// The gear still opens the full modal, so nothing the modal offers (wildcards, all-of/only,
+// Top-N, relative dates) is lost — the card is the default, not a replacement.
+// Builder-only configuration for one view filter, in a floating popup anchored to the card's
+// gear. Mirrors the reference tool's shape: a display-name override, a component-type picker,
+// and (for a measure) which aggregate the filter compares. Deliberately excludes the base
+// filter modals' power tools — wildcard matching, single-value sliders, Top-N — because a view
+// filter is meant to be a simple pick-values-or-a-range control for a viewer.
+function ViewFilterSettings({ rule, options, anchorRef, flat, onChange, onClose }: {
+  rule: FilterRule
+  options: string[]
+  flat?: boolean
+  anchorRef: React.RefObject<HTMLElement | null>
+  onChange: (patch: Partial<FilterRule>) => void
+  onClose: () => void
+}) {
+  const isNumericField = isNumericType(rule.type)
+  const isDateField = rule.type === "date"
+  const componentList = viewFilterComponents(rule.type)
+  const current = resolveViewFilterComponent(rule)
+  const listMode = rule.vfListMode ?? "all"
+  const offered: string[] = rule.vfOfferedValues ?? []
+  const selectCls = "w-full border border-gray-200 rounded-md px-2 py-1.5 text-[12px] text-gray-700 bg-white focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100"
+
+  const toggleOffered = (v: string) =>
+    onChange({ vfOfferedValues: offered.includes(v) ? offered.filter((x) => x !== v) : [...offered, v] })
+
+  return (
+    <ChipPortalMenu anchorRef={anchorRef} onClose={onClose}>
+      <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl w-72 overflow-hidden">
+        <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 bg-gray-50">
+          <Ic.Gear size={12} />
+          <span className="text-[12px] font-semibold text-gray-800 flex-1 truncate">Filter settings</span>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700 transition-colors">
+            <Ic.X size={12} />
+          </button>
+        </div>
+
+        <div className="px-3 py-3 flex flex-col gap-3 max-h-[420px] overflow-y-auto">
+          {/* Display name */}
+          <div>
+            <label className="text-[11px] text-gray-500 block mb-1">
+              Filter display name <span className="text-gray-400">({rule.field.replace("::", ".")})</span>
+            </label>
+            <input
+              type="text"
+              value={rule.vfDisplayName ?? ""}
+              placeholder={fieldDisplayName(rule.field)}
+              onChange={(e) => onChange({ vfDisplayName: e.target.value })}
+              className="w-full border border-gray-200 rounded-md px-2 py-1.5 text-[12px] text-gray-800 focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100"
+            />
+          </div>
+
+          {/* Component type — a date pairs a period-type picker with the widget picker, since
+              "which periods" and "how they're presented" are separate choices. */}
+          <div>
+            <label className="text-[11px] text-gray-500 block mb-1">Choose component type</label>
+            {isDateField && (
+              <select
+                value={rule.dateMode ?? "actual"}
+                onChange={(e) => {
+                  // Each period type reads different fields off the rule, so clear the others'
+                  // criteria rather than leaving a stale window driving the report.
+                  const mode = e.target.value as "actual" | "relative" | "range"
+                  onChange({
+                    dateMode: mode, values: [],
+                    dateFrom: "", dateTo: "", dateRelativeOpt: "", dateRelativeN: 1,
+                  })
+                }}
+                className={`${selectCls} mb-1.5`}
+              >
+                {VF_DATE_PERIODS.map((p) => <option key={p.key} value={p.key}>{p.label}</option>)}
+              </select>
+            )}
+            {(!isDateField || (rule.dateMode ?? "actual") === "actual") && (
+            <select
+              value={current}
+              onChange={(e) => {
+                const next = e.target.value as ViewFilterComponent
+                // Switching between a range and a value list changes which fields the engine
+                // reads, so reset the criteria rather than leaving stale bounds/checks behind.
+                const reset = isNumericField
+                  ? next === "sliderDouble"
+                    ? { numMode: "range" as const, value: "", value2: "", values: [] }
+                    : { numMode: "actual" as const, value: "", value2: "", values: [] }
+                  : { values: [] }
+                onChange({ vfComponent: next, ...reset })
+              }}
+              className={selectCls}
+            >
+              {componentList.map((c) => (
+                <option key={c.key} value={c.key}>{c.label}</option>
+              ))}
+            </select>
+            )}
+            <p className="text-[10px] text-gray-400 mt-1">This component will be used to display the filter.</p>
+          </div>
+
+          {/* Aggregate — only meaningful when there are groups to aggregate over */}
+          {isNumericField && !flat && (
+            <div>
+              <label className="text-[11px] text-gray-500 block mb-1">Choose function to apply</label>
+              <select
+                value={rule.numFunction || "Sum"}
+                onChange={(e) => onChange({ numFunction: e.target.value, value: "", value2: "", values: [] })}
+                className={selectCls}
+              >
+                {AGG_OPTIONS.map((a) => <option key={a} value={a}>{a}</option>)}
+              </select>
+            </div>
+          )}
+
+          {/* Which values the viewer's list offers. Hidden for a date unless it's picking
+              actual periods — a relative window or a from/to range has no list to populate. */}
+          {!isNumericField && (!isDateField || (rule.dateMode ?? "actual") === "actual") && (
+            <div>
+              <label className="text-[11px] text-gray-500 block mb-1.5">Choose values</label>
+              {/* Granularity decides WHICH periods the list holds (Years, Month & Year, …), so
+                  it belongs with the value list, not the component picker. */}
+              {isDateField && (
+                <select
+                  value={rule.dateGranularity || "Month & Year"}
+                  onChange={(e) => onChange({ dateGranularity: e.target.value, values: [], vfOfferedValues: [] })}
+                  className={`${selectCls} mb-1.5`}
+                >
+                  {DATE_GRANULARITY.map((g) => <option key={g.label} value={g.label}>{g.label}</option>)}
+                </select>
+              )}
+              <div className="flex items-center gap-4 bg-gray-50 rounded-md px-2.5 py-2">
+                {([["all", "List all values"], ["selected", "List selected values"]] as const).map(([key, label]) => (
+                  <label key={key} onClick={() => onChange({ vfListMode: key })} className="flex items-center gap-1.5 cursor-pointer select-none">
+                    <span className={`w-3 h-3 rounded-full border-2 shrink-0 flex items-center justify-center
+                      ${listMode === key ? "border-indigo-600" : "border-gray-300"}`}>
+                      {listMode === key && <span className="w-1.5 h-1.5 rounded-full bg-indigo-600" />}
+                    </span>
+                    <span className="text-[11px] text-gray-700">{label}</span>
+                  </label>
+                ))}
+              </div>
+              {listMode === "selected" && (
+                <div className="mt-2 border border-gray-200 rounded-md max-h-40 overflow-y-auto py-1">
+                  {options.length === 0 ? (
+                    <p className="px-2.5 py-1.5 text-[11px] text-gray-400">No values available.</p>
+                  ) : options.map((v) => (
+                    <label key={v} onClick={() => toggleOffered(v)} className="flex items-center gap-2 px-2.5 py-1 text-[12px] text-gray-700 cursor-pointer hover:bg-indigo-50 select-none">
+                      <span className={`w-3.5 h-3.5 rounded-sm border flex items-center justify-center shrink-0 text-white
+                        ${offered.includes(v) ? "bg-indigo-600 border-indigo-600" : "bg-white border-gray-300"}`}>
+                        {offered.includes(v) && <Ic.Check />}
+                      </span>
+                      <span className="truncate">{v}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              {listMode === "selected" && offered.length === 0 && (
+                <p className="text-[10px] text-amber-600 mt-1">Nothing picked yet — the viewer's list will be empty.</p>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </ChipPortalMenu>
+  )
+}
+
+// One view filter, rendered as an always-open inline control rather than a chip that opens a
+// modal — a viewer should see and change the criteria without hunting for a click target. The
+// control follows the field type's default (checkbox list for a category, double slider for a
+// measure) unless the builder picked another via the gear's settings popup.
+function ViewFilterCard({ rule, baseRules, source, fields, aggregations, rangeConfigs, valueOptions, isCreate, flat, onRemove, onChange }: {
+  rule: FilterRule
+  baseRules: FilterRule[]
+  source: string
+  fields: PivotFields
+  aggregations: Record<string, string>
+  rangeConfigs: Record<string, RangeConfig>
+  valueOptions?: string[] | null
+  isCreate: boolean
+  flat?: boolean
+  onRemove: () => void
+  onChange: (patch: Partial<FilterRule>) => void
+}) {
+  const [showSettings, setShowSettings] = useState(false)
+  const [showDropdown, setShowDropdown] = useState(false)
+  const [search, setSearch] = useState("")
+  const settingsBtnRef = useRef<HTMLButtonElement>(null)
+  const dropdownBtnRef = useRef<HTMLButtonElement>(null)
+
+  const isNumericField = isNumericType(rule.type)
+  const isDateField = rule.type === "date"
+  const component = resolveViewFilterComponent(rule)
+  const selected: string[] = rule.values ?? []
+  const label = (rule.vfDisplayName ?? "").trim() !== "" ? rule.vfDisplayName : fieldDisplayName(rule.field)
+
+  // Numeric cards work off the same group-level aggregate the filter compares, computed over
+  // base-filtered data only — so the track's ends are reachable values, not dataset-wide
+  // extremes the base scope already excluded.
+  const aggFn = rule.numFunction || "Sum"
+  const aggValues = !isNumericField
+    ? []
+    : flat
+      // A flat report's slider must span the records' own values; the pivot's per-group
+      // aggregates would collapse to a single point with no row grouping to vary them.
+      ? flatFieldNumericValues(source, fields, baseRules, baseRules, rule.field)
+      : previewGroupAggregates(source, fields, aggregations, baseRules, rule.field, aggFn, rangeConfigs)
+  const boundLo = aggValues.length ? Math.min(...aggValues) : 0
+  const boundHi = aggValues.length ? Math.max(...aggValues) : 0
+  const lo = rule.value !== "" && rule.value != null ? Number(rule.value) : boundLo
+  const hi = rule.value2 !== "" && rule.value2 != null ? Number(rule.value2) : boundHi
+
+  // The full set of values this field could offer. Date uses its granularity's period labels;
+  // a numeric Multi Select Box uses the distinct aggregates; everything else uses the
+  // base-filtered value list threaded in from the pane.
+  const allOptions = isNumericField
+    ? [...new Set(aggValues)].sort((a, b) => a - b).map(String)
+    : isDateField
+      ? (ACTUAL_DATE_VALUES[rule.dateGranularity || "Month & Year"] ?? [])
+      : (valueOptions ?? [])
+
+  // "List selected values" narrows what the viewer may pick to the builder's allow-list.
+  const options = (!isNumericField && (rule.vfListMode ?? "all") === "selected")
+    ? allOptions.filter((v) => (rule.vfOfferedValues ?? []).includes(v))
+    : allOptions
+
+  // An empty `values` means "no filter" everywhere in this engine, so it must render as every
+  // box ticked — anything else would misreport what the report is actually doing.
+  const allSelected = selected.length === 0
+  const isChecked = (v: string) => allSelected || selected.includes(v)
+  const checkedCount = allSelected ? options.length : selected.length
+
+  // Unchecking the last remaining value is refused rather than written through: `values: []`
+  // would read back as "no filter" and silently re-tick every box, misrepresenting the report.
+  const toggleValue = (v: string) => {
+    const current = allSelected ? options : selected
+    const next = current.includes(v) ? current.filter((x) => x !== v) : [...current, v]
+    if (next.length === 0) return
+    const patch: Partial<FilterRule> = { values: next.length === options.length ? [] : next }
+    if (isNumericField) patch.numMode = "actual"
+    onChange(patch)
+  }
+  const pickSingle = (v: string) => {
+    const patch: Partial<FilterRule> = { values: v === "" ? [] : [v] }
+    if (isNumericField) patch.numMode = "actual"
+    onChange(patch)
+  }
+
+  const filtered = options.filter((v) => v.toLowerCase().includes(search.toLowerCase()))
+  const summary = allSelected ? "All" : selected.length === 1 ? selected[0] : `${selected.length} selected`
+  const checkboxCls = (on: boolean) =>
+    `w-3.5 h-3.5 rounded-sm border flex items-center justify-center shrink-0 text-white ${on ? "bg-indigo-600 border-indigo-600" : "bg-white border-gray-300"}`
+
+  const searchBox = options.length > 8 && (
+    <div className="px-2 pt-2">
+      <div className="flex items-center gap-1.5 bg-gray-50 rounded px-2 py-1">
+        <Ic.Search />
+        <input
+          type="text" placeholder="Search…" value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          className="flex-1 min-w-0 bg-transparent text-[11px] text-gray-700 placeholder-gray-400 focus:outline-none"
+        />
+      </div>
+    </div>
+  )
+
+  const checkList = (
+    <div className="max-h-48 overflow-y-auto py-1">
+      {!search && (
+        <label
+          onClick={() => { if (!allSelected) onChange(isNumericField ? { values: [], numMode: "actual" } : { values: [] }) }}
+          title={allSelected ? "At least one value must stay selected" : "Select all"}
+          className={`flex items-center gap-2 px-2.5 py-1 text-[12px] text-gray-700 select-none
+            ${allSelected ? "cursor-default" : "cursor-pointer hover:bg-indigo-50"}`}
+        >
+          <span className={checkboxCls(allSelected)}>{allSelected && <Ic.Check />}</span>
+          (All)
+        </label>
+      )}
+      {filtered.map((v) => {
+        const on = isChecked(v)
+        const isLast = on && checkedCount === 1
+        return (
+          <label
+            key={v}
+            onClick={() => toggleValue(v)}
+            title={isLast ? "At least one value must stay selected" : undefined}
+            className={`flex items-center gap-2 px-2.5 py-1 text-[12px] text-gray-700 select-none
+              ${isLast ? "cursor-default" : "cursor-pointer hover:bg-indigo-50"}`}
+          >
+            <span className={checkboxCls(on)}>{on && <Ic.Check />}</span>
+            <span className="truncate">{isNumericField ? fmtNum(Number(v)) : v}</span>
+          </label>
+        )
+      })}
+      {filtered.length === 0 && <p className="px-2.5 py-1.5 text-[11px] text-gray-400">No matching values.</p>}
+    </div>
+  )
+
+  const radioList = (
+    <div className="max-h-48 overflow-y-auto py-1">
+      {!search && (
+        <label
+          onClick={() => pickSingle("")}
+          className="flex items-center gap-2 px-2.5 py-1 text-[12px] text-gray-700 cursor-pointer hover:bg-indigo-50 select-none"
+        >
+          <span className={`w-3 h-3 rounded-full border-2 shrink-0 flex items-center justify-center ${allSelected ? "border-indigo-600" : "border-gray-300"}`}>
+            {allSelected && <span className="w-1.5 h-1.5 rounded-full bg-indigo-600" />}
+          </span>
+          (All)
+        </label>
+      )}
+      {filtered.map((v) => {
+        const on = !allSelected && selected[0] === v
+        return (
+          <label
+            key={v}
+            onClick={() => pickSingle(v)}
+            className="flex items-center gap-2 px-2.5 py-1 text-[12px] text-gray-700 cursor-pointer hover:bg-indigo-50 select-none"
+          >
+            <span className={`w-3 h-3 rounded-full border-2 shrink-0 flex items-center justify-center ${on ? "border-indigo-600" : "border-gray-300"}`}>
+              {on && <span className="w-1.5 h-1.5 rounded-full bg-indigo-600" />}
+            </span>
+            <span className="truncate">{v}</span>
+          </label>
+        )
+      })}
+    </div>
+  )
+
+  const selectCls = "w-full border border-gray-200 rounded-md px-2 py-1 text-[12px] text-gray-700 bg-white focus:outline-none focus:border-indigo-400"
+
+  const dateMode = rule.dateMode ?? "actual"
+  const relOptions = RELATIVE_OPTIONS[rule.dateGranularity || "Month & Year"] ?? []
+
+  let body: ReturnType<typeof ViewFilterSettings> | null = null
+  if (isDateField && dateMode === "relative") {
+    // A relative window is inherently one choice, so it's a single select regardless of the
+    // component picker (which the settings popup hides for this period type).
+    body = (
+      <div className="px-2.5 py-2 flex flex-col gap-1.5">
+        <select
+          value={rule.dateRelativeOpt || ""}
+          onChange={(e) => onChange({ dateRelativeOpt: e.target.value })}
+          className={selectCls}
+        >
+          <option value="">(Any time)</option>
+          {relOptions.map((o) => <option key={o} value={o}>{o}</option>)}
+        </select>
+        {isNInput(rule.dateRelativeOpt || "") && (
+          <input
+            type="number" min={1} value={rule.dateRelativeN || 1}
+            onChange={(e) => onChange({ dateRelativeN: Math.max(1, Number(e.target.value) || 1) })}
+            className={selectCls}
+          />
+        )}
+      </div>
+    )
+  } else if (isDateField && dateMode === "range") {
+    const op = rule.dateRangeOp ?? "after"
+    body = (
+      <div className="px-2.5 py-2 flex flex-col gap-1.5">
+        <select
+          value={op}
+          onChange={(e) => onChange({ dateRangeOp: e.target.value as FilterRule["dateRangeOp"] })}
+          className={selectCls}
+        >
+          <option value="after">On or after</option>
+          <option value="before">On or before</option>
+          <option value="between">Between</option>
+        </select>
+        <input
+          type="date" value={rule.dateFrom || ""}
+          onChange={(e) => onChange({ dateFrom: e.target.value })}
+          className={selectCls}
+        />
+        {op === "between" && (
+          <input
+            type="date" value={rule.dateTo || ""}
+            onChange={(e) => onChange({ dateTo: e.target.value })}
+            className={selectCls}
+          />
+        )}
+      </div>
+    )
+  } else if (component === "sliderDouble") {
+    body = (
+      <div className="px-3 pt-3 pb-2.5">
+        <RangeSlider
+          min={boundLo} max={boundHi} value={lo} value2={hi}
+          onChange={(a, b) => onChange({ numMode: "range", value: String(a), value2: String(b) })}
+        />
+        <div className="flex items-center justify-between mt-1 text-[11px] text-gray-500 tabular-nums">
+          <span>{fmtNum(lo)}</span>
+          <span>{fmtNum(hi)}</span>
+        </div>
+      </div>
+    )
+  } else if (component === "singleDropdown") {
+    body = (
+      <div className="px-2.5 py-2">
+        <select value={allSelected ? "" : (selected[0] ?? "")} onChange={(e) => pickSingle(e.target.value)} className={selectCls}>
+          <option value="">(All)</option>
+          {options.map((v) => <option key={v} value={v}>{v}</option>)}
+        </select>
+      </div>
+    )
+  } else if (component === "multiDropdown") {
+    body = (
+      <div className="px-2.5 py-2">
+        <button
+          ref={dropdownBtnRef}
+          onClick={() => setShowDropdown((p) => !p)}
+          className="w-full flex items-center gap-1.5 border border-gray-200 rounded-md px-2 py-1 text-[12px] text-gray-700 bg-white hover:border-gray-300 transition-colors"
+        >
+          <span className="flex-1 truncate text-left">{summary}</span>
+          <Ic.ChevDown size={10} />
+        </button>
+        {showDropdown && (
+          <ChipPortalMenu anchorRef={dropdownBtnRef} onClose={() => setShowDropdown(false)}>
+            <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl w-60 overflow-hidden">
+              {searchBox}
+              {checkList}
+            </div>
+          </ChipPortalMenu>
+        )}
+      </div>
+    )
+  } else if (component === "multiCustomList") {
+    body = (
+      <div className="px-2.5 py-2">
+        <textarea
+          rows={4}
+          value={selected.join("\n")}
+          placeholder={"One value per line…\ne.g.\n" + (options.slice(0, 2).join("\n") || "")}
+          onChange={(e) => onChange({ values: e.target.value.split("\n").map((s) => s.trim()).filter((s) => s !== "") })}
+          className="w-full border border-gray-200 rounded-md px-2 py-1.5 text-[11px] text-gray-700 focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100 resize-y"
+        />
+        <p className="text-[10px] text-gray-400 mt-1">Empty matches everything.</p>
+      </div>
+    )
+  } else if (component === "singleList") {
+    body = <>{searchBox}{radioList}</>
+  } else {
+    body = <>{searchBox}{checkList}</>
+  }
+
+  return (
+    <div className="w-full border border-gray-200 rounded-lg bg-white shadow-sm overflow-hidden animate-chip-in">
+      {/* Header */}
+      <div className="flex items-center gap-1.5 px-2.5 py-1.5 border-b border-gray-100 bg-gray-50/70">
+        <span className="shrink-0">{fieldTypeIcon(rule.type, 11)}</span>
+        <span className="text-[12px] font-semibold text-gray-700 truncate flex-1" title={rule.field.replace("::", ": ")}>
+          {label}
+        </span>
+        {isNumericField && <span className="text-[10px] text-gray-400 shrink-0">{aggFn}</span>}
+        {/* Settings is builder-only — a viewer changes the filter's criteria, not how it's presented */}
+        {isCreate && (
+          <button
+            ref={settingsBtnRef}
+            onClick={() => setShowSettings((p) => !p)}
+            title="Filter settings"
+            className={`transition-colors shrink-0 p-0.5 rounded hover:bg-gray-200/60 ${showSettings ? "text-indigo-600" : "text-gray-300 hover:text-gray-600"}`}
+          >
+            <Ic.Gear size={11} />
+          </button>
+        )}
+        {isCreate && (
+          <button onClick={onRemove} title="Remove" className="text-gray-300 hover:text-gray-600 transition-colors shrink-0 p-0.5 rounded hover:bg-gray-200/60">
+            <Ic.X size={11} />
+          </button>
+        )}
+      </div>
+
+      {body}
+
+      {showSettings && (
+        <ViewFilterSettings
+          rule={rule}
+          flat={flat}
+          options={allOptions}
+          anchorRef={settingsBtnRef}
+          onChange={onChange}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+function ViewFilterPane({
+  rules, baseRules, dragging, source, fields, aggregations, rangeConfigs, onDrop, onRemove, onRuleChange, reportMode, flat,
+}: {
+  rules: FilterRule[]
+  baseRules: FilterRule[]
+  dragging: boolean
+  source: string
+  fields: PivotFields
+  aggregations: Record<string, string>
+  rangeConfigs: Record<string, RangeConfig>
+  onDrop: (name: string, type: FieldType) => void
+  onRemove: (field: string) => void
+  onRuleChange: (field: string, patch: Partial<FilterRule>) => void
+  reportMode: ReportMode
+  // Tabular reports have no pivot groups — numeric cards slide over record values, and the
+  // aggregate-function setting is hidden. See ViewFilterCard.
+  flat?: boolean
+}) {
+  const [over, setOver] = useState(false)
+  const isCreate = reportMode === "create"
+
+  // A viewer with no exposed filters gets no pane at all — an empty rail is pure noise. In
+  // create mode it always renders, since it has to be there to drop onto.
+  if (!isCreate && rules.length === 0) return null
+
+  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setOver(true) }
+  const handleDragLeave = (e: React.DragEvent) => {
+    if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) setOver(false)
+  }
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault(); setOver(false)
+    try {
+      const data = JSON.parse(e.dataTransfer.getData("application/field")) as { field: string; type: FieldType }
+      onDrop(data.field, data.type)
+    } catch {}
+  }
+
+  const highlight = isCreate && (over || (dragging && rules.length === 0))
+  // Grain must account for every rule the report actually applies, but the value list itself is
+  // narrowed by the BASE rules only — stable, and no cascade between sibling view filters.
+  const grainRules = baseRules.length > 0 ? [...baseRules, ...rules] : rules
+
+  return (
+    <aside
+      onDragOver={isCreate ? handleDragOver : undefined}
+      onDragLeave={isCreate ? handleDragLeave : undefined}
+      onDrop={isCreate ? handleDrop : undefined}
+      className={`w-[280px] shrink-0 flex flex-col border-l border-gray-200 overflow-hidden transition-colors
+        ${highlight ? "bg-amber-50" : "bg-white"}`}
+    >
+      {/* Builder-only heading: it names the drop target and counts what's in it. A viewer just
+          sees filter cards, so the label is noise — each card already names its own field. */}
+      {isCreate && (
+        <div className="flex items-center gap-1.5 px-4 pt-3.5 pb-2 shrink-0">
+          <span className={`text-[11px] font-bold uppercase tracking-wider transition-colors
+            ${highlight ? "text-amber-500" : "text-gray-600"}`}>
+            View filters
+          </span>
+          {rules.length > 0 && (
+            <span className="text-[10px] bg-gray-200/70 text-gray-600 rounded-full px-1.5 py-px font-medium">
+              {rules.length}
+            </span>
+          )}
+        </div>
+      )}
+
+      <div className={`flex-1 min-h-0 overflow-y-auto px-4 pb-4 flex flex-col gap-1.5 items-start ${isCreate ? "" : "pt-3.5"}`}>
+        {rules.length === 0 ? (
+          <>
+            <span className={`text-[12px] leading-relaxed transition-colors ${highlight ? "text-amber-500" : "text-gray-400"}`}>
+              {highlight ? "Release to add" : "Drop a field here to let viewers filter this report."}
+            </span>
+            <span className="text-[11px] text-gray-300 leading-relaxed mt-1">
+              Applied after the report's own Filters.
+            </span>
+          </>
+        ) : (
+          rules.map((rule) => (
+            <ViewFilterCard
+              key={rule.field}
+              rule={rule}
+              baseRules={baseRules}
+              source={source}
+              fields={fields}
+              aggregations={aggregations}
+              rangeConfigs={rangeConfigs}
+              valueOptions={relevantFieldValues(source, fields, grainRules, baseRules, rule.field, rule.type)}
+              isCreate={isCreate}
+              flat={flat}
+              onRemove={() => onRemove(rule.field)}
+              onChange={(patch) => onRuleChange(rule.field, patch)}
+            />
+          ))
+        )}
+      </div>
+    </aside>
+  )
+}
+
+// ── Tabular builder ────────────────────────────────────────────────────────────
+
+// The tabular equivalent of DropZoneBar: two shelves instead of three. DropZone itself is
+// reused unchanged — it is generic over its zone key and agnostic about what the chips mean.
+function TabularZoneBar({
+  fields, dragging, aggregations, rangeConfigs, fieldFormats,
+  onDrop, onMove, onReorder, onRemove, onAggChange, onRangeConfigChange, onFieldFormatChange,
+}: {
+  fields: TabularFields
+  dragging: boolean
+  aggregations: Record<string, string>
+  rangeConfigs: Record<string, RangeConfig>
+  fieldFormats: Record<string, FieldFormat>
+  onDrop: (zone: TabularZoneKey, field: string, type: FieldType) => void
+  onMove: (from: TabularZoneKey, to: TabularZoneKey, id: string) => void
+  onReorder: (zone: TabularZoneKey, id: string, toIndex: number) => void
+  onRemove: (zone: TabularZoneKey, id: string) => void
+  onAggChange: (id: string, agg: string) => void
+  onRangeConfigChange: (id: string, cfg: RangeConfig) => void
+  onFieldFormatChange: (id: string, patch: Partial<FieldFormat>) => void
+}) {
+  // Group by sits first because that's where its fields land in the table — leftmost. The shelf
+  // order mirrors the column order, so the builder reads the same way the result does.
+  const zones: { key: TabularZoneKey; label: string; chips: PivotItem[] }[] = [
+    { key: "tabGroupBy", label: "Group by", chips: fields.groupBy },
+    { key: "tabColumns", label: "Columns", chips: fields.columns },
+  ]
+  const noop = () => {}
+  return (
+    <div className="flex gap-3 border-b border-gray-200 bg-white px-3 py-3 h-[192px] shrink-0 print-hide">
+      {zones.map(({ key, label, chips }) => (
+        <DropZone
+          key={key}
+          zone={key}
+          label={label}
+          chips={chips}
+          dragging={dragging}
+          isSuggested={false}
+          aggregations={aggregations}
+          timelineFilters={{}}
+          rangeConfigs={rangeConfigs}
+          fieldFormats={fieldFormats}
+          onDrop={onDrop}
+          onMove={onMove}
+          onReorder={onReorder}
+          onRemove={onRemove}
+          onAggChange={onAggChange}
+          onTimelineChange={noop}
+          onRangeConfigChange={onRangeConfigChange}
+          onFieldFormatChange={onFieldFormatChange}
+        />
+      ))}
+    </div>
+  )
+}
+
+// The flat table. Structured to match ReportCanvas's wrappers exactly — data-print-root on the
+// outer div, the scroll card as its only child, data-report-table on the table — so CSV export
+// and the print stylesheet work with no extra wiring.
+function TabularCanvas({
+  source, fields, aggregations, filterRules, viewFilterRules, rangeConfigs, fieldFormats,
+  showModuleTag, showProjectCurrency, showRowNumbers, groupSortDir, onGroupSortToggle,
+}: {
+  source: string
+  fields: TabularFields
+  aggregations: Record<string, string>
+  filterRules: FilterRule[]
+  viewFilterRules: FilterRule[]
+  rangeConfigs: Record<string, RangeConfig>
+  fieldFormats: Record<string, FieldFormat>
+  showModuleTag: boolean
+  showProjectCurrency: boolean
+  showRowNumbers: boolean
+  groupSortDir: "asc" | "desc"
+  onGroupSortToggle: () => void
+}) {
+  const isEmpty = fields.columns.length === 0 && fields.groupBy.length === 0
+
+  if (isEmpty) {
+    return (
+      <div data-print-root className="flex-1 min-w-0 min-h-0 overflow-hidden bg-gray-50 p-5 flex flex-col">
+        <div className="flex-1 min-h-0 flex flex-col items-center justify-center bg-white rounded-xl border border-gray-100 shadow-sm gap-4 select-none">
+          <svg width="120" height="88" viewBox="0 0 120 88" fill="none" className="opacity-20">
+            <rect x="1" y="1" width="118" height="86" rx="5" stroke="#6366f1" strokeWidth="2" strokeDasharray="6 4" />
+            <line x1="1" y1="22" x2="119" y2="22" stroke="#6366f1" strokeWidth="1.5" strokeDasharray="4 3" />
+            <line x1="34" y1="1" x2="34" y2="87" stroke="#6366f1" strokeWidth="1.5" strokeDasharray="4 3" />
+            <rect x="8" y="8" width="20" height="8" rx="2" fill="#6366f1" opacity="0.4" />
+            <rect x="42" y="8" width="26" height="8" rx="2" fill="#6366f1" opacity="0.3" />
+            <rect x="78" y="8" width="30" height="8" rx="2" fill="#6366f1" opacity="0.3" />
+            <rect x="42" y="32" width="24" height="6" rx="2" fill="#6366f1" opacity="0.2" />
+            <rect x="78" y="32" width="28" height="6" rx="2" fill="#6366f1" opacity="0.2" />
+            <rect x="42" y="48" width="20" height="6" rx="2" fill="#6366f1" opacity="0.18" />
+            <rect x="78" y="48" width="26" height="6" rx="2" fill="#6366f1" opacity="0.18" />
+            <rect x="42" y="64" width="26" height="6" rx="2" fill="#6366f1" opacity="0.15" />
+            <rect x="78" y="64" width="22" height="6" rx="2" fill="#6366f1" opacity="0.15" />
+          </svg>
+          <div className="text-center">
+            <p className="text-[15px] font-semibold text-gray-700 mb-1">Nothing to show yet</p>
+            <p className="text-[13px] text-gray-400 max-w-[280px] leading-relaxed">
+              Drag fields from the left panel into <strong className="text-gray-500 font-medium">Columns</strong> to
+              list records, or into <strong className="text-gray-500 font-medium">Group by</strong> to group them
+            </p>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const report = computeTabularData(
+    source, fields, aggregations, filterRules, viewFilterRules, rangeConfigs, fieldFormats,
+    groupSortDir, showProjectCurrency,
+  )
+  const { rows, totalCount, grainModule } = report
+
+  const thCls = "border-b border-r border-gray-200 px-4 py-2.5 text-[12px] font-semibold text-left whitespace-nowrap sticky top-0 z-10 bg-gray-50"
+  const tdCls = "border-b border-r border-gray-100 px-4 py-2 text-[13px] whitespace-nowrap"
+
+  const headerCell = (item: PivotItem, group: boolean) => {
+    const type = getFieldType(item.field)
+    const align = alignClass(fieldFormats[item.id], !group && isNumericType(type) ? "right" : "left")
+    return (
+      <th key={item.id} className={`${thCls} ${align} ${group ? "text-gray-800" : "text-gray-600"} min-w-[140px]`}>
+        <span className="inline-flex items-center gap-1.5">
+          {fieldTypeIcon(type, 11)}
+          <span>{fieldItemLabel(item, fieldFormats)}</span>
+          <ModuleTag field={item.field} show={showModuleTag} />
+          {group && (
+            <button
+              onClick={onGroupSortToggle}
+              title={groupSortDir === "asc" ? "Sorted A→Z — click to reverse" : "Sorted Z→A — click to reverse"}
+              className="text-gray-400 hover:text-indigo-600 transition-colors ml-0.5"
+            >
+              <span style={{ display: "inline-block", transform: groupSortDir === "desc" ? "rotate(180deg)" : "none" }}>
+                <Ic.ChevDown size={11} />
+              </span>
+            </button>
+          )}
+        </span>
+      </th>
+    )
+  }
+
+  // How many consecutive rows share this row's group prefix — drives the rowSpan that makes a
+  // group's label render once and span its records, the arrangement the reference tool uses.
+  const spanAt = (ri: number, level: number): number => {
+    const key = rows[ri].groupLabels.slice(0, level + 1).join("␟")
+    let n = 1
+    while (ri + n < rows.length && rows[ri + n].groupLabels.slice(0, level + 1).join("␟") === key) n++
+    return n
+  }
+  const startsGroup = (ri: number, level: number): boolean =>
+    ri === 0 || rows[ri - 1].groupLabels.slice(0, level + 1).join("␟") !== rows[ri].groupLabels.slice(0, level + 1).join("␟")
+
+  return (
+    <div data-print-root className="flex-1 min-w-0 min-h-0 overflow-hidden bg-gray-50 p-5 flex flex-col items-start gap-2">
+      <div className="flex-1 min-h-0 w-fit max-w-full overflow-auto bg-white rounded-xl border border-gray-100 shadow-sm">
+        <table data-report-table className="border-collapse text-[13px]">
+          <thead>
+            <tr>
+              {showRowNumbers && <th className={`${thCls} text-gray-400 w-12 text-right`}>#</th>}
+              {fields.groupBy.map((item) => headerCell(item, true))}
+              {fields.columns.map((item) => headerCell(item, false))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 ? (
+              <tr>
+                <td
+                  className={`${tdCls} text-gray-400 italic`}
+                  colSpan={(showRowNumbers ? 1 : 0) + fields.groupBy.length + fields.columns.length}
+                >
+                  No records match the current filters.
+                </td>
+              </tr>
+            ) : rows.map((row, ri) => (
+              <tr key={ri} className="hover:bg-indigo-50/30 transition-colors">
+                {showRowNumbers && (
+                  <td className={`${tdCls} text-gray-400 text-right tabular-nums`}>{ri + 1}</td>
+                )}
+                {fields.groupBy.map((item, gi) =>
+                  startsGroup(ri, gi) ? (
+                    <td
+                      key={item.id}
+                      rowSpan={spanAt(ri, gi)}
+                      className={`${tdCls} text-gray-800 font-semibold align-top pt-2.5 border-t-2 border-t-gray-200 ${alignClass(fieldFormats[item.id], "left")}`}
+                    >
+                      {row.groupLabels[gi]}
+                    </td>
+                  ) : null,
+                )}
+                {row.cells.map((cell, ci) => {
+                  const item = fields.columns[ci]
+                  const type = getFieldType(item.field)
+                  return (
+                    <td
+                      key={item.id}
+                      className={`${tdCls} text-gray-700 ${alignClass(fieldFormats[item.id], isNumericType(type) ? "right" : "left")} ${isNumericType(type) ? "tabular-nums" : ""}`}
+                    >
+                      {cell.text}
+                    </td>
+                  )
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {totalCount > rows.length && (
+        <p className="text-[11px] text-gray-400 shrink-0">
+          Showing {rows.length.toLocaleString()} of {totalCount.toLocaleString()} records from {grainModule}.
+        </p>
+      )}
+    </div>
+  )
+}
+
+
+// Source picker + settings gear. A deliberate sibling of Toolbar rather than a set of optional
+// props on it: the pivot toolbar is threaded with reportView, the Detail/Compact toggle and
+// totals — none of which a flat table has — so keeping them apart leaves the pivot path untouched.
+function TabularToolbar({
+  source, setSource, reportMode,
+  showModuleTag, onShowModuleTagChange, showProjectCurrency, onShowProjectCurrencyChange,
+  showRowNumbers, onShowRowNumbersChange, fields, fieldFormats, onFieldFormatChange,
+}: {
+  source: string; setSource: (s: string) => void
+  reportMode: ReportMode
+  showModuleTag: boolean; onShowModuleTagChange: (v: boolean) => void
+  showProjectCurrency: boolean; onShowProjectCurrencyChange: (v: boolean) => void
+  showRowNumbers: boolean; onShowRowNumbersChange: (v: boolean) => void
+  fields: TabularFields
+  fieldFormats: Record<string, FieldFormat>
+  onFieldFormatChange: (id: string, patch: Partial<FieldFormat>) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
+  return (
+    <div className="flex items-center gap-3 px-5 py-2 border-b border-gray-200 bg-white text-[13px] print-hide">
+      {reportMode === "create" && (
+        <div className="relative">
+          <button
+            onClick={() => setOpen((p) => !p)}
+            className="flex items-center gap-1.5 text-gray-700 pr-3 border-r border-gray-200 hover:text-gray-900 transition-colors"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
+            </svg>
+            <span className="font-semibold">{source}</span>
+            <Ic.ChevDown size={12} />
+          </button>
+          {open && (
+            <>
+              <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+              <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-xl py-1 w-44">
+                <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-3 pt-2 pb-1">Source</p>
+                {SOURCE_OPTIONS.map((opt) => (
+                  <button
+                    key={opt}
+                    onClick={() => { setSource(opt); setOpen(false) }}
+                    className={`flex items-center justify-between w-full px-3 py-1.5 text-[13px] hover:bg-indigo-50 transition-colors
+                      ${source === opt ? "text-indigo-600 font-medium" : "text-gray-700"}`}
+                  >
+                    {opt}
+                    {source === opt && <Ic.Check />}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      <div className="flex items-center gap-1 ml-auto">
+        <button
+          title="Report settings"
+          onClick={() => setShowSettings(true)}
+          className={`flex items-center justify-center w-7 h-7 rounded-md transition-colors
+            ${showSettings ? "bg-indigo-100 text-indigo-600" : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"}`}
+        >
+          <Ic.Gear size={15} />
+        </button>
+      </div>
+
+      {showSettings && (
+        <TabularSettingsPanel
+          fields={fields}
+          showModuleTag={showModuleTag}
+          onShowModuleTagChange={onShowModuleTagChange}
+          showProjectCurrency={showProjectCurrency}
+          onShowProjectCurrencyChange={onShowProjectCurrencyChange}
+          showRowNumbers={showRowNumbers}
+          onShowRowNumbersChange={onShowRowNumbersChange}
+          fieldFormats={fieldFormats}
+          onFieldFormatChange={onFieldFormatChange}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+// Same right-hand drawer as ReportSettingsPanel, minus the settings a flat table has no use for:
+// no Layout (Detail/Compact is a pivot idea) and no Totals (nothing is aggregated).
+function TabularSettingsPanel({
+  fields, showModuleTag, onShowModuleTagChange, showProjectCurrency, onShowProjectCurrencyChange,
+  showRowNumbers, onShowRowNumbersChange, fieldFormats, onFieldFormatChange, onClose,
+}: {
+  fields: TabularFields
+  showModuleTag: boolean; onShowModuleTagChange: (v: boolean) => void
+  showProjectCurrency: boolean; onShowProjectCurrencyChange: (v: boolean) => void
+  showRowNumbers: boolean; onShowRowNumbersChange: (v: boolean) => void
+  fieldFormats: Record<string, FieldFormat>
+  onFieldFormatChange: (id: string, patch: Partial<FieldFormat>) => void
+  onClose: () => void
+}) {
+  const formatItems: { item: PivotItem; zone: string }[] = [
+    ...fields.groupBy.map((item) => ({ item, zone: "Group by" })),
+    ...fields.columns.map((item) => ({ item, zone: "Column" })),
+  ]
+
+  const toggle = (label: string, note: string, on: boolean, set: (v: boolean) => void) => (
+    <div>
+      <label className="flex items-center justify-between cursor-pointer select-none py-1">
+        <span className="text-[13px] text-gray-700">{label}</span>
+        <span
+          onClick={() => set(!on)}
+          className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0
+            ${on ? "bg-indigo-600" : "bg-gray-200"}`}
+        >
+          <span className={`inline-block w-3.5 h-3.5 transform rounded-full bg-white transition-transform
+            ${on ? "translate-x-[18px]" : "translate-x-1"}`} />
+        </span>
+      </label>
+      {note && <p className="text-[11px] text-gray-400 mt-2 leading-relaxed">{note}</p>}
+    </div>
+  )
+
+  return createPortal(
+    <div className="fixed inset-0 z-[70] flex justify-end">
+      <div className="absolute inset-0 bg-black/20" onClick={onClose} />
+      <div className="relative bg-white w-96 h-full shadow-2xl flex flex-col animate-panel-in">
+        <div className="flex items-center gap-2 px-5 py-4 border-b border-gray-100 shrink-0">
+          <Ic.Gear size={16} />
+          <span className="text-[15px] font-semibold text-gray-900">Table settings</span>
+          <button onClick={onClose} className="ml-auto text-gray-400 hover:text-gray-700 transition-colors p-1 rounded-lg hover:bg-gray-100">
+            <Ic.X size={14} />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-6">
+          <div>
+            <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Rows</p>
+            {toggle("Show row numbers", "", showRowNumbers, onShowRowNumbersChange)}
+          </div>
+
+          <div>
+            <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Headers</p>
+            {toggle(
+              "Show source module in headers",
+              "Tags each header with its owning module — helps tell apart same-named fields from different modules.",
+              showModuleTag, onShowModuleTagChange,
+            )}
+          </div>
+
+          <div>
+            <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Currency</p>
+            {toggle(
+              "View table values in project's currency",
+              "Tags each money value with its own record's project currency.",
+              showProjectCurrency, onShowProjectCurrencyChange,
+            )}
+          </div>
+
+          <div>
+            <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Formatting</p>
+            {formatItems.length === 0 ? (
+              <p className="text-[12px] text-gray-400 leading-relaxed">
+                Drop a field into Columns or Group by to format it here.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-1">
+                {formatItems.map(({ item, zone }) => (
+                  <FieldFormatListItem
+                    key={item.id}
+                    item={item}
+                    zone={zone}
+                    format={fieldFormats[item.id] ?? DEFAULT_FIELD_FORMAT}
+                    onChange={(patch) => onFieldFormatChange(item.id, patch)}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body
+  )
+}
+
+const SAVED_TABULAR_KEY = "customReportsV2.savedTabular"
+
+interface SavedTabularReport {
+  source: string
+  fields: TabularFields
+  aggregations: Record<string, string>
+  filterRules: FilterRule[]
+  viewFilterRules: FilterRule[]
+  rangeConfigs: Record<string, RangeConfig>
+  fieldFormats: Record<string, FieldFormat>
+  showModuleTag: boolean
+  showProjectCurrency: boolean
+  showRowNumbers: boolean
+  groupSortDir: "asc" | "desc"
+}
+
+function loadSavedTabular(): Partial<SavedTabularReport> | null {
+  try {
+    const raw = localStorage.getItem(SAVED_TABULAR_KEY)
+    const parsed: Partial<SavedTabularReport> | null = raw ? JSON.parse(raw) : null
+    if (parsed?.fields) {
+      reserveItemIds([...(parsed.fields.columns ?? []), ...(parsed.fields.groupBy ?? [])])
+    }
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+// The tabular report is its own entity — separate source, fields, filters and saved payload from
+// the pivot builder, with no switching between them. It owns all of that state here rather than
+// in App(), which keeps the two report types genuinely independent.
+function TabularBuilder() {
+  const [saved] = useState(() => loadSavedTabular())
+
+  const [reportMode, setReportMode] = useState<ReportMode>("create")
+  const [source, setSource] = useState<string>(saved?.source ?? "Project")
+  const [fields, setFields] = useState<TabularFields>(saved?.fields ?? { columns: [], groupBy: [] })
+  const [aggregations, setAggregations] = useState<Record<string, string>>(saved?.aggregations ?? {})
+  const [filterRules, setFilterRules] = useState<FilterRule[]>(saved?.filterRules ?? [])
+  const [viewFilterRules, setViewFilterRules] = useState<FilterRule[]>(saved?.viewFilterRules ?? [])
+  const [rangeConfigs, setRangeConfigs] = useState<Record<string, RangeConfig>>(saved?.rangeConfigs ?? {})
+  const [fieldFormats, setFieldFormats] = useState<Record<string, FieldFormat>>(saved?.fieldFormats ?? {})
+  const [showModuleTag, setShowModuleTag] = useState(saved?.showModuleTag ?? false)
+  const [showProjectCurrency, setShowProjectCurrency] = useState(saved?.showProjectCurrency ?? false)
+  const [showRowNumbers, setShowRowNumbers] = useState(saved?.showRowNumbers ?? true)
+  const [groupSortDir, setGroupSortDir] = useState<"asc" | "desc">(saved?.groupSortDir ?? "asc")
+
+  const [dragging, setDragging] = useState(false)
+  const [justSaved, setJustSaved] = useState(false)
+  const [dupAlert, setDupAlert] = useState<string | null>(null)
+  const [needsFieldAlert, setNeedsFieldAlert] = useState(false)
+  const [justDroppedFilter, setJustDroppedFilter] = useState<string | null>(null)
+  const [pendingSource, setPendingSource] = useState<string | null>(null)
+
+  const pivotShape = asPivotFields(fields)
+  const hasAnyField = fields.columns.length > 0 || fields.groupBy.length > 0
+
+  const handleSave = () => {
+    const payload: SavedTabularReport = {
+      source, fields, aggregations, filterRules, viewFilterRules, rangeConfigs, fieldFormats,
+      showModuleTag, showProjectCurrency, showRowNumbers, groupSortDir,
+    }
+    try {
+      localStorage.setItem(SAVED_TABULAR_KEY, JSON.stringify(payload))
+      setJustSaved(true)
+      setTimeout(() => setJustSaved(false), 1500)
+    } catch {}
+  }
+
+  // FieldBrowser speaks PivotZoneKey; map its zones onto the two tabular shelves. "rows" is what
+  // it uses for non-numeric click-to-add, so that becomes Group by; everything else is a Column.
+  const [usedAlert, setUsedAlert] = useState<{ name: string; zone: string } | null>(null)
+
+  const zoneOf = (z: PivotZoneKey): TabularZoneKey => (z === "rows" ? "tabGroupBy" : "tabColumns")
+  const listKey = (z: TabularZoneKey) => (z === "tabGroupBy" ? "groupBy" : "columns") as keyof TabularFields
+
+  const addField = (zone: TabularZoneKey, field: string, type: FieldType) => {
+    // One appearance per field. Both shelves feed the same flat row, so a second copy would
+    // repeat a value rather than add information — refuse and say where the first copy is.
+    const inGroupBy = fields.groupBy.some((it) => it.field === field)
+    const inColumns = fields.columns.some((it) => it.field === field)
+    if (inGroupBy || inColumns) {
+      setUsedAlert({ name: fieldDisplayName(field), zone: inGroupBy ? "Group by" : "Columns" })
+      return
+    }
+    const id = nextPivotItemId()
+    const key = listKey(zone)
+    setFields((prev) => ({ ...prev, [key]: [...prev[key], { id, field }] }))
+    // Only a grouping field gets a modifier; a column shows its raw value.
+    if (zone === "tabGroupBy") {
+      let mod: string | undefined
+      if (isNumericType(type)) mod = "Dimension"
+      else if (type === "date") mod = "Quarter & Year"
+      if (mod) setAggregations((prev) => ({ ...prev, [id]: mod! }))
+    }
+  }
+  const removeField = (zone: TabularZoneKey, id: string) => {
+    const key = listKey(zone)
+    setFields((prev) => ({ ...prev, [key]: prev[key].filter((it) => it.id !== id) }))
+  }
+  const reorderField = (zone: TabularZoneKey, id: string, toIndex: number) => {
+    const key = listKey(zone)
+    setFields((prev) => {
+      const item = prev[key].find((it) => it.id === id)
+      if (!item) return prev
+      const arr = prev[key].filter((it) => it.id !== id)
+      arr.splice(toIndex, 0, item)
+      return { ...prev, [key]: arr }
+    })
+  }
+  const moveField = (from: TabularZoneKey, to: TabularZoneKey, id: string) => {
+    const fk = listKey(from), tk = listKey(to)
+    setFields((prev) => {
+      const item = prev[fk].find((it) => it.id === id)
+      if (!item) return prev
+      return { ...prev, [fk]: prev[fk].filter((it) => it.id !== id), [tk]: [...prev[tk], item] }
+    })
+  }
+
+  const makeRule = (name: string, type: FieldType) => makeFilterRule(name, type)
+
+  const handleFilterDrop = (name: string, type: FieldType) => {
+    if (!hasAnyField) { setNeedsFieldAlert(true); return }
+    setFilterRules((prev) => (prev.find((r) => r.field === name) ? prev : [...prev, makeRule(name, type)]))
+    setJustDroppedFilter(name)
+  }
+  const handleViewFilterDrop = (name: string, type: FieldType) => {
+    if (!hasAnyField) { setNeedsFieldAlert(true); return }
+    setViewFilterRules((prev) => {
+      if (prev.find((r) => r.field === name)) return prev
+      const rule = makeRule(name, type)
+      return [...prev, isNumericType(type) ? { ...rule, numMode: "range" as const } : rule]
+    })
+    setJustDroppedFilter(name)
+  }
+
+  const requestSourceChange = (next: string) => {
+    if (next === source) return
+    const empty = !hasAnyField && filterRules.length === 0 && viewFilterRules.length === 0
+    if (empty) { setSource(next); return }
+    setPendingSource(next)
+  }
+  const confirmSourceChange = () => {
+    if (!pendingSource) return
+    setSource(pendingSource)
+    setFields({ columns: [], groupBy: [] })
+    setAggregations({})
+    setFilterRules([])
+    setViewFilterRules([])
+    setRangeConfigs({})
+    setFieldFormats({})
+    setPendingSource(null)
+  }
+
+  return (
+    <>
+      {usedAlert && (
+        <FieldAlreadyUsedAlert name={usedAlert.name} zone={usedAlert.zone} onClose={() => setUsedAlert(null)} />
+      )}
+      {dupAlert && (
+        <DupFieldAlert
+          name={fieldDisplayName(dupAlert)}
+          count={[...fields.columns, ...fields.groupBy].filter((it) => it.field === dupAlert).length}
+          onClose={() => setDupAlert(null)}
+        />
+      )}
+      {needsFieldAlert && <FilterNeedsFieldAlert onClose={() => setNeedsFieldAlert(false)} />}
+      {pendingSource && (
+        <SourceChangeConfirmModal
+          nextSource={pendingSource}
+          onConfirm={confirmSourceChange}
+          onCancel={() => setPendingSource(null)}
+        />
+      )}
+
+      <PageHeader reportMode={reportMode} onReportModeChange={setReportMode} onSave={handleSave} justSaved={justSaved} />
+      <TabularToolbar
+        source={source}
+        setSource={requestSourceChange}
+        reportMode={reportMode}
+        showModuleTag={showModuleTag}
+        onShowModuleTagChange={setShowModuleTag}
+        showProjectCurrency={showProjectCurrency}
+        onShowProjectCurrencyChange={setShowProjectCurrency}
+        showRowNumbers={showRowNumbers}
+        onShowRowNumbersChange={setShowRowNumbers}
+        fields={fields}
+        fieldFormats={fieldFormats}
+        onFieldFormatChange={(id, patch) =>
+          setFieldFormats((prev) => ({ ...prev, [id]: { ...DEFAULT_FIELD_FORMAT, ...prev[id], ...patch } }))}
+      />
+
+      <div className="flex flex-1 overflow-hidden">
+        {reportMode === "create" && (
+          <FieldBrowser
+            fields={pivotShape}
+            source={source}
+            onAdd={(zone, field, type) => addField(zoneOf(zone), field, type)}
+            onRemove={(zone, id) => removeField(zoneOf(zone), id)}
+            onDupAlert={(name) => setDupAlert(name)}
+            onDragStart={() => setDragging(true)}
+            onDragEnd={() => setDragging(false)}
+          />
+        )}
+        <div className="flex flex-col flex-1 min-w-0">
+          {reportMode === "create" && (
+            <TabularZoneBar
+              fields={fields}
+              dragging={dragging}
+              aggregations={aggregations}
+              rangeConfigs={rangeConfigs}
+              fieldFormats={fieldFormats}
+              onDrop={addField}
+              onMove={moveField}
+              onReorder={reorderField}
+              onRemove={removeField}
+              onAggChange={(id, agg) => setAggregations((prev) => ({ ...prev, [id]: agg }))}
+              onRangeConfigChange={(id, cfg) => setRangeConfigs((prev) => ({ ...prev, [id]: cfg }))}
+              onFieldFormatChange={(id, patch) =>
+                setFieldFormats((prev) => ({ ...prev, [id]: { ...DEFAULT_FIELD_FORMAT, ...prev[id], ...patch } }))}
+            />
+          )}
+          {reportMode === "create" && (
+            <FilterBar
+              rules={filterRules}
+              dragging={dragging}
+              source={source}
+              fields={pivotShape}
+              aggregations={aggregations}
+              rangeConfigs={rangeConfigs}
+              onDrop={handleFilterDrop}
+              onRemove={(field) => setFilterRules((prev) => prev.filter((r) => r.field !== field))}
+              onRuleChange={(field, patch) =>
+                setFilterRules((prev) => prev.map((r) => (r.field === field ? { ...r, ...patch } : r)))}
+              justDropped={justDroppedFilter}
+              flat
+            />
+          )}
+          <div className="flex flex-1 overflow-hidden">
+            <TabularCanvas
+              source={source}
+              fields={fields}
+              aggregations={aggregations}
+              filterRules={filterRules}
+              viewFilterRules={viewFilterRules}
+              rangeConfigs={rangeConfigs}
+              fieldFormats={fieldFormats}
+              showModuleTag={showModuleTag}
+              showProjectCurrency={showProjectCurrency}
+              showRowNumbers={showRowNumbers}
+              groupSortDir={groupSortDir}
+              onGroupSortToggle={() => setGroupSortDir((d) => (d === "asc" ? "desc" : "asc"))}
+            />
+            <ViewFilterPane
+              rules={viewFilterRules}
+              baseRules={filterRules}
+              dragging={dragging}
+              source={source}
+              fields={pivotShape}
+              aggregations={aggregations}
+              rangeConfigs={rangeConfigs}
+              onDrop={handleViewFilterDrop}
+              onRemove={(field) => setViewFilterRules((prev) => prev.filter((r) => r.field !== field))}
+              onRuleChange={(field, patch) =>
+                setViewFilterRules((prev) => prev.map((r) => (r.field === field ? { ...r, ...patch } : r)))}
+              reportMode={reportMode}
+              flat
+            />
+          </div>
+        </div>
+      </div>
+    </>
+  )
+}
+
 
 // ── Dashboard view ─────────────────────────────────────────────────────────────
 
@@ -6367,11 +8240,12 @@ function flattenCompactTree(nodes: CompactNode[], collapsed: Set<string>, out: C
 
 // ── Report canvas ──────────────────────────────────────────────────────────────
 
-function ReportCanvas({ source, fields, aggregations, filterRules, timelineFilters, rangeConfigs, fieldFormats, reportView, showTotals, showModuleTag, showProjectCurrency }: {
+function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRules, timelineFilters, rangeConfigs, fieldFormats, reportView, showTotals, showModuleTag, showProjectCurrency }: {
   source: string
   fields: PivotFields
   aggregations: Record<string, string>
   filterRules: FilterRule[]
+  viewFilterRules: FilterRule[]
   timelineFilters: Record<string, MetricFilter>
   rangeConfigs: Record<string, RangeConfig>
   fieldFormats: Record<string, FieldFormat>
@@ -6390,11 +8264,11 @@ function ReportCanvas({ source, fields, aggregations, filterRules, timelineFilte
     return next
   })
 
-  const isEmpty = fields.values.length === 0 && fields.rows.length === 0
+  const isEmpty = fields.values.length === 0 && fields.rows.length === 0 && fields.columns.length === 0
 
   if (isEmpty) {
     return (
-      <div className="flex-1 min-h-0 overflow-hidden bg-gray-50 p-5 flex flex-col">
+      <div data-print-root className="flex-1 min-w-0 min-h-0 overflow-hidden bg-gray-50 p-5 flex flex-col">
         <div className="flex-1 min-h-0 flex flex-col items-center justify-center bg-white rounded-xl border border-gray-100 shadow-sm gap-4 select-none">
           <svg width="120" height="88" viewBox="0 0 120 88" fill="none" className="opacity-20">
             <rect x="1" y="1" width="118" height="86" rx="5" stroke="#6366f1" strokeWidth="2" strokeDasharray="6 4" />
@@ -6425,8 +8299,9 @@ function ReportCanvas({ source, fields, aggregations, filterRules, timelineFilte
   // Row-field labels only — the actual grouping/aggregation is computed for real below.
   const rowSamples = fields.rows.map(item => ({ id: item.id, name: item.field }))
 
-  const report = computeReportData(source, fields, aggregations, filterRules, timelineFilters, rangeConfigs)
-  const { displayRows, colValues, hasColumns, hasValues, cellNum, grandTotals, bucketRows, grainModule } = report
+  const report = computeReportData(source, fields, aggregations, filterRules, viewFilterRules, timelineFilters, rangeConfigs)
+  const { displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, grandTotals, bucketRows, grainModule } = report
+  const colHeaderTiers = hasColumns ? buildColumnHeaderTiers(colTuples) : []
 
   // "View table values in project's currency" — appends the resolved currency code to a
   // money-typed value cell, but only when every row feeding it agrees on one (see
@@ -6460,28 +8335,35 @@ function ReportCanvas({ source, fields, aggregations, filterRules, timelineFilte
       hasColumns ? node.leafIndices.flatMap((ri) => colValues.map((_, ci) => bucketRows(ri, ci))) : nodeBuckets(node, 0)
 
     return (
-      <div className="flex-1 min-h-0 overflow-hidden bg-gray-50 p-5 flex flex-col items-start">
+      <div data-print-root className="flex-1 min-w-0 min-h-0 overflow-hidden bg-gray-50 p-5 flex flex-col items-start">
         <div className="flex-1 min-h-0 w-fit max-w-full overflow-auto bg-white rounded-xl border border-gray-100 shadow-sm">
-          <table className="border-collapse text-[13px]">
+          <table data-report-table className="border-collapse text-[13px]">
             <thead>
-              {hasColumns && (
-                <tr>
+              {/* One header row per Columns field (outermost first), each colSpan-grouped by
+                  the distinct combinations that share that prefix — a true nested pivot
+                  header rather than one flattened row. */}
+              {colHeaderTiers.map((tierRow, level) => (
+                <tr key={level}>
                   <th className={`${thCls} bg-white border-b-0`} colSpan={1} />
-                  {colValues.map((cv, ci) => (
+                  {tierRow.map((cell, ci) => (
                     <th key={ci}
-                      colSpan={hasValues ? fields.values.length : 1}
+                      colSpan={cell.span * (hasValues ? fields.values.length : 1)}
                       className={`${thCls} bg-indigo-50 text-indigo-600 text-center`}
                     >
-                      {cv}
+                      {cell.label}
                     </th>
                   ))}
                   {hasValues && (
-                    <th colSpan={fields.values.length} className={`${thCls} bg-gray-100 text-gray-600 text-center`}>
-                      Grand Total
-                    </th>
+                    level === 0 ? (
+                      <th colSpan={fields.values.length} className={`${thCls} bg-gray-100 text-gray-600 text-center`}>
+                        Grand Total
+                      </th>
+                    ) : (
+                      <th colSpan={fields.values.length} className={`${thCls} bg-gray-100`} />
+                    )
                   )}
                 </tr>
-              )}
+              ))}
               <tr>
                 <th className={`${thCls} bg-gray-50 text-gray-600 min-w-[220px]`}>
                   {rowSamples.map((r, i) => (
@@ -6604,29 +8486,35 @@ function ReportCanvas({ source, fields, aggregations, filterRules, timelineFilte
   }
 
   return (
-    <div className="flex-1 min-h-0 overflow-hidden bg-gray-50 p-5 flex flex-col items-start">
+    <div data-print-root className="flex-1 min-w-0 min-h-0 overflow-hidden bg-gray-50 p-5 flex flex-col items-start">
       <div className="flex-1 min-h-0 w-fit max-w-full overflow-auto bg-white rounded-xl border border-gray-100 shadow-sm">
-        <table className="border-collapse text-[13px]">
+        <table data-report-table className="border-collapse text-[13px]">
         <thead>
-          {/* Column group header */}
-          {hasColumns && (
-            <tr>
+          {/* Column group header — one row per Columns field (outermost first), each
+              colSpan-grouped by the distinct combinations sharing that prefix, rather than
+              one row flattening every Columns field into a single joined label. */}
+          {colHeaderTiers.map((tierRow, level) => (
+            <tr key={level}>
               <th className={`${thCls} bg-white border-b-0`} colSpan={Math.max(1, rowSamples.length)} />
-              {colValues.map((cv, ci) => (
+              {tierRow.map((cell, ci) => (
                 <th key={ci}
-                  colSpan={hasValues ? fields.values.length : 1}
+                  colSpan={cell.span * (hasValues ? fields.values.length : 1)}
                   className={`${thCls} bg-indigo-50 text-indigo-600 text-center`}
                 >
-                  {cv}
+                  {cell.label}
                 </th>
               ))}
               {hasValues && (
-                <th colSpan={fields.values.length} className={`${thCls} bg-gray-100 text-gray-600 text-center`}>
-                  Grand Total
-                </th>
+                level === 0 ? (
+                  <th colSpan={fields.values.length} className={`${thCls} bg-gray-100 text-gray-600 text-center`}>
+                    Grand Total
+                  </th>
+                ) : (
+                  <th colSpan={fields.values.length} className={`${thCls} bg-gray-100`} />
+                )
               )}
             </tr>
-          )}
+          ))}
 
           {/* Field name header */}
           <tr>
@@ -6667,7 +8555,18 @@ function ReportCanvas({ source, fields, aggregations, filterRules, timelineFilte
         </thead>
 
         <tbody>
-          {displayRows.map((combo, ri) => {
+          {/* With no Row fields and no Values, every raw row collapses into one meaningless
+              blank group (rowLabelers is empty, so every combo is "") — rendering it as a
+              stray empty <tr> reads as a bug, not "nothing to show". Say so explicitly
+              instead; the Columns header above still shows the distinct combinations that
+              exist. */}
+          {rowSamples.length === 0 && !hasValues ? (
+            <tr>
+              <td className={`${tdCls} text-gray-400 italic`} colSpan={9999}>
+                Add a field to Rows or Values to see data for these columns.
+              </td>
+            </tr>
+          ) : displayRows.map((combo, ri) => {
             const isFirstOfPrimary = rowSamples.length > 1 && !renderedPrimary.has(combo[0])
             if (isFirstOfPrimary) renderedPrimary.add(combo[0])
 
@@ -6811,22 +8710,80 @@ interface AppState {
   filterRules: FilterRule[]
 }
 
+// Everything the Save CTA persists — the report's actual definition (source, fields, filters,
+// per-field config, display settings). Deliberately excludes ephemeral UI state (dragging,
+// which alert is showing, reportMode itself, collapsed tree nodes) since none of that is part
+// of "the report" a saved-and-reopened view should restore.
+interface SavedReport {
+  source: string
+  fields: PivotFields
+  aggregations: Record<string, string>
+  lookupRoles: Record<string, string>
+  filterRules: FilterRule[]
+  viewFilterRules: FilterRule[]
+  reportTimelineFilters: Record<string, MetricFilter>
+  rangeConfigs: Record<string, RangeConfig>
+  fieldFormats: Record<string, FieldFormat>
+  reportView: ReportView
+  showTotals: boolean
+  showModuleTag: boolean
+  showProjectCurrency: boolean
+}
+
+const SAVED_REPORT_KEY = "customReportsV2.savedReport"
+
+function loadSavedReport(): Partial<SavedReport> | null {
+  try {
+    const raw = localStorage.getItem(SAVED_REPORT_KEY)
+    const parsed: Partial<SavedReport> | null = raw ? JSON.parse(raw) : null
+    if (parsed?.fields) {
+      reserveItemIds([...(parsed.fields.columns ?? []), ...(parsed.fields.rows ?? []), ...(parsed.fields.values ?? [])])
+    }
+    return parsed
+  } catch {
+    return null
+  }
+}
+
 export default function App() {
-  const [appMode, setAppMode] = useState<"reports" | "dashboard">("reports")
-  const [source, setSource] = useState<AppState["source"]>("Project")
-  const [fields, setFields] = useState<AppState["fields"]>({ columns: [], rows: [], values: [] })
-  const [aggregations, setAggregations] = useState<AppState["aggregations"]>({})
-  const [lookupRoles, setLookupRoles] = useState<Record<string, string>>({}) // keyed by relationship (getRelationshipKey), not by field name
+  // Read once on mount — a lazy initializer runs exactly once, before the first render, so this
+  // doesn't re-hit localStorage on every re-render.
+  const [savedReport] = useState(() => loadSavedReport())
+
+  const [appMode, setAppMode] = useState<AppMode>("reports")
+  const [reportMode, setReportMode] = useState<ReportMode>("create")
+  const [source, setSource] = useState<AppState["source"]>(savedReport?.source ?? "Project")
+  const [fields, setFields] = useState<AppState["fields"]>(savedReport?.fields ?? { columns: [], rows: [], values: [] })
+  const [aggregations, setAggregations] = useState<AppState["aggregations"]>(savedReport?.aggregations ?? {})
+  const [lookupRoles, setLookupRoles] = useState<Record<string, string>>(savedReport?.lookupRoles ?? {}) // keyed by relationship (getRelationshipKey), not by field name
   const [dragging, setDragging] = useState<AppState["dragging"]>(false)
   const [dragType, setDragType] = useState<AppState["dragType"]>(null)
-  const [filterRules, setFilterRules] = useState<FilterRule[]>([])
-  const [reportTimelineFilters, setReportTimelineFilters] = useState<Record<string, MetricFilter>>({})
-  const [rangeConfigs, setRangeConfigs] = useState<Record<string, RangeConfig>>({})
-  const [fieldFormats, setFieldFormats] = useState<Record<string, FieldFormat>>({})
-  const [reportView, setReportView] = useState<ReportView>("detail")
-  const [showTotals, setShowTotals] = useState(true)
-  const [showModuleTag, setShowModuleTag] = useState(false)
-  const [showProjectCurrency, setShowProjectCurrency] = useState(false)
+  const [filterRules, setFilterRules] = useState<FilterRule[]>(savedReport?.filterRules ?? [])
+  const [viewFilterRules, setViewFilterRules] = useState<FilterRule[]>(savedReport?.viewFilterRules ?? [])
+  const [reportTimelineFilters, setReportTimelineFilters] = useState<Record<string, MetricFilter>>(savedReport?.reportTimelineFilters ?? {})
+  const [rangeConfigs, setRangeConfigs] = useState<Record<string, RangeConfig>>(savedReport?.rangeConfigs ?? {})
+  const [fieldFormats, setFieldFormats] = useState<Record<string, FieldFormat>>(savedReport?.fieldFormats ?? {})
+  const [reportView, setReportView] = useState<ReportView>(savedReport?.reportView ?? "detail")
+  const [showTotals, setShowTotals] = useState(savedReport?.showTotals ?? true)
+  const [showModuleTag, setShowModuleTag] = useState(savedReport?.showModuleTag ?? false)
+  const [showProjectCurrency, setShowProjectCurrency] = useState(savedReport?.showProjectCurrency ?? false)
+  const [justSaved, setJustSaved] = useState(false)
+
+  // Save CTA — persists the report definition to localStorage (this app has no backend) so a
+  // reload restores it instead of losing everything. Toggling View/Edit is unrelated to this;
+  // it only changes which controls are shown, never touches storage on its own.
+  const handleSave = () => {
+    const payload: SavedReport = {
+      source, fields, aggregations, lookupRoles, filterRules, viewFilterRules,
+      reportTimelineFilters, rangeConfigs, fieldFormats,
+      reportView, showTotals, showModuleTag, showProjectCurrency,
+    }
+    try {
+      localStorage.setItem(SAVED_REPORT_KEY, JSON.stringify(payload))
+      setJustSaved(true)
+      setTimeout(() => setJustSaved(false), 1500)
+    } catch {}
+  }
 
   const handleRangeConfigChange = (id: string, cfg: RangeConfig) => {
     setRangeConfigs(prev => ({ ...prev, [id]: cfg }))
@@ -6852,19 +8809,9 @@ export default function App() {
     }
     setFilterRules((prev) => {
       if (prev.find((r) => r.field === name)) return prev
-      const ops = filterOperators(type)
-      return [...prev, {
-        field: name, type, operator: ops[0], value: "", value2: "", values: [],
-        dateMode: "actual", dateGranularity: "Month & Year",
-        dateRangeOp: "after", dateFrom: "", dateTo: "",
-        dateRelativeOpt: "", dateRelativeN: 1, dateIncludeNull: false,
-        catMode: "actual", catMatchMode: "any",
-        wildcardConditions: [{ matchType: "Contains", value: "" }], wildcardIncludeEmpty: true,
-        catTreatment: "categorical",
-        numFunction: isNumericType(type) ? "Sum" : "Count",
-        numMode: "actual", relativeDirection: "Top", relativeN: 5,
-      }]
+      return [...prev, makeFilterRule(name, type)]
     })
+    setJustDroppedFilter(name)
   }
   const handleFilterRemove = (field: string) => {
     setFilterRules((prev) => prev.filter((r) => r.field !== field))
@@ -6873,8 +8820,37 @@ export default function App() {
     setFilterRules((prev) => prev.map((r) => r.field === field ? { ...r, ...patch } : r))
   }
 
+  // View filters — a separate, lower-priority list the builder exposes to viewers. Dropping is
+  // deduped within this list only; the same field may also sit in the base Filters above (base
+  // locks the scope, the view filter lets a viewer pick within it).
+  const handleViewFilterDrop = (name: string, type: FieldType) => {
+    if (fields.columns.length === 0 && fields.rows.length === 0 && fields.values.length === 0) {
+      setShowFilterNeedsFieldAlert(true)
+      return
+    }
+    setViewFilterRules((prev) => {
+      if (prev.find((r) => r.field === name)) return prev
+      // A numeric view filter defaults to the range slider (the inline card's numeric control),
+      // not the checked-value list a base filter starts in.
+      const rule = makeFilterRule(name, type)
+      return [...prev, isNumericType(type) ? { ...rule, numMode: "range" as const } : rule]
+    })
+    setJustDroppedFilter(name)
+  }
+  const handleViewFilterRemove = (field: string) => {
+    setViewFilterRules((prev) => prev.filter((r) => r.field !== field))
+  }
+  const handleViewFilterChange = (field: string, patch: Partial<FilterRule>) => {
+    setViewFilterRules((prev) => prev.map((r) => r.field === field ? { ...r, ...patch } : r))
+  }
+
   const [dupAlert, setDupAlert] = useState<string | null>(null) // field KEY when showing duplicate alert
   const [showFilterNeedsFieldAlert, setShowFilterNeedsFieldAlert] = useState(false)
+  // Field key of the filter dropped most recently, in either list. A brand-new filter should
+  // open its modal so the builder can configure it — but a filter merely being *rendered*
+  // shouldn't, or a saved report would pop a modal per chip on every page load. Comparing
+  // against this makes "auto-open" mean "just dropped", which is what was actually intended.
+  const [justDroppedFilter, setJustDroppedFilter] = useState<string | null>(null)
   const [pendingSource, setPendingSource] = useState<string | null>(null)
 
   // Every field key encodes its owning module (makeFieldKey), so nothing dropped against the
@@ -6882,7 +8858,8 @@ export default function App() {
   // Values/Filters, skipping the prompt only when there's nothing to lose.
   const handleSourceChangeRequest = (next: string) => {
     if (next === source) return
-    const isEmpty = fields.columns.length === 0 && fields.rows.length === 0 && fields.values.length === 0 && filterRules.length === 0
+    const isEmpty = fields.columns.length === 0 && fields.rows.length === 0 && fields.values.length === 0
+      && filterRules.length === 0 && viewFilterRules.length === 0
     if (isEmpty) { setSource(next); return }
     setPendingSource(next)
   }
@@ -6893,6 +8870,7 @@ export default function App() {
     setAggregations({})
     setLookupRoles({})
     setFilterRules([])
+    setViewFilterRules([])
     setReportTimelineFilters({})
     setRangeConfigs({})
     setFieldFormats({})
@@ -6902,7 +8880,7 @@ export default function App() {
   // Each drop is a distinct instance — dropping the same field twice must let each occurrence
   // carry its own aggregation/timeline-filter state, so both are keyed by this fresh id, never
   // by the field key itself (which duplicate pills would otherwise share).
-  const handleAdd = (zone: ZoneKey, field: string, type: FieldType) => {
+  const handleAdd = (zone: PivotZoneKey, field: string, type: FieldType) => {
     const id = nextPivotItemId()
     setFields((prev) => ({ ...prev, [zone]: [...prev[zone], { id, field }] }))
     setAggregations((prev) => {
@@ -6920,11 +8898,11 @@ export default function App() {
     setLookupRoles((prev) => ({ ...prev, [relationshipKey]: role }))
   }
 
-  const handleRemove = (zone: ZoneKey, id: string) => {
+  const handleRemove = (zone: PivotZoneKey, id: string) => {
     setFields((prev) => ({ ...prev, [zone]: prev[zone].filter((item) => item.id !== id) }))
   }
 
-  const handleReorder = (zone: ZoneKey, id: string, toIndex: number) => {
+  const handleReorder = (zone: PivotZoneKey, id: string, toIndex: number) => {
     setFields((prev) => {
       const item = prev[zone].find((it) => it.id === id)
       if (!item) return prev
@@ -6934,7 +8912,7 @@ export default function App() {
     })
   }
 
-  const handleMove = (from: ZoneKey, to: ZoneKey, id: string) => {
+  const handleMove = (from: PivotZoneKey, to: PivotZoneKey, id: string) => {
     const item = fields[from].find((it) => it.id === id)
     if (!item) return
     const type = getFieldType(item.field)
@@ -6985,9 +8963,11 @@ export default function App() {
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
         {appMode === "dashboard" ? (
           <DashboardView />
+        ) : appMode === "tabular" ? (
+          <TabularBuilder />
         ) : (
           <>
-            <PageHeader />
+            <PageHeader reportMode={reportMode} onReportModeChange={setReportMode} onSave={handleSave} justSaved={justSaved} />
             <Toolbar
               source={source}
               setSource={handleSourceChangeRequest}
@@ -7004,59 +8984,86 @@ export default function App() {
               onShowModuleTagChange={setShowModuleTag}
               showProjectCurrency={showProjectCurrency}
               onShowProjectCurrencyChange={setShowProjectCurrency}
+              reportMode={reportMode}
             />
             <div className="flex flex-1 overflow-hidden">
-              <FieldBrowser
-                fields={fields}
-                source={source}
-                onAdd={handleAdd}
-                onRemove={handleRemove}
-                onDupAlert={(name) => setDupAlert(name)}
-                onDragStart={(_, type) => { setDragging(true); setDragType(type) }}
-                onDragEnd={() => { setDragging(false); setDragType(null) }}
-              />
-              <div className="flex flex-col flex-1 min-w-0">
-                <DropZoneBar
+              {reportMode === "create" && (
+                <FieldBrowser
                   fields={fields}
-                  dragging={dragging}
-                  dragType={dragType}
-                  aggregations={aggregations}
-                  timelineFilters={reportTimelineFilters}
-                  rangeConfigs={rangeConfigs}
-                  fieldFormats={fieldFormats}
-                  onDrop={handleAdd}
-                  onMove={handleMove}
-                  onReorder={handleReorder}
+                  source={source}
+                  onAdd={handleAdd}
                   onRemove={handleRemove}
-                  onAggChange={handleAggChange}
-                  onTimelineChange={handleReportTimelineChange}
-                  onRangeConfigChange={handleRangeConfigChange}
-                  onFieldFormatChange={handleFieldFormatChange}
+                  onDupAlert={(name) => setDupAlert(name)}
+                  onDragStart={(_, type) => { setDragging(true); setDragType(type) }}
+                  onDragEnd={() => { setDragging(false); setDragType(null) }}
                 />
-                <FilterBar
-                  rules={filterRules}
-                  dragging={dragging}
-                  source={source}
-                  fields={fields}
-                  aggregations={aggregations}
-                  rangeConfigs={rangeConfigs}
-                  onDrop={handleFilterDrop}
-                  onRemove={handleFilterRemove}
-                  onRuleChange={handleFilterChange}
-                />
-                <ReportCanvas
-                  source={source}
-                  fields={fields}
-                  aggregations={aggregations}
-                  filterRules={filterRules}
-                  timelineFilters={reportTimelineFilters}
-                  rangeConfigs={rangeConfigs}
-                  fieldFormats={fieldFormats}
-                  reportView={reportView}
-                  showTotals={showTotals}
-                  showModuleTag={showModuleTag}
-                  showProjectCurrency={showProjectCurrency}
-                />
+              )}
+              <div className="flex flex-col flex-1 min-w-0">
+                {reportMode === "create" && (
+                  <DropZoneBar
+                    fields={fields}
+                    dragging={dragging}
+                    dragType={dragType}
+                    aggregations={aggregations}
+                    timelineFilters={reportTimelineFilters}
+                    rangeConfigs={rangeConfigs}
+                    fieldFormats={fieldFormats}
+                    onDrop={handleAdd}
+                    onMove={handleMove}
+                    onReorder={handleReorder}
+                    onRemove={handleRemove}
+                    onAggChange={handleAggChange}
+                    onTimelineChange={handleReportTimelineChange}
+                    onRangeConfigChange={handleRangeConfigChange}
+                    onFieldFormatChange={handleFieldFormatChange}
+                  />
+                )}
+                {reportMode === "create" && (
+                  <FilterBar
+                    rules={filterRules}
+                    dragging={dragging}
+                    source={source}
+                    fields={fields}
+                    aggregations={aggregations}
+                    rangeConfigs={rangeConfigs}
+                    onDrop={handleFilterDrop}
+                    onRemove={handleFilterRemove}
+                    onRuleChange={handleFilterChange}
+                    justDropped={justDroppedFilter}
+                  />
+                )}
+                {/* Canvas + View filters share a row BELOW the shelves, so Columns/Rows/Values
+                    and the Filters bar run the full width to the right edge — the view filter
+                    rail is a companion to the report, not to the whole builder. */}
+                <div className="flex flex-1 overflow-hidden">
+                  <ReportCanvas
+                    source={source}
+                    fields={fields}
+                    aggregations={aggregations}
+                    filterRules={filterRules}
+                    viewFilterRules={viewFilterRules}
+                    timelineFilters={reportTimelineFilters}
+                    rangeConfigs={rangeConfigs}
+                    fieldFormats={fieldFormats}
+                    reportView={reportView}
+                    showTotals={showTotals}
+                    showModuleTag={showModuleTag}
+                    showProjectCurrency={showProjectCurrency}
+                  />
+                  <ViewFilterPane
+                    rules={viewFilterRules}
+                    baseRules={filterRules}
+                    dragging={dragging}
+                    source={source}
+                    fields={fields}
+                    aggregations={aggregations}
+                    rangeConfigs={rangeConfigs}
+                    onDrop={handleViewFilterDrop}
+                    onRemove={handleViewFilterRemove}
+                    onRuleChange={handleViewFilterChange}
+                    reportMode={reportMode}
+                  />
+                </div>
               </div>
             </div>
           </>

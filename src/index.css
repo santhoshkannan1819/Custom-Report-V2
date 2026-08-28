@@ -52,6 +52,49 @@
   animation: panel-in 200ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+/* Print / Save-as-PDF — lift the report canvas out of the app chrome and let it flow across
+   pages. Everything else (nav, shelves, filter rails, header buttons) is builder furniture and
+   would only waste paper. Table headers repeat on each page via thead display: table-header-group. */
+@media print {
+  @page { margin: 12mm; }
+
+  html, body {
+    height: auto !important;
+    overflow: visible !important;
+    background: #fff !important;
+  }
+
+  /* Neutralise the app's full-height flex shell so content can paginate instead of clipping. */
+  #root, #root * {
+    max-height: none !important;
+    overflow: visible !important;
+  }
+
+  nav, aside, .print-hide { display: none !important; }
+
+  [data-print-root] {
+    position: static !important;
+    padding: 0 !important;
+    background: #fff !important;
+  }
+
+  /* The canvas nests the table in a scroll container with a rounded card border — flatten it. */
+  [data-print-root] > div {
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    width: 100% !important;
+    max-width: none !important;
+  }
+
+  table { width: 100% !important; font-size: 10pt !important; }
+  thead { display: table-header-group; }
+  tr { break-inside: avoid; page-break-inside: avoid; }
+
+  /* Keep the sticky report header from floating over rows on paper. */
+  th { position: static !important; }
+}
+
 /* Dual-handle range slider (numeric filter modal's Range tab) — two overlapping native
    range inputs sharing one visual track; the track itself is made transparent so only
    each input's own thumb is interactive, letting both handles be dragged independently. */
