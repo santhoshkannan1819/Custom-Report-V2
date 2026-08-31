@@ -880,6 +880,12 @@ const Ic = {
       <polyline points="20 6 9 17 4 12" />
     </svg>
   ),
+  Sheet: ({ size = 13 }: { size?: number }) => (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <line x1="3" y1="9" x2="21" y2="9" /><line x1="3" y1="15" x2="21" y2="15" /><line x1="9" y1="9" x2="9" y2="21" />
+    </svg>
+  ),
   Trash: ({ size = 13 }: { size?: number }) => (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <polyline points="3 6 5 6 21 6" />
@@ -2837,46 +2843,282 @@ function LeftNav({ appMode, setAppMode }: { appMode: string; setAppMode: (m: App
 // than re-deriving from computeReportData is deliberate: the export then matches exactly what
 // the user is looking at — same layout, same formatting, same totals — with no second
 // implementation to drift.
-function reportTableToGrid(table: HTMLTableElement): string[][] {
-  const grid: string[][] = []
+// ── Export ─────────────────────────────────────────────────────────────────────
+// Both exports read the rendered table rather than recomputing the report, so whatever is on
+// screen — filters, view, formatting, layout — is what lands in the file, with nothing to keep
+// in sync. Numeric cells are tagged in the DOM by the canvas's `tabular-nums` class, which is
+// the signal the xlsx writer uses to decide what becomes a real number.
+
+interface GridCell { text: string; numeric: boolean; raw: number | null }
+
+// innerText runs adjacent inline children together, so a value header built from an aggregation
+// badge and a field label reads "SumProject Fee". The badge is spaced with a margin rather than a
+// real space, which is right for the screen and wrong for a file — so the parts are joined here
+// instead of changing the markup.
+function cellExportText(cell: HTMLTableCellElement): string {
+  const parts: string[] = []
+  cell.childNodes.forEach((node) => {
+    const text = (node.textContent || "").replace(/\s+/g, " ").trim()
+    if (text !== "") parts.push(text)
+  })
+  return parts.join(" ")
+}
+
+function reportTableToGrid(table: HTMLTableElement): GridCell[][] {
+  const grid: GridCell[][] = []
   Array.from(table.rows).forEach((tr, r) => {
     if (!grid[r]) grid[r] = []
     let c = 0
     Array.from(tr.cells).forEach((cell) => {
       while (grid[r][c] !== undefined) c++
-      const text = (cell.innerText || "").replace(/\s+/g, " ").trim()
+      const text = cellExportText(cell)
+      const numeric = cell.classList.contains("tabular-nums")
+      // data-v is the cell's unrounded value, set by the canvas either on the cell itself or on
+      // the span wrapping its formatted number. Without it (the row-number gutter, say) the
+      // displayed text is parsed instead.
+      const carried = cell.dataset.v ?? cell.querySelector<HTMLElement>("[data-v]")?.dataset.v
+      const raw = carried !== undefined && carried !== "" ? Number(carried) : null
       for (let i = 0; i < cell.rowSpan; i++) {
         for (let j = 0; j < cell.colSpan; j++) {
           if (!grid[r + i]) grid[r + i] = []
           // Only the origin cell carries the text; the cells it spans stay blank so columns
           // still line up in a spreadsheet.
-          grid[r + i][c + j] = i === 0 && j === 0 ? text : ""
+          grid[r + i][c + j] = i === 0 && j === 0
+            ? { text, numeric, raw: raw !== null && Number.isFinite(raw) ? raw : null }
+            : { text: "", numeric: false, raw: null }
         }
       }
       c += cell.colSpan
     })
   })
-  return grid.map((row) => Array.from(row, (v) => v ?? ""))
+  return grid.map((row) => Array.from(row, (v) => v ?? { text: "", numeric: false, raw: null }))
 }
 
 function csvEscape(v: string): string {
   return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v
 }
 
-function exportReportCsv(): boolean {
-  const table = document.querySelector<HTMLTableElement>("[data-report-table]")
-  if (!table) return false
-  const csv = reportTableToGrid(table).map((row) => row.map(csvEscape).join(",")).join("\r\n")
-  // BOM so Excel opens UTF-8 correctly instead of mangling accented names.
-  const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8;" })
+function downloadBlob(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob)
   const a = document.createElement("a")
   a.href = url
-  a.download = `custom-report-${new Date().toISOString().slice(0, 10)}.csv`
+  a.download = filename
   document.body.appendChild(a)
   a.click()
   document.body.removeChild(a)
   setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
+const exportStamp = () => new Date().toISOString().slice(0, 10)
+
+function exportReportCsv(): boolean {
+  const table = document.querySelector<HTMLTableElement>("[data-report-table]")
+  if (!table) return false
+  const csv = reportTableToGrid(table)
+    .map((row) => row.map((cell) => csvEscape(cell.text)).join(","))
+    .join("\r\n")
+  // BOM so Excel opens UTF-8 correctly instead of mangling accented names.
+  const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8;" })
+  downloadBlob(blob, `custom-report-${exportStamp()}.csv`)
+  return true
+}
+
+// The inverse of the app's own number formatting. A spreadsheet's whole point is that you can
+// sum and chart a column, so "135.7k" is written back out as the number 135700 rather than as
+// text. Applied only to cells the canvas marked numeric, and any cell whose shape isn't
+// recognised falls through to text — the safe direction, since that is what CSV does anyway.
+const DISPLAY_UNIT_MULTIPLIER: Record<string, number> = {
+  k: 1_000, K: 1_000,      // thousands
+  L: 100_000,              // lakhs
+  m: 1_000_000, M: 1_000_000,
+  C: 10_000_000,           // crores
+  B: 1_000_000_000,
+}
+
+function parseDisplayNumber(text: string): number | null {
+  let t = text.trim()
+  if (t === "") return null
+  let sign = 1
+  if (/^\(.+\)$/.test(t)) { sign = -1; t = t.slice(1, -1).trim() }   // accounting negatives
+  t = t.replace(/\s+[A-Za-z]{3}$/, "").trim()                        // trailing currency code
+  const m = /^[^\d+-]*(-?[\d,\s]*\.?\d+)([kKLmMCB]?)$/.exec(t)
+  if (!m) return null
+  const digits = m[1].replace(/[,\s]/g, "")
+  if (!/^-?\d*\.?\d+$/.test(digits)) return null
+  const n = Number(digits)
+  if (!Number.isFinite(n)) return null
+  return sign * n * (m[2] ? DISPLAY_UNIT_MULTIPLIER[m[2]] : 1)
+}
+
+// ── Minimal .xlsx writer ───────────────────────────────────────────────────────
+// An .xlsx is a ZIP of XML parts. Writing both by hand keeps the app dependency-free — a
+// spreadsheet library would be several times the size of the whole bundle — and one flat sheet
+// needs very little of the format. Entries are STOREd rather than deflated, which every ZIP
+// reader is required to support, so no compressor is needed either.
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256)
+  for (let i = 0; i < 256; i++) {
+    let c = i
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+    table[i] = c >>> 0
+  }
+  return table
+})()
+
+function crc32(bytes: Uint8Array): number {
+  let c = 0xffffffff
+  for (let i = 0; i < bytes.length; i++) c = CRC32_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8)
+  return (c ^ 0xffffffff) >>> 0
+}
+
+function zipStore(entries: { name: string; bytes: Uint8Array }[]): Blob {
+  const enc = new TextEncoder()
+  const u16 = (v: number) => [v & 0xff, (v >>> 8) & 0xff]
+  const u32 = (v: number) => [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff]
+  // A fixed 1980-01-01 timestamp: zero is not a legal DOS date, and a real clock would only
+  // make byte-identical exports differ.
+  const DOS_TIME = 0, DOS_DATE = 33
+
+  const body: Uint8Array[] = []
+  const central: Uint8Array[] = []
+  let offset = 0
+
+  entries.forEach(({ name, bytes }) => {
+    const nameBytes = enc.encode(name)
+    const crc = crc32(bytes)
+    const local = Uint8Array.from([
+      ...u32(0x04034b50), ...u16(20), ...u16(0), ...u16(0),
+      ...u16(DOS_TIME), ...u16(DOS_DATE),
+      ...u32(crc), ...u32(bytes.length), ...u32(bytes.length),
+      ...u16(nameBytes.length), ...u16(0),
+      ...nameBytes,
+    ])
+    body.push(local, bytes)
+    central.push(Uint8Array.from([
+      ...u32(0x02014b50), ...u16(20), ...u16(20), ...u16(0), ...u16(0),
+      ...u16(DOS_TIME), ...u16(DOS_DATE),
+      ...u32(crc), ...u32(bytes.length), ...u32(bytes.length),
+      ...u16(nameBytes.length), ...u16(0), ...u16(0),
+      ...u16(0), ...u16(0), ...u32(0), ...u32(offset),
+      ...nameBytes,
+    ]))
+    offset += local.length + bytes.length
+  })
+
+  const centralSize = central.reduce((s, c) => s + c.length, 0)
+  const end = Uint8Array.from([
+    ...u32(0x06054b50), ...u16(0), ...u16(0),
+    ...u16(entries.length), ...u16(entries.length),
+    ...u32(centralSize), ...u32(offset), ...u16(0),
+  ])
+
+  const parts = [...body, ...central, end]
+  const out = new Uint8Array(parts.reduce((s, p) => s + p.length, 0))
+  let at = 0
+  parts.forEach((p) => { out.set(p, at); at += p.length })
+  return new Blob([out], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  })
+}
+
+function xmlEscape(s: string): string {
+  return s.replace(/[&<>"']/g, (ch) =>
+    ch === "&" ? "&amp;" : ch === "<" ? "&lt;" : ch === ">" ? "&gt;" : ch === '"' ? "&quot;" : "&apos;")
+}
+
+// A1, B1 … Z1, AA1 — spreadsheet column letters.
+function colRef(index: number): string {
+  let ref = ""
+  let n = index
+  while (n >= 0) {
+    ref = String.fromCharCode(65 + (n % 26)) + ref
+    n = Math.floor(n / 26) - 1
+  }
+  return ref
+}
+
+function exportReportXlsx(): boolean {
+  const table = document.querySelector<HTMLTableElement>("[data-report-table]")
+  if (!table) return false
+  const grid = reportTableToGrid(table)
+  if (grid.length === 0) return false
+  const headerRows = table.tHead?.rows.length ?? 1
+  const width = grid.reduce((w, row) => Math.max(w, row.length), 0)
+
+  const rowsXml = grid.map((row, r) => {
+    const cells = row.map((cell, c) => {
+      if (cell.text === "") return ""
+      const ref = `${colRef(c)}${r + 1}`
+      const style = r < headerRows ? ' s="1"' : ""
+      const num = cell.raw ?? (cell.numeric ? parseDisplayNumber(cell.text) : null)
+      return num !== null
+        ? `<c r="${ref}"${style}><v>${num}</v></c>`
+        : `<c r="${ref}"${style} t="inlineStr"><is><t>${xmlEscape(cell.text)}</t></is></c>`
+    }).join("")
+    return `<row r="${r + 1}">${cells}</row>`
+  }).join("")
+
+  // Widths sized to the longest cell in each column, so the sheet is readable on open rather
+  // than a wall of ####.
+  const cols = Array.from({ length: width }, (_, c) => {
+    const longest = grid.reduce((max, row) => Math.max(max, row[c]?.text.length ?? 0), 0)
+    return `<col min="${c + 1}" max="${c + 1}" width="${Math.min(48, Math.max(10, longest + 3))}" customWidth="1"/>`
+  }).join("")
+
+  const sheet =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+    `<sheetViews><sheetView workbookViewId="0">` +
+    `<pane ySplit="${headerRows}" topLeftCell="A${headerRows + 1}" activePane="bottomLeft" state="frozen"/>` +
+    `</sheetView></sheetViews>` +
+    `<cols>${cols}</cols><sheetData>${rowsXml}</sheetData></worksheet>`
+
+  const styles =
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+    `<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>` +
+    `<font><b/><sz val="11"/><name val="Calibri"/></font></fonts>` +
+    // Excel requires fill 0 = none and fill 1 = gray125 before any custom fill.
+    `<fills count="2"><fill><patternFill patternType="none"/></fill>` +
+    `<fill><patternFill patternType="gray125"/></fill></fills>` +
+    `<borders count="1"><border/></borders>` +
+    `<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>` +
+    `<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>` +
+    `<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>` +
+    `</styleSheet>`
+
+  const R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  const enc = new TextEncoder()
+  const blob = zipStore([
+    { name: "[Content_Types].xml", bytes: enc.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+      `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
+      `<Default Extension="xml" ContentType="application/xml"/>` +
+      `<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>` +
+      `<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>` +
+      `<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>` +
+      `</Types>`) },
+    { name: "_rels/.rels", bytes: enc.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+      `<Relationship Id="rId1" Type="${R}/officeDocument" Target="xl/workbook.xml"/>` +
+      `</Relationships>`) },
+    { name: "xl/workbook.xml", bytes: enc.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="${R}">` +
+      `<sheets><sheet name="Report" sheetId="1" r:id="rId1"/></sheets></workbook>`) },
+    { name: "xl/_rels/workbook.xml.rels", bytes: enc.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+      `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+      `<Relationship Id="rId1" Type="${R}/worksheet" Target="worksheets/sheet1.xml"/>` +
+      `<Relationship Id="rId2" Type="${R}/styles" Target="styles.xml"/>` +
+      `</Relationships>`) },
+    { name: "xl/styles.xml", bytes: enc.encode(styles) },
+    { name: "xl/worksheets/sheet1.xml", bytes: enc.encode(sheet) },
+  ])
+  downloadBlob(blob, `custom-report-${exportStamp()}.xlsx`)
   return true
 }
 
@@ -3257,13 +3499,15 @@ function NewViewModal({ existingNames, onSave, onClose }: {
   )
 }
 
-function PageHeader({ reportMode, onReportModeChange, onSave, justSaved, dirty, viewBlockedReason }: {
+function PageHeader({ reportMode, onReportModeChange, onSave, justSaved, dirty, saveBlockedReason, viewBlockedReason }: {
   reportMode: ReportMode
   onReportModeChange: (m: ReportMode) => void
   onSave: () => void
   justSaved: boolean
   /** Unsaved changes since the last save — drives the Save button's emphasis. */
   dirty: boolean
+  /** Why Save is unavailable, or null when it is. An empty report has nothing to write. */
+  saveBlockedReason: string | null
   /** Why View is unavailable, or null when it is. A report has to be saved, and non-empty,
       before it can be viewed — so the reason doubles as the disabled button's tooltip. */
   viewBlockedReason: string | null
@@ -3306,6 +3550,20 @@ function PageHeader({ reportMode, onReportModeChange, onSave, justSaved, dirty, 
                   onClick={() => {
                     // Exports exactly what's rendered — current filters, formatting and layout all
                     // already applied, so there's nothing to keep in sync.
+                    if (!exportReportXlsx()) setExportError("Nothing to export yet — build a report first.")
+                    else setExportError(null)
+                    setShowExport(false)
+                  }}
+                  className="flex items-start gap-2.5 w-full px-3 py-2 text-left hover:bg-indigo-50 transition-colors"
+                >
+                  <span className="text-gray-400 mt-0.5"><Ic.Sheet /></span>
+                  <span>
+                    <span className="block text-[13px] text-gray-800">Download Excel</span>
+                    <span className="block text-[11px] text-gray-400 leading-snug">.xlsx with real numbers you can sum and chart.</span>
+                  </span>
+                </button>
+                <button
+                  onClick={() => {
                     if (!exportReportCsv()) setExportError("Nothing to export yet — build a report first.")
                     else setExportError(null)
                     setShowExport(false)
@@ -3315,7 +3573,7 @@ function PageHeader({ reportMode, onReportModeChange, onSave, justSaved, dirty, 
                   <span className="text-gray-400 mt-0.5"><Ic.Download size={13} /></span>
                   <span>
                     <span className="block text-[13px] text-gray-800">Download CSV</span>
-                    <span className="block text-[11px] text-gray-400 leading-snug">The table as shown, for Excel or Sheets.</span>
+                    <span className="block text-[11px] text-gray-400 leading-snug">The table exactly as shown, as plain text.</span>
                   </span>
                 </button>
                 <button
@@ -3336,13 +3594,16 @@ function PageHeader({ reportMode, onReportModeChange, onSave, justSaved, dirty, 
         {reportMode === "create" && (
           <button
             onClick={onSave}
-            title="Save this report's fields, filters, and formatting"
-            className={`flex items-center gap-1.5 text-[13px] rounded-md px-3 py-1.5 shadow-sm transition-all font-medium
-              ${justSaved
-                ? "text-emerald-600 border border-emerald-200 bg-emerald-50"
-                : dirty
-                  ? "text-indigo-700 border border-indigo-300 bg-indigo-50 hover:bg-indigo-100 hover:shadow-sm"
-                  : "text-gray-600 border border-gray-200 bg-white hover:bg-gray-50 hover:shadow-sm"}`}
+            disabled={saveBlockedReason !== null}
+            title={saveBlockedReason ?? "Save this report's fields, filters, and formatting"}
+            className={`flex items-center gap-1.5 text-[13px] rounded-md px-3 py-1.5 transition-all font-medium
+              ${saveBlockedReason !== null
+                ? "text-gray-400 border border-gray-200 bg-gray-100 cursor-not-allowed"
+                : justSaved
+                  ? "text-emerald-600 border border-emerald-200 bg-emerald-50 shadow-sm"
+                  : dirty
+                    ? "text-indigo-700 border border-indigo-300 bg-indigo-50 shadow-sm hover:bg-indigo-100 hover:shadow-sm"
+                    : "text-gray-600 border border-gray-200 bg-white shadow-sm hover:bg-gray-50 hover:shadow-sm"}`}
           >
             {justSaved ? <Ic.Check /> : <Ic.Save size={14} />}
             <span>{justSaved ? "Saved" : "Save"}</span>
@@ -7405,9 +7666,11 @@ function TabularCanvas({
                 {row.cells.map((cell, ci) => {
                   const item = fields.columns[ci]
                   const type = getFieldType(item.field)
+                  const rawNum = typeof cell.raw === "number" && Number.isFinite(cell.raw) ? cell.raw : null
                   return (
                     <td
                       key={item.id}
+                      data-v={rawNum ?? undefined}
                       className={`${tdCls} text-gray-700 ${alignClass(fieldFormats[item.id], isNumericType(type) ? "right" : "left")} ${isNumericType(type) ? "tabular-nums" : ""}`}
                     >
                       {cell.text}
@@ -7690,6 +7953,12 @@ function TabularBuilder() {
   const savedViews = useSavedViews(SAVED_TABULAR_VIEWS_KEY, reportMode, viewFilterRules, setViewFilterRules)
   const [showNewView, setShowNewView] = useState(false)
 
+  // Nothing dropped means nothing to write — saving an empty report would only overwrite a real
+  // one already in storage with a blank payload.
+  const saveBlockedReason = hasAnyField
+    ? null
+    : "Add fields to Columns or Group by before saving this report"
+
   // View mode shows a finished report, so it needs one that exists and is saved.
   const viewBlockedReason = !hasAnyField
     ? "Add fields to Columns or Group by before viewing this report"
@@ -7698,6 +7967,7 @@ function TabularBuilder() {
       : null
 
   const handleSave = () => {
+    if (saveBlockedReason !== null) return
     try {
       localStorage.setItem(SAVED_TABULAR_KEY, payloadJson)
       setSavedSnapshot(payloadJson)
@@ -7821,7 +8091,8 @@ function TabularBuilder() {
 
       <PageHeader
         reportMode={reportMode} onReportModeChange={setReportMode} onSave={handleSave}
-        justSaved={justSaved} dirty={dirty} viewBlockedReason={viewBlockedReason}
+        justSaved={justSaved} dirty={dirty}
+        saveBlockedReason={saveBlockedReason} viewBlockedReason={viewBlockedReason}
       />
       <TabularToolbar
         source={source}
@@ -8571,6 +8842,13 @@ function detectIndianLocale(): boolean {
 // Cell-value formatter that respects a field's Formatting-panel override, if any. With no
 // override (or one left fully at "auto"/null) this is byte-for-byte fmtNum's own behavior —
 // only an explicit decimals/units edit in the panel changes anything for that field.
+// Wraps a formatted number so the cell also carries its unrounded value. The display text is
+// deliberately lossy — "2.0M" for 1,984,200 — and a spreadsheet export that parsed the text back
+// would hand Excel numbers whose columns don't add up. Exports read data-v; the UI shows the text.
+function numCellValue(n: number, format?: FieldFormat) {
+  return <span data-v={Number.isFinite(n) ? n : 0}>{formatCellValue(n, format)}</span>
+}
+
 function formatCellValue(n: number, format?: FieldFormat): string {
   if (!format || (format.units === "auto" && format.decimals === null)) return fmtNum(n)
   if (!Number.isFinite(n)) return "0"
@@ -8863,19 +9141,19 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                           ? colValues.flatMap((_, ci) =>
                               fields.values.map((item, vi) => (
                                 <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} tabular-nums ${valueCls}`}>
-                                  {formatCellValue(aggValue(node, ci, vi), fieldFormats[item.id])}{currencySuffix(item, nodeBuckets(node, ci))}
+                                  {numCellValue(aggValue(node, ci, vi), fieldFormats[item.id])}{currencySuffix(item, nodeBuckets(node, ci))}
                                 </td>
                               ))
                             )
                           : fields.values.map((item, vi) => (
                               <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} tabular-nums ${valueCls}`}>
-                                {formatCellValue(aggValue(node, 0, vi), fieldFormats[item.id])}{currencySuffix(item, nodeBuckets(node, 0))}
+                                {numCellValue(aggValue(node, 0, vi), fieldFormats[item.id])}{currencySuffix(item, nodeBuckets(node, 0))}
                               </td>
                             ))
                         }
                         {hasColumns && fields.values.map((item, vi) => (
                           <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} font-semibold tabular-nums bg-gray-50`}>
-                            {formatCellValue(nodeRowTotal(node, vi), fieldFormats[item.id])}{currencySuffix(item, nodeTotalBuckets(node))}
+                            {numCellValue(nodeRowTotal(node, vi), fieldFormats[item.id])}{currencySuffix(item, nodeTotalBuckets(node))}
                           </td>
                         ))}
                       </>
@@ -8891,16 +9169,16 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                     ? colValues.flatMap((_, ci) =>
                         fields.values.map((item, vi) => (
                           <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums`}>
-                            {formatCellValue(displayRows.reduce((s, _, ri) => s + cellNum(ri, ci, vi), 0), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
+                            {numCellValue(displayRows.reduce((s, _, ri) => s + cellNum(ri, ci, vi), 0), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
                           </td>
                         ))
                       )
                     : grandTotals.map((t, vi) => (
-                        <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} text-gray-900 tabular-nums`}>{formatCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], displayRows.map((_, ri) => bucketRows(ri, 0)))}</td>
+                        <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} text-gray-900 tabular-nums`}>{numCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], displayRows.map((_, ri) => bucketRows(ri, 0)))}</td>
                       ))
                   }
                   {hasColumns && grandTotals.map((t, vi) => (
-                    <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} text-gray-900 tabular-nums bg-gray-100`}>{formatCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], displayRows.flatMap((_, ri) => colValues.map((_, ci) => bucketRows(ri, ci))))}</td>
+                    <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} text-gray-900 tabular-nums bg-gray-100`}>{numCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], displayRows.flatMap((_, ri) => colValues.map((_, ci) => bucketRows(ri, ci))))}</td>
                   ))}
                 </tr>
               )}
@@ -9034,19 +9312,19 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                     ? colValues.flatMap((_, ci) =>
                         fields.values.map((item, vi) => (
                           <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
-                            {formatCellValue(cellNum(ri, ci, vi), fieldFormats[item.id])}{currencySuffix(item, [bucketRows(ri, ci)])}
+                            {numCellValue(cellNum(ri, ci, vi), fieldFormats[item.id])}{currencySuffix(item, [bucketRows(ri, ci)])}
                           </td>
                         ))
                       )
                     : fields.values.map((item, vi) => (
                         <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
-                          {formatCellValue(cellNum(ri, 0, vi), fieldFormats[item.id])}{currencySuffix(item, [bucketRows(ri, 0)])}
+                          {numCellValue(cellNum(ri, 0, vi), fieldFormats[item.id])}{currencySuffix(item, [bucketRows(ri, 0)])}
                         </td>
                       ))
                   }
                   {hasColumns && hasValues && rowTotals.map((t, vi) => (
                     <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} font-semibold text-gray-800 tabular-nums bg-gray-50`}>
-                      {formatCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], colValues.map((_, ci) => bucketRows(ri, ci)))}
+                      {numCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], colValues.map((_, ci) => bucketRows(ri, ci)))}
                     </td>
                   ))}
                 </tr>
@@ -9065,7 +9343,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                             const buckets = groupIndices.map((absRi) => bucketRows(absRi, ci))
                             return (
                               <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
-                                {formatCellValue(subtotal, fieldFormats[item.id])}{currencySuffix(item, buckets)}
+                                {numCellValue(subtotal, fieldFormats[item.id])}{currencySuffix(item, buckets)}
                               </td>
                             )
                           })
@@ -9076,7 +9354,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                           const buckets = groupIndices.map((absRi) => bucketRows(absRi, 0))
                           return (
                             <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
-                              {formatCellValue(subtotal, fieldFormats[item.id])}{currencySuffix(item, buckets)}
+                              {numCellValue(subtotal, fieldFormats[item.id])}{currencySuffix(item, buckets)}
                             </td>
                           )
                         })
@@ -9087,7 +9365,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                       const buckets = groupIndices.flatMap((absRi) => colValues.map((_, ci) => bucketRows(absRi, ci)))
                       return (
                         <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums bg-gray-100`}>
-                          {formatCellValue(subtotal, fieldFormats[item.id])}{currencySuffix(item, buckets)}
+                          {numCellValue(subtotal, fieldFormats[item.id])}{currencySuffix(item, buckets)}
                         </td>
                       )
                     })}
@@ -9105,16 +9383,16 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                 ? colValues.flatMap((_, ci) =>
                     fields.values.map((item, vi) => (
                       <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums`}>
-                        {formatCellValue(displayRows.reduce((s, _, ri) => s + cellNum(ri, ci, vi), 0), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
+                        {numCellValue(displayRows.reduce((s, _, ri) => s + cellNum(ri, ci, vi), 0), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
                       </td>
                     ))
                   )
                 : grandTotals.map((t, vi) => (
-                    <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} text-gray-900 tabular-nums`}>{formatCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], displayRows.map((_, ri) => bucketRows(ri, 0)))}</td>
+                    <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} text-gray-900 tabular-nums`}>{numCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], displayRows.map((_, ri) => bucketRows(ri, 0)))}</td>
                   ))
               }
               {hasColumns && grandTotals.map((t, vi) => (
-                <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} text-gray-900 tabular-nums bg-gray-100`}>{formatCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], displayRows.flatMap((_, ri) => colValues.map((_, ci) => bucketRows(ri, ci))))}</td>
+                <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} text-gray-900 tabular-nums bg-gray-100`}>{numCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], displayRows.flatMap((_, ri) => colValues.map((_, ci) => bucketRows(ri, ci))))}</td>
               ))}
             </tr>
           )}
@@ -9214,6 +9492,12 @@ export default function App() {
     fields.columns.length > 0 || fields.rows.length > 0 || fields.values.length > 0
   // An empty report has nothing worth saving, so it doesn't get the "unsaved changes" emphasis.
   const dirty = savedSnapshot !== payloadJson && hasAnyPivotField
+  // Nothing dropped means nothing to write — saving an empty report would only overwrite a real
+  // one already in storage with a blank payload.
+  const saveBlockedReason = hasAnyPivotField
+    ? null
+    : "Add fields to Columns, Rows, or Values before saving this report"
+
   const viewBlockedReason = !hasAnyPivotField
     ? "Add fields to Columns, Rows, or Values before viewing this report"
     : dirty
@@ -9221,6 +9505,7 @@ export default function App() {
       : null
 
   const handleSave = () => {
+    if (saveBlockedReason !== null) return
     try {
       localStorage.setItem(SAVED_REPORT_KEY, payloadJson)
       setSavedSnapshot(payloadJson)
@@ -9421,7 +9706,8 @@ export default function App() {
           <>
             <PageHeader
         reportMode={reportMode} onReportModeChange={setReportMode} onSave={handleSave}
-        justSaved={justSaved} dirty={dirty} viewBlockedReason={viewBlockedReason}
+        justSaved={justSaved} dirty={dirty}
+        saveBlockedReason={saveBlockedReason} viewBlockedReason={viewBlockedReason}
       />
             <Toolbar
               source={source}
