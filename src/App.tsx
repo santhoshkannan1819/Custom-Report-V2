@@ -880,6 +880,12 @@ const Ic = {
       <polyline points="20 6 9 17 4 12" />
     </svg>
   ),
+  Trash: ({ size = 13 }: { size?: number }) => (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="3 6 5 6 21 6" />
+      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+    </svg>
+  ),
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -2891,11 +2897,376 @@ function NavBtn({ children, label, active = false, nav = false }: {
 
 // ── Page header ────────────────────────────────────────────────────────────────
 
-function PageHeader({ reportMode, onReportModeChange, onSave, justSaved }: {
+// ── Saved views ────────────────────────────────────────────────────────────────
+
+type ViewAudience = "me" | "specific" | "all"
+
+// A saved view is a child version of its report. The parent owns the source, fields, filters,
+// formatting and which fields sit on the view-filter rail; the view owns one configuration of
+// that rail. Storing only the rail's rules is what lets a view stay valid as its parent evolves —
+// applying one reconciles against the report's current rail rather than overwriting it.
+interface SavedView {
+  id: string
+  name: string
+  audience: ViewAudience
+  members: string[]
+  rules: FilterRule[]
+}
+
+const nextSavedViewId = () => `view-${Math.random().toString(36).slice(2, 10)}`
+
+const AUDIENCE_LABEL: Record<ViewAudience, string> = {
+  me: "Only me",
+  specific: "Specific team members",
+  all: "All team members",
+}
+
+function useSavedViews(
+  storageKey: string,
+  reportMode: ReportMode,
+  viewFilterRules: FilterRule[],
+  setViewFilterRules: (rules: FilterRule[]) => void,
+) {
+  const [views, setViews] = useState<SavedView[]>(() => {
+    try {
+      const raw = localStorage.getItem(storageKey)
+      return raw ? (JSON.parse(raw) as SavedView[]) : []
+    } catch {
+      return []
+    }
+  })
+  const [activeId, setActiveId] = useState<string | null>(null)
+  // The report's own rail setup, captured when view mode is entered. It is what Default View
+  // shows, and what edit mode gets handed back — a viewer's tweaks belong to the view layer, not
+  // to the report definition, so they must not follow the user back into the builder.
+  const reportRules = useRef<FilterRule[]>(viewFilterRules)
+  // What the active view currently stands for. The rail is "changed" relative to this.
+  const [baseline, setBaseline] = useState<FilterRule[]>(viewFilterRules)
+
+  const persist = (next: SavedView[]) => {
+    setViews(next)
+    try { localStorage.setItem(storageKey, JSON.stringify(next)) } catch {}
+  }
+
+  const prevMode = useRef(reportMode)
+  useEffect(() => {
+    if (prevMode.current === reportMode) return
+    prevMode.current = reportMode
+    if (reportMode === "view") {
+      reportRules.current = viewFilterRules
+      setBaseline(viewFilterRules)
+      setActiveId(null)
+    } else {
+      setViewFilterRules(reportRules.current)
+      setActiveId(null)
+    }
+  }, [reportMode]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Keep a view's selections for fields still on the rail, and pick up any field added to the
+  // report since the view was saved. Fields dropped from the rail fall away with it.
+  const reconcile = (rules: FilterRule[]): FilterRule[] =>
+    reportRules.current.map((r) => rules.find((s) => s.field === r.field) ?? r)
+
+  const applyView = (id: string | null) => {
+    const target = id === null ? reportRules.current : views.find((v) => v.id === id)?.rules
+    const next = reconcile(target ?? reportRules.current)
+    setViewFilterRules(next)
+    setBaseline(next)
+    setActiveId(id)
+  }
+
+  const saveView = (name: string, audience: ViewAudience, members: string[]) => {
+    const view: SavedView = {
+      id: nextSavedViewId(),
+      name: name.trim(),
+      audience,
+      members: audience === "specific" ? members : [],
+      rules: viewFilterRules,
+    }
+    persist([...views, view])
+    setBaseline(viewFilterRules)
+    setActiveId(view.id)
+  }
+
+  const deleteView = (id: string) => {
+    persist(views.filter((v) => v.id !== id))
+    if (activeId === id) {
+      const next = reconcile(reportRules.current)
+      setViewFilterRules(next)
+      setBaseline(next)
+      setActiveId(null)
+    }
+  }
+
+  const resetView = () => setViewFilterRules(baseline)
+
+  const activeView = views.find((v) => v.id === activeId) ?? null
+  return {
+    views,
+    activeId,
+    activeName: activeView?.name ?? "Default View",
+    dirty: JSON.stringify(viewFilterRules) !== JSON.stringify(baseline),
+    applyView,
+    saveView,
+    deleteView,
+    resetView,
+  }
+}
+
+// The view-mode toolbar: which view is showing, how many of its filters are set, and — once the
+// rail has been touched — the two things you can do about it.
+function SavedViewsBar({
+  views, activeId, activeName, dirty, onPick, onSaveAs, onReset, onDelete,
+}: {
+  views: SavedView[]
+  activeId: string | null
+  activeName: string
+  dirty: boolean
+  onPick: (id: string | null) => void
+  onSaveAs: () => void
+  onReset: () => void
+  onDelete: (id: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const btnRef = useRef<HTMLButtonElement>(null)
+  return (
+    <div className="flex items-center gap-1.5">
+      <button
+        ref={btnRef}
+        onClick={() => setOpen((p) => !p)}
+        title="Switch between saved views of this report"
+        className={`flex items-center gap-1.5 text-[13px] border rounded-md px-2.5 py-1.5 transition-all font-medium
+          ${open ? "text-indigo-600 border-indigo-300 bg-indigo-50" : "text-gray-700 border-gray-200 bg-white hover:bg-gray-50"}`}
+      >
+        <Ic.ViewDetail /><span>{activeName}</span><Ic.ChevDown size={10} />
+      </button>
+      {open && (
+        <ChipPortalMenu anchorRef={btnRef} onClose={() => setOpen(false)}>
+          <SavedViewsMenu
+            views={views}
+            activeId={activeId}
+            onPick={(id) => { onPick(id); setOpen(false) }}
+            onDelete={onDelete}
+          />
+        </ChipPortalMenu>
+      )}
+
+      {/* Only offered once the rail differs from the view on screen — with nothing changed there
+          is no version to capture and nothing to discard. */}
+      {dirty && (
+        <>
+          <button
+            onClick={onSaveAs}
+            title="Save view as…"
+            className="flex items-center text-[13px] text-indigo-700 border border-indigo-300 bg-indigo-50
+              rounded-md px-2.5 py-1.5 hover:bg-indigo-100 transition-colors"
+          >
+            <Ic.Save size={14} />
+          </button>
+          <button
+            onClick={onReset}
+            title={`Discard changes and go back to ${activeName}`}
+            className="flex items-center text-[13px] text-gray-500 border border-gray-200 bg-white
+              rounded-md px-2.5 py-1.5 hover:bg-gray-50 hover:text-gray-700 transition-colors"
+          >
+            <Ic.X />
+          </button>
+        </>
+      )}
+    </div>
+  )
+}
+
+function SavedViewsMenu({ views, activeId, onPick, onDelete }: {
+  views: SavedView[]
+  activeId: string | null
+  onPick: (id: string | null) => void
+  onDelete: (id: string) => void
+}) {
+  const [query, setQuery] = useState("")
+  const q = query.trim().toLowerCase()
+  const match = (v: SavedView) => v.name.toLowerCase().includes(q)
+  const mine = views.filter((v) => v.audience === "me" && match(v))
+  const shared = views.filter((v) => v.audience !== "me" && match(v))
+
+  const row = (view: SavedView) => (
+    <div key={view.id} className="group flex items-center gap-2 pl-6 pr-2 py-1.5 hover:bg-indigo-50 transition-colors">
+      <span className="text-gray-400 shrink-0">{view.audience === "me" ? <Ic.Person /> : <Ic.Users />}</span>
+      <button onClick={() => onPick(view.id)} className="flex-1 min-w-0 text-left">
+        <span className={`block text-[13px] truncate ${activeId === view.id ? "text-indigo-600 font-medium" : "text-gray-700"}`}>
+          {view.name}
+        </span>
+        {view.audience === "specific" && view.members.length > 0 && (
+          <span className="block text-[11px] text-gray-400 truncate">
+            Shared with {view.members.length} {view.members.length === 1 ? "person" : "people"}
+          </span>
+        )}
+      </button>
+      {activeId === view.id && <span className="text-indigo-600 shrink-0"><Ic.Check /></span>}
+      <button
+        onClick={() => onDelete(view.id)}
+        title={`Delete "${view.name}"`}
+        className="shrink-0 text-gray-300 opacity-0 group-hover:opacity-100 hover:text-red-500 transition-all"
+      >
+        <Ic.Trash />
+      </button>
+    </div>
+  )
+
+  return (
+    <div className="mt-1 bg-white border border-gray-200 rounded-xl shadow-2xl w-[280px] overflow-hidden">
+      <p className="text-[14px] font-semibold text-gray-900 px-3 pt-3 pb-2">Saved views</p>
+      <div className="px-3 pb-2">
+        <div className="flex items-center gap-2 border border-gray-200 rounded-lg px-2.5 py-1.5 focus-within:border-indigo-300">
+          <span className="text-gray-400"><Ic.Search /></span>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search view..."
+            className="flex-1 min-w-0 text-[13px] outline-none placeholder:text-gray-400"
+          />
+        </div>
+      </div>
+
+      <div className="max-h-[320px] overflow-y-auto pb-2">
+        {"default view".includes(q) && (
+          <button
+            onClick={() => onPick(null)}
+            className={`flex items-center gap-2 w-full px-3 py-2 transition-colors
+              ${activeId === null ? "bg-indigo-50 text-indigo-600 font-medium" : "text-gray-700 hover:bg-indigo-50"}`}
+          >
+            <Ic.Globe /><span className="flex-1 text-left text-[13px]">Default View</span>
+            {activeId === null && <Ic.Check />}
+          </button>
+        )}
+
+        <p className="flex items-center gap-2 text-[12px] font-medium text-gray-500 px-3 pt-3 pb-1">
+          <Ic.Person /> My saved views
+        </p>
+        {mine.length > 0
+          ? mine.map(row)
+          : <p className="text-[12px] text-gray-400 pl-6 py-1.5">{q ? "No matches" : "No saved views"}</p>}
+
+        <p className="flex items-center gap-2 text-[12px] font-medium text-gray-500 px-3 pt-3 pb-1">
+          <Ic.Users /> Shared views
+        </p>
+        {shared.length > 0
+          ? shared.map(row)
+          : <p className="text-[12px] text-gray-400 pl-6 py-1.5">{q ? "No matches" : "No shared views"}</p>}
+      </div>
+    </div>
+  )
+}
+
+function NewViewModal({ existingNames, onSave, onClose }: {
+  existingNames: string[]
+  onSave: (name: string, audience: ViewAudience, members: string[]) => void
+  onClose: () => void
+}) {
+  const [name, setName] = useState("")
+  const [audience, setAudience] = useState<ViewAudience>("me")
+  const [members, setMembers] = useState<string[]>([])
+
+  const trimmed = name.trim()
+  const duplicate = existingNames.some((n) => n.toLowerCase() === trimmed.toLowerCase())
+  const canSave = trimmed.length > 0 && !duplicate && (audience !== "specific" || members.length > 0)
+
+  const toggleMember = (person: string) =>
+    setMembers((prev) => (prev.includes(person) ? prev.filter((p) => p !== person) : [...prev, person]))
+
+  return createPortal(
+    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40" onMouseDown={onClose}>
+      <div
+        className="bg-white rounded-xl shadow-2xl w-[520px] max-h-[85vh] flex flex-col overflow-hidden"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-6 pt-5 pb-3">
+          <h2 className="text-[17px] font-semibold text-gray-900">New View</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700 transition-colors"><Ic.X /></button>
+        </div>
+
+        <div className="px-6 pb-4 overflow-y-auto">
+          <label className="block text-[12px] font-medium text-gray-700 mb-1.5">
+            <span className="text-red-500">*</span>Name
+          </label>
+          <input
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && canSave) onSave(trimmed, audience, members) }}
+            placeholder="e.g: Weekly view"
+            className={`w-full text-[13px] border rounded-lg px-3 py-2 outline-none transition-colors
+              ${duplicate ? "border-red-300 focus:border-red-400" : "border-gray-200 focus:border-indigo-300"}`}
+          />
+          {duplicate && <p className="text-[11px] text-red-500 mt-1">A view with this name already exists.</p>}
+
+          <p className="text-[12px] font-medium text-gray-700 mt-5 mb-2">
+            <span className="text-red-500">*</span>Make this view available for
+          </p>
+          <div className="flex flex-col gap-2.5">
+            {(["me", "specific", "all"] as ViewAudience[]).map((opt) => (
+              <label key={opt} className="flex items-center gap-2.5 cursor-pointer">
+                <input
+                  type="radio"
+                  name="view-audience"
+                  checked={audience === opt}
+                  onChange={() => setAudience(opt)}
+                  className="w-4 h-4 accent-indigo-600"
+                />
+                <span className="text-[13px] text-gray-800">{AUDIENCE_LABEL[opt]}</span>
+              </label>
+            ))}
+          </div>
+
+          {audience === "specific" && (
+            <div className="mt-3 ml-6 border border-gray-200 rounded-lg max-h-[168px] overflow-y-auto">
+              {PERSON_NAMES.map((person) => (
+                <label key={person} className="flex items-center gap-2.5 px-3 py-1.5 hover:bg-indigo-50 cursor-pointer transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={members.includes(person)}
+                    onChange={() => toggleMember(person)}
+                    className="w-3.5 h-3.5 accent-indigo-600"
+                  />
+                  <span className="text-[13px] text-gray-700">{person}</span>
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="flex justify-end gap-2 px-6 py-4 border-t border-gray-100">
+          <button
+            onClick={onClose}
+            className="text-[13px] text-gray-700 bg-gray-100 rounded-lg px-4 py-2 hover:bg-gray-200 transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => canSave && onSave(trimmed, audience, members)}
+            disabled={!canSave}
+            className={`text-[13px] rounded-lg px-5 py-2 font-medium transition-colors
+              ${canSave ? "text-white bg-indigo-600 hover:bg-indigo-700" : "text-gray-400 bg-gray-100 cursor-not-allowed"}`}
+          >
+            Save
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  )
+}
+
+function PageHeader({ reportMode, onReportModeChange, onSave, justSaved, dirty, viewBlockedReason }: {
   reportMode: ReportMode
   onReportModeChange: (m: ReportMode) => void
   onSave: () => void
   justSaved: boolean
+  /** Unsaved changes since the last save — drives the Save button's emphasis. */
+  dirty: boolean
+  /** Why View is unavailable, or null when it is. A report has to be saved, and non-empty,
+      before it can be viewed — so the reason doubles as the disabled button's tooltip. */
+  viewBlockedReason: string | null
 }) {
   const [showExport, setShowExport] = useState(false)
   const [exportError, setExportError] = useState<string | null>(null)
@@ -2969,7 +3340,9 @@ function PageHeader({ reportMode, onReportModeChange, onSave, justSaved }: {
             className={`flex items-center gap-1.5 text-[13px] rounded-md px-3 py-1.5 shadow-sm transition-all font-medium
               ${justSaved
                 ? "text-emerald-600 border border-emerald-200 bg-emerald-50"
-                : "text-gray-600 border border-gray-200 bg-white hover:bg-gray-50 hover:shadow-sm"}`}
+                : dirty
+                  ? "text-indigo-700 border border-indigo-300 bg-indigo-50 hover:bg-indigo-100 hover:shadow-sm"
+                  : "text-gray-600 border border-gray-200 bg-white hover:bg-gray-50 hover:shadow-sm"}`}
           >
             {justSaved ? <Ic.Check /> : <Ic.Save size={14} />}
             <span>{justSaved ? "Saved" : "Save"}</span>
@@ -2978,8 +3351,12 @@ function PageHeader({ reportMode, onReportModeChange, onSave, justSaved }: {
         {reportMode === "create" ? (
           <button
             onClick={() => onReportModeChange("view")}
-            title="Switch to view mode — hides the source picker, field browser, and Columns/Rows/Values drop areas"
-            className="flex items-center gap-1.5 text-[13px] text-white bg-gray-900 rounded-md px-3 py-1.5 shadow-sm hover:bg-gray-800 hover:shadow transition-all font-medium"
+            disabled={viewBlockedReason !== null}
+            title={viewBlockedReason ?? "Switch to view mode — hides the source picker, field browser, and drop areas"}
+            className={`flex items-center gap-1.5 text-[13px] rounded-md px-3 py-1.5 transition-all font-medium
+              ${viewBlockedReason !== null
+                ? "text-gray-400 bg-gray-100 border border-gray-200 cursor-not-allowed"
+                : "text-white bg-gray-900 shadow-sm hover:bg-gray-800 hover:shadow"}`}
           >
             <Ic.Eye size={14} /><span>View</span>
           </button>
@@ -2999,8 +3376,10 @@ function PageHeader({ reportMode, onReportModeChange, onSave, justSaved }: {
 
 // ── Toolbar ────────────────────────────────────────────────────────────────────
 
-function Toolbar({ source, setSource, fields, lookupRoles, onLookupRoleChange, reportView, onReportViewChange, showTotals, onShowTotalsChange, fieldFormats, onFieldFormatChange, showModuleTag, onShowModuleTagChange, showProjectCurrency, onShowProjectCurrencyChange, reportMode }: {
+function Toolbar({ source, setSource, fields, lookupRoles, onLookupRoleChange, reportView, onReportViewChange, showTotals, onShowTotalsChange, fieldFormats, onFieldFormatChange, showModuleTag, onShowModuleTagChange, showProjectCurrency, onShowProjectCurrencyChange, reportMode, viewBar }: {
   source: string; setSource: (s: string) => void
+  /** The saved-views controls, which take over this bar's left side in view mode. */
+  viewBar: React.ReactNode
   fields: PivotFields
   lookupRoles: Record<string, string>
   onLookupRoleChange: (relationshipKey: string, role: string) => void
@@ -3020,6 +3399,7 @@ function Toolbar({ source, setSource, fields, lookupRoles, onLookupRoleChange, r
   const [showSettings, setShowSettings] = useState(false)
   return (
     <div className="flex items-center gap-3 px-5 py-2 border-b border-gray-200 bg-white text-[13px] print-hide">
+      {reportMode === "view" && viewBar}
       {/* Source chooser + Lookups — build-time-only, hidden in view mode */}
       {reportMode === "create" && (
         <>
@@ -7053,12 +7433,14 @@ function TabularCanvas({
 // props on it: the pivot toolbar is threaded with reportView, the Detail/Compact toggle and
 // totals — none of which a flat table has — so keeping them apart leaves the pivot path untouched.
 function TabularToolbar({
-  source, setSource, reportMode,
+  source, setSource, reportMode, viewBar,
   showModuleTag, onShowModuleTagChange, showProjectCurrency, onShowProjectCurrencyChange,
   showRowNumbers, onShowRowNumbersChange, fields, fieldFormats, onFieldFormatChange,
 }: {
   source: string; setSource: (s: string) => void
   reportMode: ReportMode
+  /** The saved-views controls, which take over this bar's left side in view mode. */
+  viewBar: React.ReactNode
   showModuleTag: boolean; onShowModuleTagChange: (v: boolean) => void
   showProjectCurrency: boolean; onShowProjectCurrencyChange: (v: boolean) => void
   showRowNumbers: boolean; onShowRowNumbersChange: (v: boolean) => void
@@ -7070,6 +7452,7 @@ function TabularToolbar({
   const [showSettings, setShowSettings] = useState(false)
   return (
     <div className="flex items-center gap-3 px-5 py-2 border-b border-gray-200 bg-white text-[13px] print-hide">
+      {reportMode === "view" && viewBar}
       {reportMode === "create" && (
         <div className="relative">
           <button
@@ -7233,6 +7616,7 @@ function TabularSettingsPanel({
 }
 
 const SAVED_TABULAR_KEY = "customReportsV2.savedTabular"
+const SAVED_TABULAR_VIEWS_KEY = "customReportsV2.savedTabularViews"
 
 interface SavedTabularReport {
   source: string
@@ -7290,13 +7674,33 @@ function TabularBuilder() {
   const pivotShape = asPivotFields(fields)
   const hasAnyField = fields.columns.length > 0 || fields.groupBy.length > 0
 
+  // Serialising the whole payload is how "has anything changed?" is answered — cheaper to keep
+  // honest than a dirty flag threaded through every one of the builder's ~20 setters, and it can
+  // never drift out of sync with what Save actually writes.
+  const payloadJson = JSON.stringify({
+    source, fields, aggregations, filterRules, viewFilterRules, rangeConfigs, fieldFormats,
+    showModuleTag, showProjectCurrency, showRowNumbers, groupSortDir,
+  } satisfies SavedTabularReport)
+  // A restored report starts clean; one that has never been saved starts dirty. This initialiser
+  // runs on the first render, where payloadJson is built from exactly the restored state.
+  const [savedSnapshot, setSavedSnapshot] = useState<string | null>(saved ? payloadJson : null)
+  // An empty report has nothing worth saving, so it doesn't get the "unsaved changes" emphasis.
+  const dirty = savedSnapshot !== payloadJson && hasAnyField
+
+  const savedViews = useSavedViews(SAVED_TABULAR_VIEWS_KEY, reportMode, viewFilterRules, setViewFilterRules)
+  const [showNewView, setShowNewView] = useState(false)
+
+  // View mode shows a finished report, so it needs one that exists and is saved.
+  const viewBlockedReason = !hasAnyField
+    ? "Add fields to Columns or Group by before viewing this report"
+    : dirty
+      ? "Save your changes to view this report"
+      : null
+
   const handleSave = () => {
-    const payload: SavedTabularReport = {
-      source, fields, aggregations, filterRules, viewFilterRules, rangeConfigs, fieldFormats,
-      showModuleTag, showProjectCurrency, showRowNumbers, groupSortDir,
-    }
     try {
-      localStorage.setItem(SAVED_TABULAR_KEY, JSON.stringify(payload))
+      localStorage.setItem(SAVED_TABULAR_KEY, payloadJson)
+      setSavedSnapshot(payloadJson)
       setJustSaved(true)
       setTimeout(() => setJustSaved(false), 1500)
     } catch {}
@@ -7392,6 +7796,13 @@ function TabularBuilder() {
       {usedAlert && (
         <FieldAlreadyUsedAlert name={usedAlert.name} zone={usedAlert.zone} onClose={() => setUsedAlert(null)} />
       )}
+      {showNewView && (
+        <NewViewModal
+          existingNames={savedViews.views.map((v) => v.name)}
+          onSave={(name, audience, members) => { savedViews.saveView(name, audience, members); setShowNewView(false) }}
+          onClose={() => setShowNewView(false)}
+        />
+      )}
       {dupAlert && (
         <DupFieldAlert
           name={fieldDisplayName(dupAlert)}
@@ -7408,11 +7819,26 @@ function TabularBuilder() {
         />
       )}
 
-      <PageHeader reportMode={reportMode} onReportModeChange={setReportMode} onSave={handleSave} justSaved={justSaved} />
+      <PageHeader
+        reportMode={reportMode} onReportModeChange={setReportMode} onSave={handleSave}
+        justSaved={justSaved} dirty={dirty} viewBlockedReason={viewBlockedReason}
+      />
       <TabularToolbar
         source={source}
         setSource={requestSourceChange}
         reportMode={reportMode}
+        viewBar={
+          <SavedViewsBar
+            views={savedViews.views}
+            activeId={savedViews.activeId}
+            activeName={savedViews.activeName}
+            dirty={savedViews.dirty}
+            onPick={savedViews.applyView}
+            onSaveAs={() => setShowNewView(true)}
+            onReset={savedViews.resetView}
+            onDelete={savedViews.deleteView}
+          />
+        }
         showModuleTag={showModuleTag}
         onShowModuleTagChange={setShowModuleTag}
         showProjectCurrency={showProjectCurrency}
@@ -8731,6 +9157,7 @@ interface SavedReport {
 }
 
 const SAVED_REPORT_KEY = "customReportsV2.savedReport"
+const SAVED_VIEWS_KEY = "customReportsV2.savedViews"
 
 function loadSavedReport(): Partial<SavedReport> | null {
   try {
@@ -8772,14 +9199,31 @@ export default function App() {
   // Save CTA — persists the report definition to localStorage (this app has no backend) so a
   // reload restores it instead of losing everything. Toggling View/Edit is unrelated to this;
   // it only changes which controls are shown, never touches storage on its own.
+  // Same dirty check as the tabular builder: serialise the payload Save would write and compare
+  // it against the last one written, so the flag can never disagree with what was saved.
+  const payloadJson = JSON.stringify({
+    source, fields, aggregations, lookupRoles, filterRules, viewFilterRules,
+    reportTimelineFilters, rangeConfigs, fieldFormats,
+    reportView, showTotals, showModuleTag, showProjectCurrency,
+  } satisfies SavedReport)
+  const [savedSnapshot, setSavedSnapshot] = useState<string | null>(savedReport ? payloadJson : null)
+  const savedViews = useSavedViews(SAVED_VIEWS_KEY, reportMode, viewFilterRules, setViewFilterRules)
+  const [showNewView, setShowNewView] = useState(false)
+
+  const hasAnyPivotField =
+    fields.columns.length > 0 || fields.rows.length > 0 || fields.values.length > 0
+  // An empty report has nothing worth saving, so it doesn't get the "unsaved changes" emphasis.
+  const dirty = savedSnapshot !== payloadJson && hasAnyPivotField
+  const viewBlockedReason = !hasAnyPivotField
+    ? "Add fields to Columns, Rows, or Values before viewing this report"
+    : dirty
+      ? "Save your changes to view this report"
+      : null
+
   const handleSave = () => {
-    const payload: SavedReport = {
-      source, fields, aggregations, lookupRoles, filterRules, viewFilterRules,
-      reportTimelineFilters, rangeConfigs, fieldFormats,
-      reportView, showTotals, showModuleTag, showProjectCurrency,
-    }
     try {
-      localStorage.setItem(SAVED_REPORT_KEY, JSON.stringify(payload))
+      localStorage.setItem(SAVED_REPORT_KEY, payloadJson)
+      setSavedSnapshot(payloadJson)
       setJustSaved(true)
       setTimeout(() => setJustSaved(false), 1500)
     } catch {}
@@ -8952,6 +9396,14 @@ export default function App() {
         <FilterNeedsFieldAlert onClose={() => setShowFilterNeedsFieldAlert(false)} />
       )}
 
+      {showNewView && (
+        <NewViewModal
+          existingNames={savedViews.views.map((v) => v.name)}
+          onSave={(name, audience, members) => { savedViews.saveView(name, audience, members); setShowNewView(false) }}
+          onClose={() => setShowNewView(false)}
+        />
+      )}
+
       {pendingSource && (
         <SourceChangeConfirmModal
           nextSource={pendingSource}
@@ -8967,7 +9419,10 @@ export default function App() {
           <TabularBuilder />
         ) : (
           <>
-            <PageHeader reportMode={reportMode} onReportModeChange={setReportMode} onSave={handleSave} justSaved={justSaved} />
+            <PageHeader
+        reportMode={reportMode} onReportModeChange={setReportMode} onSave={handleSave}
+        justSaved={justSaved} dirty={dirty} viewBlockedReason={viewBlockedReason}
+      />
             <Toolbar
               source={source}
               setSource={handleSourceChangeRequest}
@@ -8985,6 +9440,18 @@ export default function App() {
               showProjectCurrency={showProjectCurrency}
               onShowProjectCurrencyChange={setShowProjectCurrency}
               reportMode={reportMode}
+              viewBar={
+                <SavedViewsBar
+                  views={savedViews.views}
+                  activeId={savedViews.activeId}
+                  activeName={savedViews.activeName}
+                  dirty={savedViews.dirty}
+                  onPick={savedViews.applyView}
+                  onSaveAs={() => setShowNewView(true)}
+                  onReset={savedViews.resetView}
+                  onDelete={savedViews.deleteView}
+                />
+              }
             />
             <div className="flex flex-1 overflow-hidden">
               {reportMode === "create" && (
