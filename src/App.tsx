@@ -1360,12 +1360,12 @@ const TASKS: Row[] = PROJECTS.flatMap((project) => {
     const id = nextId("task")
     const phase = pick(phases)
     const assignee = pick(team)
-    const status = pickWeighted<string>([["Completed", 4], ["In Progress", 3], ["Not Started", 2], ["On Hold", 1], ["Cancelled", 1]])
+    const status = pickWeighted<string>([["Completed", 4], ["In progress", 3], ["To do", 2], ["Blocked", 1]])
     const effort = randInt(4, 80)
     const start = randDate(phase["Start date"], phase["Due date"])
     const due = addDays(start, randInt(3, 21))
     const isDone = status === "Completed"
-    const progress = isDone ? 100 : status === "Not Started" ? 0 : status === "Cancelled" ? randInt(0, 30) : randInt(10, 90)
+    const progress = isDone ? 100 : status === "To do" ? 0 : status === "Blocked" ? randInt(0, 30) : randInt(10, 90)
     return {
       id, taskId: id, projectId: project.id, phaseId: phase.id, accountId: project.accountId,
       userId: assignee.id, roleId: assignee.roleId,
@@ -1394,8 +1394,8 @@ TASKS.forEach((t) => { (TASKS_BY_PROJECT[t.projectId] ??= []).push(t) })
 
 // ── Time tracking entries ────────────────────────────────────────────────────────
 const TIME_ENTRIES: Row[] = TASKS.flatMap((task) => {
-  if (task["Status"] === "Not Started") return []
-  const entryCount = task["Status"] === "Cancelled" ? randInt(0, 3) : Math.max(1, Math.round(task["Effort"] / randFloat(2, 4)))
+  if (task["Status"] === "To do") return []
+  const entryCount = task["Status"] === "Blocked" ? randInt(0, 3) : Math.max(1, Math.round(task["Effort"] / randFloat(2, 4)))
   const project = PROJECTS_BY_ID[task.projectId]
   const windowEnd = task["Completed at"] ?? TODAY
   const windowStart = task["Start date"] < windowEnd ? task["Start date"] : addDays(windowEnd, -14)
