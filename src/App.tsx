@@ -1123,6 +1123,22 @@ const MODULE_RELATIONSHIP_PATHS: Record<string, string[]> = (() => {
   return map
 })()
 
+// The relationship paths that could take you from the report's grain to this field's module.
+// Zero or one means there is nothing to choose and the chip shows no role at all — only the
+// genuinely ambiguous pairs (6 of 105 today) ever surface a picker.
+function availableLookupPaths(grainModule: string, fieldKey: string): string[] {
+  const mod = fieldKeyModule(fieldKey)
+  if (!mod || mod === grainModule) return []
+  return MODULE_RELATIONSHIP_PATHS[modulePairKey(grainModule, mod)] ?? []
+}
+
+// The role a chip is actually resolving through: its explicit choice, else the primary path.
+function effectiveLookupPath(grainModule: string, fieldKey: string, chosen?: string): string | undefined {
+  const paths = availableLookupPaths(grainModule, fieldKey)
+  if (paths.length < 2) return undefined
+  return chosen && paths.includes(chosen) ? chosen : paths[0]
+}
+
 interface LookupRelationship {
   key: string
   label: string
@@ -1360,6 +1376,10 @@ const TASKS: Row[] = PROJECTS.flatMap((project) => {
     const id = nextId("task")
     const phase = pick(phases)
     const assignee = pick(team)
+    // A second, deliberately different person so "Assignees" and "Responsible" are not the
+    // same lookup wearing two names — without this the role picker would be decorative.
+    const others = team.filter((p) => p.id !== assignee.id)
+    const responsible = others.length > 0 ? pick(others) : assignee
     const status = pickWeighted<string>([["Completed", 4], ["In progress", 3], ["To do", 2], ["Blocked", 1]])
     const effort = randInt(4, 80)
     const start = randDate(phase["Start date"], phase["Due date"])
@@ -1369,6 +1389,7 @@ const TASKS: Row[] = PROJECTS.flatMap((project) => {
     return {
       id, taskId: id, projectId: project.id, phaseId: phase.id, accountId: project.accountId,
       userId: assignee.id, roleId: assignee.roleId,
+      responsibleUserId: responsible.id,
       "Task name": pick(TASK_SUBJECTS),
       "Project phase": phase["Project phase"],
       "Effort": effort,
@@ -1794,6 +1815,16 @@ const DIMENSION_ID_KEY: Record<string, string> = {
   Account: "accountId", Role: "roleId", People: "userId", Project: "projectId",
   Phase: "phaseId", Task: "taskId", Budget: "projectId", Invoice: "projectId",
 }
+// Where a module pair is reachable by more than one relationship, the role chosen on the chip
+// decides which foreign key on the grain row gets followed. A pair with no entry here resolves
+// the same way whichever role is picked — the relationship exists in the schema but the mock
+// data carries only one key for it.
+const ROLE_FK: Record<string, string> = {
+  "Task|People|Assignees": "userId",
+  "Task|People|Responsible": "responsibleUserId",
+}
+const roleFkKey = (grain: string, target: string, role: string) => `${grain}|${target}|${role}`
+
 const DIMENSION_BY_ID: Record<string, Record<string, Row>> = {
   Account: ACCOUNTS_BY_ID, Role: ROLES_BY_ID, People: PEOPLE_BY_ID, Project: PROJECTS_BY_ID,
   Phase: PHASES_BY_ID, Task: TASKS_BY_ID, Budget: BUDGET_BY_PROJECT, Invoice: INVOICE_BY_PROJECT,
@@ -1855,7 +1886,7 @@ function withinWindow(v: any, window: [number, number]): boolean {
 
 // Resolves a "Module::Field" key against a row at any grain — own field, ancestor
 // dimension, or rollup-collection — using the FK ids every generated row carries.
-function resolveFieldForRow(grainModule: string, row: Row, targetKey: string, dateWindow: [number, number] | null): any {
+function resolveFieldForRow(grainModule: string, row: Row, targetKey: string, dateWindow: [number, number] | null, role?: string): any {
   const targetModule = fieldKeyModule(targetKey)
   const targetField = fieldDisplayName(targetKey)
   if (targetModule === grainModule) {
@@ -1867,7 +1898,8 @@ function resolveFieldForRow(grainModule: string, row: Row, targetKey: string, da
     }
     return row[targetField]
   }
-  const dimKey = DIMENSION_ID_KEY[targetModule]
+  const dimKey = (role ? ROLE_FK[roleFkKey(grainModule, targetModule, role)] : undefined)
+    ?? DIMENSION_ID_KEY[targetModule]
   if (dimKey) {
     const id = row[dimKey]
     const dimRow = id != null ? DIMENSION_BY_ID[targetModule][id] : undefined
@@ -2218,10 +2250,11 @@ interface FieldLabeler {
   sortKey: (row: Row) => number | string
 }
 
-function buildLabeler(grainModule: string, sampleRows: Row[], item: PivotItem, aggregations: Record<string, string>, rangeConfigs: Record<string, RangeConfig>): FieldLabeler {
+function buildLabeler(grainModule: string, sampleRows: Row[], item: PivotItem, aggregations: Record<string, string>, rangeConfigs: Record<string, RangeConfig>, lookupPaths: Record<string, string> = {}): FieldLabeler {
   const type = getFieldType(item.field)
   const modifier = aggregations[item.id]
-  const resolve = (row: Row) => resolveFieldForRow(grainModule, row, item.field, null)
+  const role = effectiveLookupPath(grainModule, item.field, lookupPaths[item.id])
+  const resolve = (row: Row) => resolveFieldForRow(grainModule, row, item.field, null, role)
 
   if (type === "date") {
     const gran = modifier || "Quarter & Year"
@@ -2262,7 +2295,7 @@ function buildLabeler(grainModule: string, sampleRows: Row[], item: PivotItem, a
 // at Task grain) would otherwise fan out — the same ARR counted once per task instead
 // of once per project. Dedupe by the owning dimension's id before summing/averaging so
 // the number stays the real, non-inflated figure.
-function aggregateBucket(bucketRows: Row[], grainModule: string, item: PivotItem, agg: string, type: FieldType, timelineFilter?: MetricFilter): number {
+function aggregateBucket(bucketRows: Row[], grainModule: string, item: PivotItem, agg: string, type: FieldType, timelineFilter?: MetricFilter, role?: string): number {
   const targetModule = fieldKeyModule(item.field)
 
   let dateWindow: [number, number] | null = null
@@ -2296,7 +2329,7 @@ function aggregateBucket(bucketRows: Row[], grainModule: string, item: PivotItem
         seen.add(ownerId)
       }
     }
-    const v = resolveFieldForRow(grainModule, row, item.field, dateWindow)
+    const v = resolveFieldForRow(grainModule, row, item.field, dateWindow, role)
     if (v !== undefined && v !== null && v !== "") values.push(v)
   }
 
@@ -2425,7 +2458,7 @@ function applyGroupLevelFilters(entries: ComboEntry[], rules: FilterRule[], grai
 // entity" for both scalar-aggregate previews and set-membership previews below.
 function previewGroupRows(
   source: string, fields: PivotFields, aggregations: Record<string, string>, filterRules: FilterRule[],
-  rangeConfigs: Record<string, RangeConfig>,
+  rangeConfigs: Record<string, RangeConfig>, lookupPaths: Record<string, string> = {},
 ): { grainModule: string; groups: Row[][] } {
   const grainModule = pickGrain(source, fields, filterRules)
   const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
@@ -2433,7 +2466,7 @@ function previewGroupRows(
 
   if (fields.rows.length === 0) return { grainModule, groups: [filteredRows] }
 
-  const rowLabelers = fields.rows.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs))
+  const rowLabelers = fields.rows.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths))
   const groups = new Map<string, Row[]>()
   filteredRows.forEach((row) => {
     const key = rowLabelers.map((l) => l.label(row)).join("␟")
@@ -2521,6 +2554,7 @@ function computeReportData(
   viewFilterRules: FilterRule[],
   timelineFilters: Record<string, MetricFilter>,
   rangeConfigs: Record<string, RangeConfig>,
+  lookupPaths: Record<string, string> = {},
 ): ComputedReport {
   // Base Filters are the report's own locked scope; View filters run on top of that result.
   // Concatenating in THIS order is what encodes the hierarchy: applyGroupLevelFilters narrows
@@ -2530,12 +2564,12 @@ function computeReportData(
   const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
   const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, allRules))
 
-  const rowLabelers = fields.rows.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs))
+  const rowLabelers = fields.rows.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths))
   // Every Columns field participates. Each distinct combination gets one composite key (joined
   // for map-lookup purposes) but keeps its per-field label tuple around too (colLabelParts), so
   // the header can render true nested tiers — one row per Columns field, colSpan-grouped by
   // shared prefix — instead of flattening into a single joined label.
-  const colLabelers = fields.columns.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs))
+  const colLabelers = fields.columns.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths))
 
   const SEP = "␟"
   const comboMap = new Map<string, { combo: string[]; sortTuple: (number | string)[]; cols: Map<string, Row[]> }>()
@@ -2601,7 +2635,7 @@ function computeReportData(
     if (!item) return 0
     const type = getFieldType(item.field)
     const agg = aggregations[item.id] || (isNumericType(type) ? "Sum" : "Count")
-    return aggregateBucket(bucketRows(ri, ci), grainModule, item, agg, type, timelineFilters[item.id])
+    return aggregateBucket(bucketRows(ri, ci), grainModule, item, agg, type, timelineFilters[item.id], effectiveLookupPath(grainModule, item.field, lookupPaths[item.id]))
   }
 
   const grandTotals = fields.values.map((_, vi) =>
@@ -2667,6 +2701,7 @@ function computeTabularData(
   fieldFormats: Record<string, FieldFormat>,
   groupSortDir: "asc" | "desc",
   showProjectCurrency: boolean,
+  lookupPaths: Record<string, string> = {},
 ): ComputedTabular {
   // Base filters scope the report; view filters run on top — same ordering as computeReportData.
   const allRules = viewFilterRules.length > 0 ? [...filterRules, ...viewFilterRules] : filterRules
@@ -2676,7 +2711,7 @@ function computeTabularData(
   const filtered = filterRowsFlat(grainModule, allRows, allRules)
 
   const groupLabelers = fields.groupBy.map((item) =>
-    buildLabeler(grainModule, filtered, item, groupByAggregations, rangeConfigs))
+    buildLabeler(grainModule, filtered, item, groupByAggregations, rangeConfigs, lookupPaths))
 
   const compareKey = (a: number | string, b: number | string) =>
     typeof a === "number" && typeof b === "number" ? a - b : String(a).localeCompare(String(b))
@@ -2702,7 +2737,7 @@ function computeTabularData(
   const rows: TabularRow[] = decorated.slice(0, TABULAR_ROW_CAP).map(({ row, labels }) => ({
     groupLabels: labels,
     cells: fields.columns.map((item) => {
-      const raw = resolveFieldForRow(grainModule, row, item.field, null)
+      const raw = resolveFieldForRow(grainModule, row, item.field, null, effectiveLookupPath(grainModule, item.field, lookupPaths[item.id]))
       let text = tabularCellText(raw, item, fieldFormats)
       // Simpler than the pivot's version of this setting: a tabular row IS one record, so its
       // currency is unambiguous — no mixed-currency group to suppress the tag for.
@@ -3637,13 +3672,11 @@ function PageHeader({ reportMode, onReportModeChange, onSave, justSaved, dirty, 
 
 // ── Toolbar ────────────────────────────────────────────────────────────────────
 
-function Toolbar({ source, setSource, fields, lookupRoles, onLookupRoleChange, reportView, onReportViewChange, showTotals, onShowTotalsChange, fieldFormats, onFieldFormatChange, showModuleTag, onShowModuleTagChange, showProjectCurrency, onShowProjectCurrencyChange, reportMode, viewBar }: {
+function Toolbar({ source, setSource, fields, reportView, onReportViewChange, showTotals, onShowTotalsChange, fieldFormats, onFieldFormatChange, showModuleTag, onShowModuleTagChange, showProjectCurrency, onShowProjectCurrencyChange, reportMode, viewBar }: {
   source: string; setSource: (s: string) => void
   /** The saved-views controls, which take over this bar's left side in view mode. */
   viewBar: React.ReactNode
   fields: PivotFields
-  lookupRoles: Record<string, string>
-  onLookupRoleChange: (relationshipKey: string, role: string) => void
   reportView: ReportView
   onReportViewChange: (v: ReportView) => void
   showTotals: boolean
@@ -3696,7 +3729,6 @@ function Toolbar({ source, setSource, fields, lookupRoles, onLookupRoleChange, r
             )}
           </div>
 
-          <LookupsControl fields={fields} lookupRoles={lookupRoles} onChange={onLookupRoleChange} />
         </>
       )}
 
@@ -4042,65 +4074,6 @@ function FieldFormatListItem({ item, zone, format, onChange }: {
             <FieldFormatFields item={item} defaultAlign={zone === "Values" ? "right" : "left"} format={format} onChange={onChange} />
           </div>
         </ChipPortalMenu>
-      )}
-    </div>
-  )
-}
-
-function LookupsControl({ fields, lookupRoles, onChange }: {
-  fields: PivotFields
-  lookupRoles: Record<string, string>
-  onChange: (relationshipKey: string, role: string) => void
-}) {
-  const [open, setOpen] = useState(false)
-  const relationships = usedModuleRelationships(fields)
-
-  if (relationships.length === 0) return null
-
-  return (
-    <div className="relative pl-3 border-l border-gray-200">
-      <button
-        onClick={() => setOpen((p) => !p)}
-        className="flex items-center gap-1.5 text-gray-700 hover:text-gray-900 transition-colors"
-      >
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
-        </svg>
-        <span className="font-semibold">Lookups</span>
-        <Ic.ChevDown size={12} />
-      </button>
-      {open && (
-        <>
-          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-          <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-xl py-2 w-64">
-            <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-3 pb-1.5">Lookups used in this report</p>
-            {relationships.map(({ key, label, paths }) => {
-              const current = lookupRoles[key] ?? paths[0]
-              return (
-                <div key={key} className="px-3 py-1.5">
-                  <p className="text-[12px] font-medium text-gray-700 mb-1">{label}</p>
-                  {paths.length > 1 ? (
-                    <div className="flex flex-wrap gap-1">
-                      {paths.map((path) => (
-                        <button
-                          key={path}
-                          onClick={() => onChange(key, path)}
-                          className={`text-[11px] font-medium rounded-full px-2 py-0.5 border transition-colors
-                            ${current === path ? "bg-sky-500 text-white border-sky-500" : "bg-white text-gray-600 border-gray-200 hover:border-sky-300"}`}
-                        >
-                          {path}
-                        </button>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-[11px] text-gray-400">via {paths[0]}</p>
-                  )}
-                </div>
-              )
-            })}
-          </div>
-        </>
       )}
     </div>
   )
@@ -4472,6 +4445,9 @@ interface DropZoneBarProps {
   fields: PivotFields
   dragging: boolean
   dragType: FieldType | null
+  grainModule: string
+  lookupPaths: Record<string, string>
+  onLookupPathChange: (id: string, path: string) => void
   aggregations: Record<string, string>
   timelineFilters: Record<string, MetricFilter>
   rangeConfigs: Record<string, RangeConfig>
@@ -4487,7 +4463,7 @@ interface DropZoneBarProps {
 }
 
 function DropZoneBar(props: DropZoneBarProps) {
-  const { fields, dragging, dragType, aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange } = props
+  const { fields, dragging, dragType, grainModule, lookupPaths, aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange } = props
 
   const zones: { key: PivotZoneKey; label: string; suggestValues?: boolean }[] = [
     { key: "columns", label: "Columns" },
@@ -4505,6 +4481,9 @@ function DropZoneBar(props: DropZoneBarProps) {
           chips={fields[key]}
           dragging={dragging}
           isSuggested={!!suggestValues && !!dragType && isNumericType(dragType)}
+          grainModule={grainModule}
+          lookupPaths={lookupPaths}
+          onLookupPathChange={onLookupPathChange}
           aggregations={aggregations}
           timelineFilters={timelineFilters}
           rangeConfigs={rangeConfigs}
@@ -4527,11 +4506,15 @@ function DropZoneBar(props: DropZoneBarProps) {
 // pivot's handlers index PivotFields, the tabular one's index TabularFields, and neither can be
 // handed the other's zone by mistake.
 function DropZone<Z extends ZoneKey>({
-  zone, label, chips, dragging, isSuggested,
-  aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange,
+  zone, label, chips, dragging, isSuggested, grainModule, lookupPaths,
+  aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange,
 }: {
   zone: Z; label: string; chips: PivotItem[]; dragging: boolean
   isSuggested: boolean; aggregations: Record<string, string>
+  /** The report's grain — a chip's relationship options depend on where it is resolved from. */
+  grainModule: string
+  lookupPaths: Record<string, string>
+  onLookupPathChange: (id: string, path: string) => void
   timelineFilters: Record<string, MetricFilter>
   rangeConfigs: Record<string, RangeConfig>
   fieldFormats: Record<string, FieldFormat>
@@ -4641,6 +4624,9 @@ function DropZone<Z extends ZoneKey>({
                 name={item.field}
                 zone={zone}
                 modifier={aggregations[item.id]}
+                lookupPath={lookupPaths[item.id]}
+                lookupOptions={availableLookupPaths(grainModule, item.field)}
+                onLookupPathChange={(path) => onLookupPathChange(item.id, path)}
                 timelineFilter={timelineFilters[item.id]}
                 rangeConfig={rangeConfigs[item.id]}
                 fieldFormat={fieldFormats[item.id]}
@@ -4937,8 +4923,12 @@ function RangeConfigPicker({ config, bounds, type, onChange, embedded }: {
   )
 }
 
-function FieldChip({ id, name, zone, modifier, timelineFilter, rangeConfig, fieldFormat, onRemove, onModifierChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange }: {
+function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timelineFilter, rangeConfig, fieldFormat, onRemove, onModifierChange, onLookupPathChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange }: {
   id: string; name: string; zone: ZoneKey; modifier?: string
+  /** The relationship this chip resolves through, when its module can be reached more than one way. */
+  lookupPath?: string
+  lookupOptions?: string[]
+  onLookupPathChange?: (path: string) => void
   timelineFilter?: MetricFilter
   rangeConfig?: RangeConfig
   fieldFormat?: FieldFormat
@@ -4952,6 +4942,8 @@ function FieldChip({ id, name, zone, modifier, timelineFilter, rangeConfig, fiel
   const [showDatePicker, setShowDatePicker] = useState(false)
   const [showRangeSettings, setShowRangeSettings] = useState(false)
   const [showFormatMenu, setShowFormatMenu] = useState(false)
+  const [showLookupMenu, setShowLookupMenu] = useState(false)
+  const lookupBtnRef = useRef<HTMLButtonElement>(null)
   const modifierBtnRef = useRef<HTMLButtonElement>(null)
   const dateBtnRef = useRef<HTMLButtonElement>(null)
   const formatBtnRef = useRef<HTMLButtonElement>(null)
@@ -4988,6 +4980,46 @@ function FieldChip({ id, name, zone, modifier, timelineFilter, rangeConfig, fiel
           Title shows the owning module too, since the same short name (e.g. "Status")
           can exist on more than one module in the real schema. */}
       <span className="truncate flex-1 min-w-0" title={name.replace("::", ": ")}>{fieldDisplayName(name)}</span>
+
+      {/* Relationship role — shown only when this field's module can be reached more than one
+          way, so the 99 unambiguous relationships stay uncluttered. Always visible once it
+          applies: two identical-looking chips resolving through different people is exactly
+          the thing that must not be hidden behind a menu. */}
+      {lookupOptions && lookupOptions.length > 1 && (
+        <>
+          <button
+            ref={lookupBtnRef}
+            onClick={(e) => { e.stopPropagation(); setShowLookupMenu((p) => !p) }}
+            title={`Resolved via ${lookupPath ?? lookupOptions[0]} — click to change`}
+            className="flex items-center gap-0.5 text-[11px] font-medium text-sky-700
+              bg-sky-50 border border-sky-200 rounded px-1.5 py-px hover:bg-sky-100 transition-colors shrink-0"
+          >
+            <span className="max-w-[72px] truncate">{lookupPath ?? lookupOptions[0]}</span>
+            <Ic.ChevDown size={9} />
+          </button>
+          {showLookupMenu && (
+            <ChipPortalMenu anchorRef={lookupBtnRef} onClose={() => setShowLookupMenu(false)}>
+              <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl py-1 w-56 overflow-hidden">
+                <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-3 pt-1.5 pb-1">
+                  Resolve this field via
+                </p>
+                {lookupOptions.map((opt) => (
+                  <button
+                    key={opt}
+                    onClick={() => { onLookupPathChange?.(opt); setShowLookupMenu(false) }}
+                    className={`flex items-center justify-between w-full px-3 py-1.5 text-[13px] text-left
+                      hover:bg-sky-50 transition-colors
+                      ${(lookupPath ?? lookupOptions[0]) === opt ? "text-sky-700 font-medium" : "text-gray-700"}`}
+                  >
+                    {opt}
+                    {(lookupPath ?? lookupOptions[0]) === opt && <Ic.Check />}
+                  </button>
+                ))}
+              </div>
+            </ChipPortalMenu>
+          )}
+        </>
+      )}
 
       {/* Modifier badge (Sum ∨, Count ∨, etc.) */}
       {hasBadge && modifier && (
@@ -7478,11 +7510,14 @@ function ViewFilterPane({
 // The tabular equivalent of DropZoneBar: two shelves instead of three. DropZone itself is
 // reused unchanged — it is generic over its zone key and agnostic about what the chips mean.
 function TabularZoneBar({
-  fields, dragging, aggregations, rangeConfigs, fieldFormats,
-  onDrop, onMove, onReorder, onRemove, onAggChange, onRangeConfigChange, onFieldFormatChange,
+  fields, dragging, grainModule, lookupPaths, aggregations, rangeConfigs, fieldFormats,
+  onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onRangeConfigChange, onFieldFormatChange,
 }: {
   fields: TabularFields
   dragging: boolean
+  grainModule: string
+  lookupPaths: Record<string, string>
+  onLookupPathChange: (id: string, path: string) => void
   aggregations: Record<string, string>
   rangeConfigs: Record<string, RangeConfig>
   fieldFormats: Record<string, FieldFormat>
@@ -7511,6 +7546,9 @@ function TabularZoneBar({
           chips={chips}
           dragging={dragging}
           isSuggested={false}
+          grainModule={grainModule}
+          lookupPaths={lookupPaths}
+          onLookupPathChange={onLookupPathChange}
           aggregations={aggregations}
           timelineFilters={{}}
           rangeConfigs={rangeConfigs}
@@ -7533,11 +7571,12 @@ function TabularZoneBar({
 // outer div, the scroll card as its only child, data-report-table on the table — so CSV export
 // and the print stylesheet work with no extra wiring.
 function TabularCanvas({
-  source, fields, aggregations, filterRules, viewFilterRules, rangeConfigs, fieldFormats,
+  source, fields, aggregations, filterRules, viewFilterRules, lookupPaths, rangeConfigs, fieldFormats,
   showModuleTag, showProjectCurrency, showRowNumbers, groupSortDir, onGroupSortToggle,
 }: {
   source: string
   fields: TabularFields
+  lookupPaths: Record<string, string>
   aggregations: Record<string, string>
   filterRules: FilterRule[]
   viewFilterRules: FilterRule[]
@@ -7583,7 +7622,7 @@ function TabularCanvas({
 
   const report = computeTabularData(
     source, fields, aggregations, filterRules, viewFilterRules, rangeConfigs, fieldFormats,
-    groupSortDir, showProjectCurrency,
+    groupSortDir, showProjectCurrency, lookupPaths,
   )
   const { rows, totalCount, grainModule } = report
 
@@ -7893,6 +7932,7 @@ interface SavedTabularReport {
   showProjectCurrency: boolean
   showRowNumbers: boolean
   groupSortDir: "asc" | "desc"
+  lookupPaths: Record<string, string>
 }
 
 function loadSavedTabular(): Partial<SavedTabularReport> | null {
@@ -7921,6 +7961,7 @@ function TabularBuilder() {
   const [filterRules, setFilterRules] = useState<FilterRule[]>(saved?.filterRules ?? [])
   const [viewFilterRules, setViewFilterRules] = useState<FilterRule[]>(saved?.viewFilterRules ?? [])
   const [rangeConfigs, setRangeConfigs] = useState<Record<string, RangeConfig>>(saved?.rangeConfigs ?? {})
+  const [lookupPaths, setLookupPaths] = useState<Record<string, string>>(saved?.lookupPaths ?? {})
   const [fieldFormats, setFieldFormats] = useState<Record<string, FieldFormat>>(saved?.fieldFormats ?? {})
   const [showModuleTag, setShowModuleTag] = useState(saved?.showModuleTag ?? false)
   const [showProjectCurrency, setShowProjectCurrency] = useState(saved?.showProjectCurrency ?? false)
@@ -7936,13 +7977,15 @@ function TabularBuilder() {
 
   const pivotShape = asPivotFields(fields)
   const hasAnyField = fields.columns.length > 0 || fields.groupBy.length > 0
+  // Chips need the grain to know which of their relationships are ambiguous from here.
+  const grainModule = pickGrain(source, pivotShape, filterRules)
 
   // Serialising the whole payload is how "has anything changed?" is answered — cheaper to keep
   // honest than a dirty flag threaded through every one of the builder's ~20 setters, and it can
   // never drift out of sync with what Save actually writes.
   const payloadJson = JSON.stringify({
     source, fields, aggregations, filterRules, viewFilterRules, rangeConfigs, fieldFormats,
-    showModuleTag, showProjectCurrency, showRowNumbers, groupSortDir,
+    showModuleTag, showProjectCurrency, showRowNumbers, groupSortDir, lookupPaths,
   } satisfies SavedTabularReport)
   // A restored report starts clean; one that has never been saved starts dirty. This initialiser
   // runs on the first render, where payloadJson is built from exactly the restored state.
@@ -8139,6 +8182,9 @@ function TabularBuilder() {
             <TabularZoneBar
               fields={fields}
               dragging={dragging}
+              grainModule={grainModule}
+              lookupPaths={lookupPaths}
+              onLookupPathChange={(id, path) => setLookupPaths((prev) => ({ ...prev, [id]: path }))}
               aggregations={aggregations}
               rangeConfigs={rangeConfigs}
               fieldFormats={fieldFormats}
@@ -8172,6 +8218,7 @@ function TabularBuilder() {
             <TabularCanvas
               source={source}
               fields={fields}
+              lookupPaths={lookupPaths}
               aggregations={aggregations}
               filterRules={filterRules}
               viewFilterRules={viewFilterRules}
@@ -8944,12 +8991,13 @@ function flattenCompactTree(nodes: CompactNode[], collapsed: Set<string>, out: C
 
 // ── Report canvas ──────────────────────────────────────────────────────────────
 
-function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRules, timelineFilters, rangeConfigs, fieldFormats, reportView, showTotals, showModuleTag, showProjectCurrency }: {
+function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRules, lookupPaths, timelineFilters, rangeConfigs, fieldFormats, reportView, showTotals, showModuleTag, showProjectCurrency }: {
   source: string
   fields: PivotFields
   aggregations: Record<string, string>
   filterRules: FilterRule[]
   viewFilterRules: FilterRule[]
+  lookupPaths: Record<string, string>
   timelineFilters: Record<string, MetricFilter>
   rangeConfigs: Record<string, RangeConfig>
   fieldFormats: Record<string, FieldFormat>
@@ -9003,7 +9051,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
   // Row-field labels only — the actual grouping/aggregation is computed for real below.
   const rowSamples = fields.rows.map(item => ({ id: item.id, name: item.field }))
 
-  const report = computeReportData(source, fields, aggregations, filterRules, viewFilterRules, timelineFilters, rangeConfigs)
+  const report = computeReportData(source, fields, aggregations, filterRules, viewFilterRules, timelineFilters, rangeConfigs, lookupPaths)
   const { displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, grandTotals, bucketRows, grainModule } = report
   const colHeaderTiers = hasColumns ? buildColumnHeaderTiers(colTuples) : []
 
@@ -9422,7 +9470,7 @@ interface SavedReport {
   source: string
   fields: PivotFields
   aggregations: Record<string, string>
-  lookupRoles: Record<string, string>
+  lookupPaths: Record<string, string>
   filterRules: FilterRule[]
   viewFilterRules: FilterRule[]
   reportTimelineFilters: Record<string, MetricFilter>
@@ -9460,7 +9508,9 @@ export default function App() {
   const [source, setSource] = useState<AppState["source"]>(savedReport?.source ?? "Project")
   const [fields, setFields] = useState<AppState["fields"]>(savedReport?.fields ?? { columns: [], rows: [], values: [] })
   const [aggregations, setAggregations] = useState<AppState["aggregations"]>(savedReport?.aggregations ?? {})
-  const [lookupRoles, setLookupRoles] = useState<Record<string, string>>(savedReport?.lookupRoles ?? {}) // keyed by relationship (getRelationshipKey), not by field name
+  // Keyed by CHIP id, not by relationship: the same field dropped twice can resolve two
+  // different ways, which a report-level setting could never express.
+  const [lookupPaths, setLookupPaths] = useState<Record<string, string>>(savedReport?.lookupPaths ?? {})
   const [dragging, setDragging] = useState<AppState["dragging"]>(false)
   const [dragType, setDragType] = useState<AppState["dragType"]>(null)
   const [filterRules, setFilterRules] = useState<FilterRule[]>(savedReport?.filterRules ?? [])
@@ -9480,7 +9530,7 @@ export default function App() {
   // Same dirty check as the tabular builder: serialise the payload Save would write and compare
   // it against the last one written, so the flag can never disagree with what was saved.
   const payloadJson = JSON.stringify({
-    source, fields, aggregations, lookupRoles, filterRules, viewFilterRules,
+    source, fields, aggregations, lookupPaths, filterRules, viewFilterRules,
     reportTimelineFilters, rangeConfigs, fieldFormats,
     reportView, showTotals, showModuleTag, showProjectCurrency,
   } satisfies SavedReport)
@@ -9490,6 +9540,8 @@ export default function App() {
 
   const hasAnyPivotField =
     fields.columns.length > 0 || fields.rows.length > 0 || fields.values.length > 0
+  // Chips need the grain to know which of their relationships are ambiguous from here.
+  const grainModule = pickGrain(source, fields, filterRules)
   // An empty report has nothing worth saving, so it doesn't get the "unsaved changes" emphasis.
   const dirty = savedSnapshot !== payloadJson && hasAnyPivotField
   // Nothing dropped means nothing to write — saving an empty report would only overwrite a real
@@ -9597,7 +9649,7 @@ export default function App() {
     setSource(pendingSource)
     setFields({ columns: [], rows: [], values: [] })
     setAggregations({})
-    setLookupRoles({})
+    setLookupPaths({})
     setFilterRules([])
     setViewFilterRules([])
     setReportTimelineFilters({})
@@ -9623,8 +9675,8 @@ export default function App() {
     })
   }
 
-  const handleLookupRoleChange = (relationshipKey: string, role: string) => {
-    setLookupRoles((prev) => ({ ...prev, [relationshipKey]: role }))
+  const handleLookupPathChange = (id: string, path: string) => {
+    setLookupPaths((prev) => ({ ...prev, [id]: path }))
   }
 
   const handleRemove = (zone: PivotZoneKey, id: string) => {
@@ -9713,8 +9765,6 @@ export default function App() {
               source={source}
               setSource={handleSourceChangeRequest}
               fields={fields}
-              lookupRoles={lookupRoles}
-              onLookupRoleChange={handleLookupRoleChange}
               reportView={reportView}
               onReportViewChange={setReportView}
               showTotals={showTotals}
@@ -9757,6 +9807,9 @@ export default function App() {
                     fields={fields}
                     dragging={dragging}
                     dragType={dragType}
+                    grainModule={grainModule}
+                    lookupPaths={lookupPaths}
+                    onLookupPathChange={handleLookupPathChange}
                     aggregations={aggregations}
                     timelineFilters={reportTimelineFilters}
                     rangeConfigs={rangeConfigs}
@@ -9795,6 +9848,7 @@ export default function App() {
                     aggregations={aggregations}
                     filterRules={filterRules}
                     viewFilterRules={viewFilterRules}
+                    lookupPaths={lookupPaths}
                     timelineFilters={reportTimelineFilters}
                     rangeConfigs={rangeConfigs}
                     fieldFormats={fieldFormats}
