@@ -981,7 +981,9 @@ const JOIN_EDGES: JoinEdge[] = [
   { from: "Project", to: "Account", label: "Company" },
   { from: "Project", to: "Phase", label: "Current Phases" },
   { from: "Project", to: "Account", label: "Partner Company" },
-  { from: "Project", to: "People", label: "Team Members" },
+  { from: "Project", to: "People", label: "Project owner" },
+  { from: "Project", to: "People", label: "Project creator" },
+  { from: "Project", to: "People", label: "Project member" },
 
   { from: "Task", to: "People", label: "Assignees" },
   { from: "Task", to: "Sprint", label: "Associated Sprints" },
@@ -1315,7 +1317,9 @@ const PROJECTS: Row[] = PROJECT_NAMES.map((name) => {
   const team = pickSubset(PEOPLE, 3, 7)
   if (!team.includes(owner)) team.push(owner)
   return {
-    id, projectId: id, accountId: account.id, ownerId: owner.id, teamIds: team.map((p) => p.id),
+    id, projectId: id, accountId: account.id, ownerId: owner.id,
+    createdById: (team.filter((p) => p.id !== owner.id)[0] ?? owner).id,
+    teamIds: team.map((p) => p.id),
     "Project Name": name,
     "Customer": account["Company name"],
     "ARR": randInt(20_000, 600_000),
@@ -1614,6 +1618,7 @@ const PROJECT_MEMBERS: Row[] = PROJECTS.flatMap((project) => {
   const members: Row[] = project.teamIds.map((id: string) => PEOPLE_BY_ID[id])
   return members.map((person: Row, i: number) => ({
     id: nextId("pmember"), projectId: project.id, userId: person.id, accountId: project.accountId,
+    ownerId: project.ownerId, createdById: project.createdById,
     "Source type": i === 0 ? "Owner" : pick(["Team Member", "Stakeholder"]),
     "Active": rng() < 0.92,
     "Is default": i === 0,
@@ -1822,6 +1827,21 @@ const DIMENSION_ID_KEY: Record<string, string> = {
 const ROLE_FK: Record<string, string> = {
   "Task|People|Assignees": "userId",
   "Task|People|Responsible": "responsibleUserId",
+  "Project|People|Project owner": "ownerId",
+  "Project|People|Project creator": "createdById",
+  // The same two roles again at the junction grain, because choosing "Project member" for one
+  // chip raises the whole report to it — and the other chips must keep resolving as they read.
+  "Project members|People|Project owner": "ownerId",
+  "Project members|People|Project creator": "createdById",
+}
+
+// A role that is one-to-many cannot be answered by swapping a key — a project has many
+// members, so there is no single person to put in the cell. Reporting the first one would be
+// arbitrary and silently wrong. Instead the role raises the report's grain to the junction
+// that already models the pairing, giving one row per project-and-member, which is what
+// "group by project member" actually means.
+const ROLE_GRAIN: Record<string, string> = {
+  "Project|People|Project member": "Project members",
 }
 const roleFkKey = (grain: string, target: string, role: string) => `${grain}|${target}|${role}`
 
@@ -1934,8 +1954,11 @@ function resolveGroupCurrency(buckets: Row[][], grainModule: string): string | n
 }
 
 // ── Grain selection ───────────────────────────────────────────────────────────────
-function pickGrain(source: string, fields: PivotFields, filterRules: FilterRule[]): string {
-  const used = new Set<string>()
+// The grain implied purely by which fields are in play. This is what the chips ask about, so
+// it must not itself depend on the roles they have chosen — otherwise picking a role could
+// change which roles are on offer.
+function pickGrain(source: string, fields: PivotFields, filterRules: FilterRule[], extra?: Set<string>): string {
+  const used = new Set<string>(extra)
   ;[...fields.columns, ...fields.rows, ...fields.values].forEach((item) => used.add(fieldKeyModule(item.field)))
   filterRules.forEach((r) => used.add(fieldKeyModule(r.field)))
   const reachable = new Set(SOURCE_MODULES[source] ?? [source])
@@ -1951,6 +1974,37 @@ function pickGrain(source: string, fields: PivotFields, filterRules: FilterRule[
     }
   })
   return best
+}
+
+// Every chip's concrete role, decided against the base grain and then carried. Deciding once
+// matters: choosing "Project member" raises the grain to the junction, and a role re-derived at
+// that point would no longer see the choices the user was actually offered.
+function resolveChipRoles(
+  baseGrain: string, fields: PivotFields, lookupPaths: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {}
+  ;[...fields.columns, ...fields.rows, ...fields.values].forEach((item) => {
+    const role = effectiveLookupPath(baseGrain, item.field, lookupPaths[item.id])
+    if (role) out[item.id] = role
+  })
+  return out
+}
+
+// The grain the data is actually computed at: the base grain, plus any junction module that a
+// chosen role pulls in. Two passes rather than one, so the roles are read against a stable base.
+function pickGrainWithRoles(
+  source: string, fields: PivotFields, filterRules: FilterRule[], lookupPaths: Record<string, string>,
+): string {
+  const base = pickGrain(source, fields, filterRules)
+  const roles = resolveChipRoles(base, fields, lookupPaths)
+  const implied = new Set<string>()
+  ;[...fields.columns, ...fields.rows, ...fields.values].forEach((item) => {
+    const role = roles[item.id]
+    if (!role) return
+    const g = ROLE_GRAIN[roleFkKey(base, fieldKeyModule(item.field), role)]
+    if (g && MODULE_ROWS[g]) implied.add(g)
+  })
+  return implied.size === 0 ? base : pickGrain(source, fields, filterRules, implied)
 }
 
 // ── Date bucketing / relative windows (shared by row & column grouping, and filters) ──
@@ -2253,8 +2307,7 @@ interface FieldLabeler {
 function buildLabeler(grainModule: string, sampleRows: Row[], item: PivotItem, aggregations: Record<string, string>, rangeConfigs: Record<string, RangeConfig>, lookupPaths: Record<string, string> = {}): FieldLabeler {
   const type = getFieldType(item.field)
   const modifier = aggregations[item.id]
-  const role = effectiveLookupPath(grainModule, item.field, lookupPaths[item.id])
-  const resolve = (row: Row) => resolveFieldForRow(grainModule, row, item.field, null, role)
+  const resolve = (row: Row) => resolveFieldForRow(grainModule, row, item.field, null, lookupPaths[item.id])
 
   if (type === "date") {
     const gran = modifier || "Quarter & Year"
@@ -2544,6 +2597,9 @@ interface ComputedReport {
   grandTotals: number[]
   bucketRows: (ri: number, ci: number) => Row[]
   grainModule: string
+  /** Set when a one-to-many role has fanned the rows out, so measures from the "one" side are
+      counted once per joined row. Silence here would be a total that looks right and isn't. */
+  fanoutNotice: string | null
 }
 
 function computeReportData(
@@ -2560,7 +2616,23 @@ function computeReportData(
   // Concatenating in THIS order is what encodes the hierarchy: applyGroupLevelFilters narrows
   // sequentially, so a view-level Top-N ranks only among the groups base filters left standing.
   const allRules = viewFilterRules.length > 0 ? [...filterRules, ...viewFilterRules] : filterRules
-  const grainModule = pickGrain(source, fields, allRules)
+  const grainModule = pickGrainWithRoles(source, fields, allRules, lookupPaths)
+  // From here on "lookupPaths" means each chip's resolved role, not its raw choice.
+  const baseGrain = pickGrain(source, fields, allRules)
+  const chipRoles = resolveChipRoles(baseGrain, fields, lookupPaths)
+  lookupPaths = chipRoles
+
+  // A role that raised the grain repeats every "one"-side measure across the many rows it
+  // joined to. Name the affected measures rather than leaving an inflated total to be found.
+  let fanoutNotice: string | null = null
+  if (grainModule !== baseGrain) {
+    const fanned = fields.values.filter((v) => fieldKeyModule(v.field) === baseGrain)
+    const role = Object.values(chipRoles).find((r) => ROLE_GRAIN[roleFkKey(baseGrain, "People", r)])
+    if (fanned.length > 0) {
+      const names = fanned.map((v) => fieldDisplayName(v.field)).join(", ")
+      fanoutNotice = `${names} is counted once per ${(role ?? "joined row").toLowerCase()}, not once per ${baseGrain.toLowerCase()} — totals are higher than the ${baseGrain.toLowerCase()} totals.`
+    }
+  }
   const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
   const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, allRules))
 
@@ -2635,7 +2707,7 @@ function computeReportData(
     if (!item) return 0
     const type = getFieldType(item.field)
     const agg = aggregations[item.id] || (isNumericType(type) ? "Sum" : "Count")
-    return aggregateBucket(bucketRows(ri, ci), grainModule, item, agg, type, timelineFilters[item.id], effectiveLookupPath(grainModule, item.field, lookupPaths[item.id]))
+    return aggregateBucket(bucketRows(ri, ci), grainModule, item, agg, type, timelineFilters[item.id], lookupPaths[item.id])
   }
 
   const grandTotals = fields.values.map((_, vi) =>
@@ -2644,7 +2716,7 @@ function computeReportData(
     , 0)
   )
 
-  return { displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, grandTotals, bucketRows, grainModule }
+  return { displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, grandTotals, bucketRows, grainModule, fanoutNotice }
 }
 
 // Groups a sorted list of column-label tuples into per-level colSpan runs for nested pivot
@@ -2706,7 +2778,9 @@ function computeTabularData(
   // Base filters scope the report; view filters run on top — same ordering as computeReportData.
   const allRules = viewFilterRules.length > 0 ? [...filterRules, ...viewFilterRules] : filterRules
   const pivotShape = asPivotFields(fields)
-  const grainModule = pickGrain(source, pivotShape, allRules)
+  const grainModule = pickGrainWithRoles(source, pivotShape, allRules, lookupPaths)
+  const chipRoles = resolveChipRoles(pickGrain(source, pivotShape, allRules), pivotShape, lookupPaths)
+  lookupPaths = chipRoles
   const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
   const filtered = filterRowsFlat(grainModule, allRows, allRules)
 
@@ -2737,7 +2811,7 @@ function computeTabularData(
   const rows: TabularRow[] = decorated.slice(0, TABULAR_ROW_CAP).map(({ row, labels }) => ({
     groupLabels: labels,
     cells: fields.columns.map((item) => {
-      const raw = resolveFieldForRow(grainModule, row, item.field, null, effectiveLookupPath(grainModule, item.field, lookupPaths[item.id]))
+      const raw = resolveFieldForRow(grainModule, row, item.field, null, lookupPaths[item.id])
       let text = tabularCellText(raw, item, fieldFormats)
       // Simpler than the pivot's version of this setting: a tabular row IS one record, so its
       // currency is unambiguous — no mixed-currency group to suppress the tag for.
@@ -9052,6 +9126,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
   const rowSamples = fields.rows.map(item => ({ id: item.id, name: item.field }))
 
   const report = computeReportData(source, fields, aggregations, filterRules, viewFilterRules, timelineFilters, rangeConfigs, lookupPaths)
+  const fanoutNotice = report.fanoutNotice
   const { displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, grandTotals, bucketRows, grainModule } = report
   const colHeaderTiers = hasColumns ? buildColumnHeaderTiers(colTuples) : []
 
@@ -9088,6 +9163,11 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
 
     return (
       <div data-print-root className="flex-1 min-w-0 min-h-0 overflow-hidden bg-gray-50 p-5 flex flex-col items-start">
+        {fanoutNotice && (
+          <p className="shrink-0 mb-2 text-[12px] text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-3 py-1.5">
+            {fanoutNotice}
+          </p>
+        )}
         <div className="flex-1 min-h-0 w-fit max-w-full overflow-auto bg-white rounded-xl border border-gray-100 shadow-sm">
           <table data-report-table className="border-collapse text-[13px]">
             <thead>
@@ -9239,6 +9319,11 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
 
   return (
     <div data-print-root className="flex-1 min-w-0 min-h-0 overflow-hidden bg-gray-50 p-5 flex flex-col items-start">
+      {fanoutNotice && (
+        <p className="shrink-0 mb-2 text-[12px] text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-3 py-1.5">
+          {fanoutNotice}
+        </p>
+      )}
       <div className="flex-1 min-h-0 w-fit max-w-full overflow-auto bg-white rounded-xl border border-gray-100 shadow-sm">
         <table data-report-table className="border-collapse text-[13px]">
         <thead>
