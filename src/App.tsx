@@ -1858,6 +1858,13 @@ const ROLE_FK: Record<string, string> = {
   "Project members|People|Project creator": "createdById",
 }
 
+// The same one-to-many roles read as a LIST of ids, for filters. A filter never needs one row per
+// member — "projects I am on" is a yes/no per project — so it can test every member in place,
+// without raising the grain the way a row or column chip must.
+const ROLE_MULTI_FK: Record<string, string> = {
+  "Project|People|Project member": "teamIds",
+}
+
 // A role that is one-to-many cannot be answered by swapping a key — a project has many
 // members, so there is no single person to put in the cell. Reporting the first one would be
 // arbitrary and silently wrong. Instead the role raises the report's grain to the junction
@@ -2235,12 +2242,48 @@ function textRuleMatches(raw: any, rule: FilterRule): boolean {
   return (rule.catMatchMode ?? "any") === "none" ? !inSet : inSet
 }
 
+// The values a text/person filter should test for this row. One value normally; every member
+// when the role is one-to-many. Reads the rule's role, which withFilterRoles has already settled
+// against the base grain so it means what the user picked whatever grain the report ends up at.
+function filterValuesForRow(grainModule: string, row: Row, rule: FilterRule): any[] {
+  const role = rule.lookupPath
+  const target = fieldKeyModule(rule.field)
+  const multiFk = role ? ROLE_MULTI_FK[roleFkKey(grainModule, target, role)] : undefined
+  if (multiFk) {
+    const ids: any[] = Array.isArray(row[multiFk]) ? row[multiFk] : []
+    const field = fieldDisplayName(rule.field)
+    return ids.map((id) => DIMENSION_BY_ID[target]?.[id]?.[field])
+  }
+  return [resolveFieldForRow(grainModule, row, rule.field, null, role)]
+}
+
+// "None of" and "not me" must hold for EVERY value a row has; the positive modes need just one.
+// With a single value per row the two readings agree, so this only changes one-to-many filters:
+// "member is not me" excludes any project I am on, rather than passing it because someone else is.
+function textRuleMatchesAll(values: any[], rule: FilterRule): boolean {
+  const negative = (rule.catMode ?? "actual") !== "wildcard"
+    && (rule.catMatchMode === "none" || rule.catMatchMode === "notMe")
+  return negative ? values.every((v) => textRuleMatches(v, rule)) : values.some((v) => textRuleMatches(v, rule))
+}
+
+// Each rule with its relationship role resolved against the BASE grain — the same rule chips use,
+// so a filter and a chip on the same field read the same people. Done once, up front, because a
+// chip choosing a one-to-many role can raise the grain, and a role re-derived after that would no
+// longer see the choices the user was offered.
+function withFilterRoles(baseGrain: string, rules: FilterRule[]): FilterRule[] {
+  return rules.map((r) => {
+    const role = effectiveLookupPath(baseGrain, r.field, r.lookupPath)
+    return role === r.lookupPath ? r : { ...r, lookupPath: role }
+  })
+}
+
 function ruleMatches(grainModule: string, row: Row, rule: FilterRule): boolean {
   // Numeric rules, and Count/Distinct-Count-treated categorical rules, are group-level
   // ("HAVING"-style) — they don't apply per raw row at all; computeReportData prunes
   // comboEntries with them separately, after grouping (see applyGroupLevelFilters).
   if (isGroupLevelFilterRule(rule)) return true
-  const raw = resolveFieldForRow(grainModule, row, rule.field, null)
+  if (rule.type === "text" || rule.type === "person") return textRuleMatchesAll(filterValuesForRow(grainModule, row, rule), rule)
+  const raw = resolveFieldForRow(grainModule, row, rule.field, null, rule.lookupPath)
   if (rule.type === "date") return dateRuleMatches(raw, rule)
   if (rule.type === "boolean") return booleanRuleMatches(raw, rule)
   return textRuleMatches(raw, rule)
@@ -2257,7 +2300,8 @@ function rowPassesFilters(grainModule: string, row: Row, rules: FilterRule[]): b
 // on the promise that applyGroupLevelFilters prunes them later, so reusing it unchanged would
 // leave a tabular numeric filter silently doing nothing.
 function tabularRuleMatches(grainModule: string, row: Row, rule: FilterRule, relativeThreshold?: number): boolean {
-  const raw = resolveFieldForRow(grainModule, row, rule.field, null)
+  if (rule.type === "text" || rule.type === "person") return textRuleMatchesAll(filterValuesForRow(grainModule, row, rule), rule)
+  const raw = resolveFieldForRow(grainModule, row, rule.field, null, rule.lookupPath)
   if (rule.type === "date") return dateRuleMatches(raw, rule)
   if (rule.type === "boolean") return booleanRuleMatches(raw, rule)
   if (isNumericType(rule.type)) return numericRuleMatches(raw, rule, relativeThreshold)
@@ -2482,23 +2526,27 @@ function comboAggregateValue(entry: ComboEntry, grainModule: string, fieldKey: s
 // field — same conventions as textRuleMatches — via resolveFieldForRow (the same per-row
 // resolver aggregateBucket already uses, so this is grain-correct for free: e.g. resolves
 // Role::Role name off an Allocations row's roleId, or Task::Assignees directly off a Task row).
-function groupDistinctValues(rows: Row[], grainModule: string, fieldKey: string): Set<string> {
+function groupDistinctValues(rows: Row[], grainModule: string, fieldKey: string, role?: string): Set<string> {
   const set = new Set<string>()
+  // Same resolution a row filter uses, so "all of" / "only" read the same people — every
+  // member, where the role is one-to-many.
+  const probe = { field: fieldKey, lookupPath: role } as FilterRule
   rows.forEach((row) => {
-    const raw = resolveFieldForRow(grainModule, row, fieldKey, null)
-    if (raw == null || raw === "") return
-    set.add(String(raw).toLowerCase())
+    filterValuesForRow(grainModule, row, probe).forEach((raw) => {
+      if (raw == null || raw === "") return
+      set.add(String(raw).toLowerCase())
+    })
   })
   return set
 }
-function groupContainsAllValues(rows: Row[], grainModule: string, fieldKey: string, checked: string[]): boolean {
+function groupContainsAllValues(rows: Row[], grainModule: string, fieldKey: string, checked: string[], role?: string): boolean {
   if (checked.length === 0) return true
-  const distinct = groupDistinctValues(rows, grainModule, fieldKey)
+  const distinct = groupDistinctValues(rows, grainModule, fieldKey, role)
   return checked.every((v) => distinct.has(v.toLowerCase()))
 }
-function groupContainsExactlyValues(rows: Row[], grainModule: string, fieldKey: string, checked: string[]): boolean {
+function groupContainsExactlyValues(rows: Row[], grainModule: string, fieldKey: string, checked: string[], role?: string): boolean {
   if (checked.length === 0) return true
-  const distinct = groupDistinctValues(rows, grainModule, fieldKey)
+  const distinct = groupDistinctValues(rows, grainModule, fieldKey, role)
   return distinct.size === checked.length && checked.every((v) => distinct.has(v.toLowerCase()))
 }
 
@@ -2515,8 +2563,8 @@ function applyGroupLevelFilters(entries: ComboEntry[], rules: FilterRule[], grai
         // ones carrying a checked value.
         const rows = ([] as Row[]).concat(...e.cols.values())
         return exact
-          ? groupContainsExactlyValues(rows, grainModule, rule.field, checked)
-          : groupContainsAllValues(rows, grainModule, rule.field, checked)
+          ? groupContainsExactlyValues(rows, grainModule, rule.field, checked, rule.lookupPath)
+          : groupContainsAllValues(rows, grainModule, rule.field, checked, rule.lookupPath)
       })
       return
     }
@@ -2544,7 +2592,8 @@ function previewGroupRows(
 ): { grainModule: string; groups: Row[][] } {
   const grainModule = pickGrain(source, fields, filterRules)
   const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
-  const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, filterRules))
+  const roledRules = withFilterRoles(grainModule, filterRules)
+  const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, roledRules))
 
   if (fields.rows.length === 0) return { grainModule, groups: [filteredRows] }
 
@@ -2601,16 +2650,21 @@ function previewSetMembershipOverlap(
 //   scopeRules  = base only — the narrowing this list must respect
 function relevantFieldValues(
   source: string, fields: PivotFields, grainRules: FilterRule[], scopeRules: FilterRule[],
-  fieldKey: string, type: FieldType,
+  fieldKey: string, type: FieldType, lookupPath?: string,
 ): string[] | null {
   if (type === "boolean") return ["Yes", "No"]
   if (type !== "text" && type !== "person") return null
   const grainModule = pickGrain(source, fields, grainRules)
+  const roledScope = withFilterRoles(grainModule, scopeRules)
+  // The offered values must come through the same relationship the filter will test, or the
+  // list would show owners while the filter matched members (or show nothing at all).
+  const probe = withFilterRoles(grainModule, [{ field: fieldKey, lookupPath } as FilterRule])[0]
   const values = new Set<string>()
   ;(MODULE_ROWS[grainModule] ?? []).forEach((row) => {
-    if (!rowPassesFilters(grainModule, row, scopeRules)) return
-    const v = resolveFieldForRow(grainModule, row, fieldKey, null)
-    if (v != null && v !== "") values.add(String(v))
+    if (!rowPassesFilters(grainModule, row, roledScope)) return
+    filterValuesForRow(grainModule, row, probe).forEach((v) => {
+      if (v != null && v !== "") values.add(String(v))
+    })
   })
   return values.size > 0 ? [...values].sort((a, b) => a.localeCompare(b)) : null
 }
@@ -2663,7 +2717,8 @@ function computeReportData(
     }
   }
   const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
-  const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, allRules))
+  const roledRules = withFilterRoles(baseGrain, allRules)
+  const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, roledRules))
 
   const rowLabelers = fields.rows.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths))
   // Every Columns field participates. Each distinct combination gets one composite key (joined
@@ -2703,7 +2758,7 @@ function computeReportData(
     }
     return 0
   })
-  const groupLevelRules = allRules.filter(isGroupLevelFilterRule)
+  const groupLevelRules = roledRules.filter(isGroupLevelFilterRule)
   const comboEntries = groupLevelRules.length > 0
     ? applyGroupLevelFilters(sortedEntries, groupLevelRules, grainModule)
     : sortedEntries
@@ -2811,7 +2866,7 @@ function computeTabularData(
   const chipRoles = resolveChipRoles(pickGrain(source, pivotShape, allRules), pivotShape, lookupPaths)
   lookupPaths = chipRoles
   const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
-  const filtered = filterRowsFlat(grainModule, allRows, allRules)
+  const filtered = filterRowsFlat(grainModule, allRows, withFilterRoles(pickGrain(source, pivotShape, allRules), allRules))
 
   const groupLabelers = fields.groupBy.map((item) =>
     buildLabeler(grainModule, filtered, item, groupByAggregations, rangeConfigs, lookupPaths))
@@ -2880,7 +2935,7 @@ function flatFieldNumericValues(
 ): number[] {
   const grainModule = pickGrain(source, fields, grainRules)
   const out: number[] = []
-  filterRowsFlat(grainModule, MODULE_ROWS[grainModule] ?? [], scopeRules).forEach((row) => {
+  filterRowsFlat(grainModule, MODULE_ROWS[grainModule] ?? [], withFilterRoles(grainModule, scopeRules)).forEach((row) => {
     const n = Number(resolveFieldForRow(grainModule, row, fieldKey, null))
     if (!Number.isNaN(n)) out.push(n)
   })
@@ -5343,6 +5398,9 @@ type FilterOperator = string
 interface FilterRule {
   field: string
   type: FieldType
+  /** Which relationship this filter reads the field through, when it can be reached more than
+      one way — the filter-side twin of a chip's role. Absent means the primary path. */
+  lookupPath?: string
   operator: FilterOperator
   value: string
   value2: string   // for "between" ranges
@@ -5972,6 +6030,70 @@ function DateFilterModal({ rule, onChange, onClose }: {
 // Mirrors DateFilterModal's structure (portalled backdrop + centered card, tab pills in
 // the header, Apply/Clear footer) so the two "big modal" filter experiences feel like one
 // consistent system rather than two unrelated ones.
+// Which relationship a FILTER reads its field through — the filter-side twin of the role pill on
+// a chip. Only rendered where the field can be reached more than one way.
+function FilterRoleStrip({ grainModule, rule, onChange, compact, readOnly }: {
+  grainModule: string
+  rule: FilterRule
+  onChange: (patch: Partial<FilterRule>) => void
+  /** Tighter padding for the view-filter rail. */
+  compact?: boolean
+  /** Viewers see which relationship applies but cannot change it — it is part of the report's
+      definition, like the field itself. */
+  readOnly?: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const btnRef = useRef<HTMLButtonElement>(null)
+  const options = availableLookupPaths(grainModule, rule.field)
+  if (options.length < 2) return null
+  const current = rule.lookupPath && options.includes(rule.lookupPath) ? rule.lookupPath : options[0]
+  const isMulti = !!ROLE_MULTI_FK[roleFkKey(grainModule, fieldKeyModule(rule.field), current)]
+  const pad = compact ? "px-2.5 py-1 text-[11px]" : "px-5 py-2 text-[12px]"
+  if (readOnly) {
+    return (
+      <div className={`flex items-center gap-1.5 border-b border-gray-100 bg-sky-50/50 text-gray-500 ${pad}`}>
+        via <span className="font-medium text-sky-700">{current}</span>
+      </div>
+    )
+  }
+  return (
+    <div className={`flex items-center gap-2 border-b border-gray-100 bg-sky-50/50 text-gray-600 ${pad}`}>
+      <span className="shrink-0">{compact ? "via" : "Matched through"}</span>
+      <button
+        ref={btnRef}
+        onClick={() => setOpen((p) => !p)}
+        className="flex items-center gap-1 font-medium text-sky-700 bg-white border border-sky-200 rounded px-2 py-0.5
+          hover:bg-sky-50 transition-colors shrink-0"
+      >
+        {current}<Ic.ChevDown size={9} />
+      </button>
+      {/* A one-to-many role tests every person on the record, which is easy to get backwards. */}
+      {isMulti && !compact && (
+        <span className="text-gray-400 truncate">
+          a {grainModule.toLowerCase()} matches if any {current.toLowerCase().replace(/^.*\s/, "")} does
+        </span>
+      )}
+      {open && (
+        <ChipPortalMenu anchorRef={btnRef} onClose={() => setOpen(false)}>
+          <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl py-1 w-52 overflow-hidden">
+            {options.map((opt) => (
+              <button
+                key={opt}
+                onClick={() => { onChange({ lookupPath: opt }); setOpen(false) }}
+                className={`flex items-center justify-between w-full px-3 py-1.5 text-[13px] text-left hover:bg-sky-50 transition-colors
+                  ${current === opt ? "text-sky-700 font-medium" : "text-gray-700"}`}
+              >
+                {opt}
+                {current === opt && <Ic.Check />}
+              </button>
+            ))}
+          </div>
+        </ChipPortalMenu>
+      )}
+    </div>
+  )
+}
+
 function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, rangeConfigs, valueOptions, flat, onChange, onClose }: {
   rule: FilterRule
   allRules: FilterRule[]
@@ -6119,6 +6241,8 @@ function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, 
             <Ic.X size={14} />
           </button>
         </div>
+
+        <FilterRoleStrip grainModule={pickGrain(source, fields, allRules)} rule={rule} onChange={onChange} />
 
         {/* Sub-mode — secondary, subdued segmented control */}
         <div className="flex items-center gap-2 px-5 py-2.5 border-b border-gray-100 bg-gray-50/60">
@@ -6870,6 +6994,15 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
       >
         {fieldTypeIcon(rule.type, 11)}
         <span>{fieldDisplayName(rule.field)}</span>
+        {/* The relationship, where there is a choice — "Team member name is me" means different
+            people depending on whether it is read as owner, creator or member. */}
+        {(() => {
+          const g = pickGrain(source, fields, allRules)
+          const opts = availableLookupPaths(g, rule.field)
+          if (opts.length < 2) return null
+          const role = rule.lookupPath && opts.includes(rule.lookupPath) ? rule.lookupPath : opts[0]
+          return <span className="text-sky-700 font-normal">via {role}</span>
+        })()}
         {!isDateField && !isCategoricalField && !isNumericField && rule.operator && (
           <span className="text-gray-400 font-normal">{rule.operator}</span>
         )}
@@ -7555,7 +7688,35 @@ function ViewFilterCard({ rule, baseRules, source, fields, aggregations, rangeCo
         )}
       </div>
 
-      {body}
+      <FilterRoleStrip
+        grainModule={pickGrain(source, fields, [...baseRules, rule])}
+        rule={rule}
+        onChange={onChange}
+        compact
+        readOnly={!isCreate}
+      />
+
+      {/* "Only me" sits above whichever control the builder chose. It is a toggle rather than a
+          "Me" entry in the list because the list starts all-ticked and clicking a name UNticks it —
+          isolating yourself would take a click per colleague, and "Me" would duplicate your name. */}
+      {rule.type === "person" && (
+        <label className="flex items-center gap-2 px-2.5 py-1.5 border-b border-gray-100 text-[12px] cursor-pointer select-none hover:bg-gray-50">
+          <input
+            type="checkbox"
+            checked={rule.catMatchMode === "me"}
+            onChange={() => onChange({ catMatchMode: rule.catMatchMode === "me" ? "any" : "me" })}
+            className="w-3.5 h-3.5 accent-indigo-600"
+          />
+          <span className="text-gray-700 font-medium">Only me</span>
+          <span className="text-gray-400 truncate">· {getCurrentUserName()}</span>
+        </label>
+      )}
+
+      {rule.type === "person" && rule.catMatchMode === "me" ? (
+        <p className="px-2.5 py-2 text-[11px] text-gray-400 leading-relaxed">
+          Showing rows where this is whoever is viewing. Untick to pick people.
+        </p>
+      ) : body}
 
       {showSettings && (
         <ViewFilterSettings
@@ -7657,7 +7818,7 @@ function ViewFilterPane({
               fields={fields}
               aggregations={aggregations}
               rangeConfigs={rangeConfigs}
-              valueOptions={relevantFieldValues(source, fields, grainRules, baseRules, rule.field, rule.type)}
+              valueOptions={relevantFieldValues(source, fields, grainRules, baseRules, rule.field, rule.type, rule.lookupPath)}
               isCreate={isCreate}
               flat={flat}
               onRemove={() => onRemove(rule.field)}
