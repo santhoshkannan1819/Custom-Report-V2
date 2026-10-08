@@ -6312,9 +6312,9 @@ function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, 
                       </div>
                     </ChipPortalMenu>
                   )}
-                  {isCurrentUserMode(matchMode)
-                    ? <span className="text-[11px] text-gray-400 truncate">resolved when the report is opened</span>
-                    : <span className="text-[11px] text-gray-400 truncate">{selectedValues.length} of {allValues.length} selected</span>}
+                  {!isCurrentUserMode(matchMode) && (
+                    <span className="text-[11px] text-gray-400 truncate">{selectedValues.length} of {allValues.length} selected</span>
+                  )}
                 </div>
                 {!isCurrentUserMode(matchMode) && (
                   <div className="flex gap-2 shrink-0">
@@ -6326,15 +6326,9 @@ function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, 
               {/* Options */}
               <div className="overflow-y-auto flex-1">
                 {isCurrentUserMode(matchMode) ? (
-                  <div className="px-4 py-6 text-center">
-                    <p className="text-[13px] text-gray-700 mb-1">
-                      {matchMode === "me" ? "Matches the person viewing the report." : "Excludes the person viewing the report."}
-                    </p>
-                    <p className="text-[12px] text-gray-400 leading-relaxed">
-                      No names are stored on the filter, so everyone who opens this report sees their own rows.
-                      Right now that is <strong className="text-gray-600 font-medium">{getCurrentUserName()}</strong>.
-                    </p>
-                  </div>
+                  <p className="px-4 py-6 text-center text-[13px] text-gray-700">
+                    {matchMode === "me" ? "Matches the person viewing the report." : "Excludes the person viewing the report."}
+                  </p>
                 ) : filteredOptions.length === 0
                   ? <p className="text-[13px] text-gray-400 text-center py-8">No matches</p>
                   : filteredOptions.map(v => {
