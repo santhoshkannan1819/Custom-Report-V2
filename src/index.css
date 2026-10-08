@@ -135,3 +135,15 @@
 .range-slider-thumb::-moz-range-track {
   background: transparent;
 }
+
+/* A view-filter value list disabled by "Only me": stays readable, stops looking clickable.
+   The rows carry their own pointer cursor and hover tint, which would otherwise invite a click
+   that does nothing. */
+.vf-disabled,
+.vf-disabled * {
+  cursor: not-allowed !important;
+}
+.vf-disabled button:hover,
+.vf-disabled label:hover {
+  background-color: transparent !important;
+}
