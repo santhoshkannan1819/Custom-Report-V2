@@ -7489,7 +7489,7 @@ function ViewFilterCard({ rule, baseRules, source, fields, aggregations, rangeCo
       {!search && (
         <label
           onClick={() => { if (!onlyMe && !allSelected) onChange(isNumericField ? { values: [], numMode: "actual" } : { values: [] }) }}
-          title={onlyMe ? ONLY_ME_TIP : allSelected ? "At least one value must stay selected" : "Select all"}
+          title={onlyMe ? undefined : allSelected ? "At least one value must stay selected" : "Select all"}
           className={`flex items-center gap-2 px-2.5 py-1 text-[12px] text-gray-700 select-none
             ${allSelected ? "cursor-default" : "cursor-pointer hover:bg-indigo-50"}`}
         >
@@ -7717,7 +7717,19 @@ function ViewFilterCard({ rule, baseRules, source, fields, aggregations, rangeCo
       )}
 
       {onlyMe ? (
-        <div title={ONLY_ME_TIP} aria-disabled className="vf-disabled opacity-50">{body}</div>
+        // Our own tooltip rather than a native `title`, which waits ~half a second before showing
+        // and cannot be made faster. It sits beside the faded list, not inside it, so it renders
+        // at full strength; and inside the card's bounds, since the card clips its overflow.
+        <div aria-disabled className="vf-disabled relative group">
+          <div className="opacity-50">{body}</div>
+          <span
+            role="tooltip"
+            className="pointer-events-none absolute left-1/2 top-2 -translate-x-1/2 w-max max-w-[90%] text-center
+              rounded-md bg-gray-900 px-2 py-1 text-[11px] leading-snug text-white shadow-lg opacity-0 group-hover:opacity-100"
+          >
+            {ONLY_ME_TIP}
+          </span>
+        </div>
       ) : body}
 
       {showSettings && (
