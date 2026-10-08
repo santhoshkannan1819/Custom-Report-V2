@@ -606,6 +606,29 @@ const SOURCE_OPTIONS = Object.keys(SOURCE_MODULES)
 
 const AGG_OPTIONS = ["Sum", "Count", "Distinct Count", "Average", "Min", "Max"]
 
+// ── The viewer ────────────────────────────────────────────────────────────────
+// A "current user" filter stores the RULE, not a name, so the same saved report shows each
+// person their own rows. Standing in for the session's signed-in user; the switcher in the nav
+// exists so the behaviour can actually be demonstrated with one browser.
+const CURRENT_USER_KEY = "customReportsV2.currentUser"
+let CURRENT_USER_NAME: string | null = null
+function getCurrentUserName(): string {
+  // Read on first use rather than at module load: PERSON_NAMES is defined further down.
+  if (CURRENT_USER_NAME === null) {
+    // Default to the owner of the first project rather than the first name on the list: the
+    // first name owns nothing in the sample data, so a "my projects" report would open empty
+    // and read as broken.
+    const fallback = String(PROJECTS[0]?.["Project owner"] ?? PERSON_NAMES[0])
+    try { CURRENT_USER_NAME = localStorage.getItem(CURRENT_USER_KEY) || fallback }
+    catch { CURRENT_USER_NAME = fallback }
+  }
+  return CURRENT_USER_NAME
+}
+function setCurrentUserName(name: string): void {
+  CURRENT_USER_NAME = name
+  try { localStorage.setItem(CURRENT_USER_KEY, name) } catch {}
+}
+
 // ── Mock field values (for filter picker) ─────────────────────────────────────
 
 // Real distinct values pulled straight from the generated dataset (defined further down,
@@ -2200,6 +2223,12 @@ function textRuleMatches(raw: any, rule: FilterRule): boolean {
     return conds.some((c) => wildcardConditionMatches(lower, c))
   }
 
+  // Resolved against whoever is viewing, so the same saved rule answers differently per person.
+  if (isCurrentUserMode(rule.catMatchMode)) {
+    const isMe = lower === getCurrentUserName().toLowerCase()
+    return rule.catMatchMode === "me" ? isMe : !isMe
+  }
+
   const selected = rule.values ?? []
   if (selected.length === 0) return true
   const inSet = selected.some((v) => v.toLowerCase() === lower)
@@ -2861,7 +2890,48 @@ function flatFieldNumericValues(
 
 // ── Left nav ───────────────────────────────────────────────────────────────────
 
-function LeftNav({ appMode, setAppMode }: { appMode: string; setAppMode: (m: AppMode) => void }) {
+// Stands in for the signed-in user. A "current user" filter is only believable if you can watch
+// it answer differently for two people, and one browser has one session — so the avatar switches
+// who is looking.
+function ViewerSwitcher({ onChange }: { onChange: () => void }) {
+  const [open, setOpen] = useState(false)
+  const btnRef = useRef<HTMLButtonElement>(null)
+  const current = getCurrentUserName()
+  const initials = current.split(" ").map((w) => w[0]).join("").slice(0, 2).toUpperCase()
+  return (
+    <>
+      <button
+        ref={btnRef}
+        onClick={() => setOpen((p) => !p)}
+        title={`Viewing as ${current} — click to switch`}
+        className="w-7 h-7 rounded-full bg-emerald-500 flex items-center justify-center cursor-pointer mt-1
+          hover:ring-2 hover:ring-emerald-300 transition-all"
+      >
+        <span className="text-white text-[9px] font-bold">{initials}</span>
+      </button>
+      {open && (
+        <ChipPortalMenu anchorRef={btnRef} onClose={() => setOpen(false)}>
+          <div className="bg-white border border-gray-200 rounded-lg shadow-2xl py-1 w-56 max-h-[320px] overflow-y-auto">
+            <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-3 pt-2 pb-1">Viewing as</p>
+            {PERSON_NAMES.map((name) => (
+              <button
+                key={name}
+                onClick={() => { setCurrentUserName(name); setOpen(false); onChange() }}
+                className={`flex items-center justify-between w-full px-3 py-1.5 text-[13px] text-left hover:bg-indigo-50 transition-colors
+                  ${name === current ? "text-indigo-600 font-medium" : "text-gray-700"}`}
+              >
+                {name}
+                {name === current && <Ic.Check />}
+              </button>
+            ))}
+          </div>
+        </ChipPortalMenu>
+      )}
+    </>
+  )
+}
+
+function LeftNav({ appMode, setAppMode, onViewerChange }: { appMode: string; setAppMode: (m: AppMode) => void; onViewerChange: () => void }) {
   const [showMenu, setShowMenu] = useState(false)
 
   return (
@@ -2937,9 +3007,7 @@ function LeftNav({ appMode, setAppMode }: { appMode: string; setAppMode: (m: App
       <div className="mt-auto flex flex-col items-center gap-0.5">
         <NavBtn label="Gifts" nav><Ic.Gift /></NavBtn>
         <NavBtn label="Messages" nav><Ic.Message /></NavBtn>
-        <div className="w-7 h-7 rounded-full bg-emerald-500 flex items-center justify-center cursor-pointer mt-1">
-          <span className="text-white text-[9px] font-bold">SK</span>
-        </div>
+        <ViewerSwitcher onChange={onViewerChange} />
       </div>
     </nav>
   )
@@ -5296,7 +5364,7 @@ interface FilterRule {
   // the REPORT'S OWN pivot-row groups survive (every/exactly the checked values must appear
   // among that group's rows for this field) without ever dropping rows from a surviving
   // group — so its Values totals still reflect the whole group, not just the checked values.
-  catMatchMode: "any" | "none" | "all" | "only"
+  catMatchMode: CatMatchMode
   wildcardConditions: { matchType: WildcardMatchType; value: string }[]
   wildcardIncludeEmpty: boolean
   // text/person-specific — how the field is treated for filtering purposes. "categorical"
@@ -5391,9 +5459,13 @@ const WILDCARD_MATCH_TYPES: WildcardMatchType[] = [
 
 // Categorical filter modal's Actual-tab match-mode dropdown labels — "any of"/"none of" are
 // row-level, "all of"/"only" are group-level (see isSetMembershipFilterRule).
-const MATCH_MODE_LABEL: Record<"any" | "none" | "all" | "only", string> = {
+type CatMatchMode = "any" | "none" | "all" | "only" | "me" | "notMe"
+const MATCH_MODE_LABEL: Record<CatMatchMode, string> = {
   any: "is any of", none: "is none of", all: "is all of", only: "is only",
+  me: "is the current user", notMe: "is not the current user",
 }
+// Resolved when the report runs, not when it is built, so the saved rule is viewer-independent.
+const isCurrentUserMode = (m: string | undefined) => m === "me" || m === "notMe"
 
 const ACTUAL_DATE_VALUES: Record<string, string[]> = {
   "Year":           ["2021", "2022", "2023", "2024", "2025", "2026"],
@@ -6100,8 +6172,9 @@ function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, 
                   </button>
                   {showMatchModeMenu && (
                     <ChipPortalMenu anchorRef={matchModeBtnRef} onClose={() => setShowMatchModeMenu(false)}>
-                      <div className="bg-white border border-gray-200 rounded-lg shadow-xl py-1 w-40 mt-1">
-                        {((flat ? ["any", "none"] : ["any", "none", "all", "only"]) as ("any" | "none" | "all" | "only")[]).map((key) => (
+                      <div className="bg-white border border-gray-200 rounded-lg shadow-xl py-1 w-52 mt-1">
+                        {(((flat ? ["any", "none"] : ["any", "none", "all", "only"])
+                          .concat(rule.type === "person" ? ["me", "notMe"] : [])) as CatMatchMode[]).map((key) => (
                           <button
                             key={key}
                             onClick={() => { onChange({ catMatchMode: key }); setShowMatchModeMenu(false) }}
@@ -6115,16 +6188,30 @@ function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, 
                       </div>
                     </ChipPortalMenu>
                   )}
-                  <span className="text-[11px] text-gray-400 truncate">{selectedValues.length} of {allValues.length} selected</span>
+                  {isCurrentUserMode(matchMode)
+                    ? <span className="text-[11px] text-gray-400 truncate">resolved when the report is opened</span>
+                    : <span className="text-[11px] text-gray-400 truncate">{selectedValues.length} of {allValues.length} selected</span>}
                 </div>
-                <div className="flex gap-2 shrink-0">
-                  <button onClick={() => onChange({ values: allValues })} className="text-[11px] text-indigo-500 hover:text-indigo-700 font-medium">All</button>
-                  <button onClick={() => onChange({ values: [] })} className="text-[11px] text-gray-400 hover:text-gray-600">None</button>
-                </div>
+                {!isCurrentUserMode(matchMode) && (
+                  <div className="flex gap-2 shrink-0">
+                    <button onClick={() => onChange({ values: allValues })} className="text-[11px] text-indigo-500 hover:text-indigo-700 font-medium">All</button>
+                    <button onClick={() => onChange({ values: [] })} className="text-[11px] text-gray-400 hover:text-gray-600">None</button>
+                  </div>
+                )}
               </div>
               {/* Options */}
               <div className="overflow-y-auto flex-1">
-                {filteredOptions.length === 0
+                {isCurrentUserMode(matchMode) ? (
+                  <div className="px-4 py-6 text-center">
+                    <p className="text-[13px] text-gray-700 mb-1">
+                      {matchMode === "me" ? "Matches the person viewing the report." : "Excludes the person viewing the report."}
+                    </p>
+                    <p className="text-[12px] text-gray-400 leading-relaxed">
+                      No names are stored on the filter, so everyone who opens this report sees their own rows.
+                      Right now that is <strong className="text-gray-600 font-medium">{getCurrentUserName()}</strong>.
+                    </p>
+                  </div>
+                ) : filteredOptions.length === 0
                   ? <p className="text-[13px] text-gray-400 text-center py-8">No matches</p>
                   : filteredOptions.map(v => {
                       const checked = selectedValues.includes(v)
@@ -6732,6 +6819,10 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
       if (conds.length === 1) return `${WILDCARD_VERB[conds[0].matchType]} '${conds[0].value}'`
       return `${conds.length} conditions`
     }
+    // A current-user rule has no ticked values to describe — without this the chip would fall
+    // back to "Actual" and give no hint that it answers differently for each viewer.
+    if (rule.catMatchMode === "me") return "is me"
+    if (rule.catMatchMode === "notMe") return "is not me"
     if (selectedValues.length === 0) return ""
     const base = selectedValues.length === 1 ? selectedValues[0] : `${selectedValues.length} selected`
     const matchMode = rule.catMatchMode ?? "any"
@@ -9596,6 +9687,9 @@ export default function App() {
   // Keyed by CHIP id, not by relationship: the same field dropped twice can resolve two
   // different ways, which a report-level setting could never express.
   const [lookupPaths, setLookupPaths] = useState<Record<string, string>>(savedReport?.lookupPaths ?? {})
+  // Switching viewer changes what every current-user filter resolves to, so the whole app has
+  // to recompute — a counter is enough, since the name itself lives outside React.
+  const [, setViewerTick] = useState(0)
   const [dragging, setDragging] = useState<AppState["dragging"]>(false)
   const [dragType, setDragType] = useState<AppState["dragType"]>(null)
   const [filterRules, setFilterRules] = useState<FilterRule[]>(savedReport?.filterRules ?? [])
@@ -9804,7 +9898,7 @@ export default function App() {
 
   return (
     <div className="flex h-screen bg-white font-sans">
-      <LeftNav appMode={appMode} setAppMode={setAppMode} />
+      <LeftNav appMode={appMode} setAppMode={setAppMode} onViewerChange={() => setViewerTick((t) => t + 1)} />
 
       {dupAlert && (
         <DupFieldAlert
