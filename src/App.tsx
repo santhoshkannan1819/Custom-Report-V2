@@ -6032,6 +6032,34 @@ function DateFilterModal({ rule, onChange, onClose }: {
 // consistent system rather than two unrelated ones.
 const ONLY_ME_TIP = "Untick “Only me” to pick people"
 
+// A tooltip that tracks the pointer. Portalled to the body because the filter card clips its
+// overflow, and kept on screen by measuring itself: the view-filter rail sits at the right edge,
+// so a tooltip anchored at the cursor would usually run off it.
+function CursorTooltip({ text, at }: { text: string; at: { x: number; y: number } }) {
+  const ref = useRef<HTMLSpanElement>(null)
+  const [size, setSize] = useState({ w: 0, h: 0 })
+  useLayoutEffect(() => {
+    if (ref.current) setSize({ w: ref.current.offsetWidth, h: ref.current.offsetHeight })
+  }, [text])
+  const gap = 14
+  const left = Math.max(8, Math.min(at.x - size.w / 2, window.innerWidth - size.w - 8))
+  // Below the pointer, so it never sits under it; above if that would leave the viewport.
+  const below = at.y + gap + size.h <= window.innerHeight - 8
+  const top = below ? at.y + gap : at.y - gap - size.h
+  return createPortal(
+    <span
+      ref={ref}
+      role="tooltip"
+      style={{ position: "fixed", left, top, visibility: size.w ? "visible" : "hidden" }}
+      className="pointer-events-none z-[300] whitespace-nowrap rounded-md bg-gray-900 px-2 py-1
+        text-[11px] leading-snug text-white shadow-lg"
+    >
+      {text}
+    </span>,
+    document.body,
+  )
+}
+
 // Which relationship a FILTER reads its field through — the filter-side twin of the role pill on
 // a chip. Only rendered where the field can be reached more than one way.
 function FilterRoleStrip({ grainModule, rule, onChange, compact, readOnly }: {
@@ -7397,6 +7425,7 @@ function ViewFilterCard({ rule, baseRules, source, fields, aggregations, rangeCo
   const [showSettings, setShowSettings] = useState(false)
   const [showDropdown, setShowDropdown] = useState(false)
   const [search, setSearch] = useState("")
+  const [tipAt, setTipAt] = useState<{ x: number; y: number } | null>(null)
   const settingsBtnRef = useRef<HTMLButtonElement>(null)
   const dropdownBtnRef = useRef<HTMLButtonElement>(null)
 
@@ -7718,17 +7747,15 @@ function ViewFilterCard({ rule, baseRules, source, fields, aggregations, rangeCo
 
       {onlyMe ? (
         // Our own tooltip rather than a native `title`, which waits ~half a second before showing
-        // and cannot be made faster. It sits beside the faded list, not inside it, so it renders
-        // at full strength; and inside the card's bounds, since the card clips its overflow.
-        <div aria-disabled className="vf-disabled relative group">
+        // and cannot be made faster. It follows the pointer and renders at full strength.
+        <div
+          aria-disabled
+          className="vf-disabled"
+          onMouseMove={(e) => setTipAt({ x: e.clientX, y: e.clientY })}
+          onMouseLeave={() => setTipAt(null)}
+        >
           <div className="opacity-50">{body}</div>
-          <span
-            role="tooltip"
-            className="pointer-events-none absolute left-1/2 top-2 -translate-x-1/2 w-max max-w-[90%] text-center
-              rounded-md bg-gray-900 px-2 py-1 text-[11px] leading-snug text-white shadow-lg opacity-0 group-hover:opacity-100"
-          >
-            {ONLY_ME_TIP}
-          </span>
+          {tipAt && <CursorTooltip text={ONLY_ME_TIP} at={tipAt} />}
         </div>
       ) : body}
 
