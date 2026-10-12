@@ -1973,15 +1973,20 @@ function rollupOne(rows: Row[], field: string, type: FieldType): any {
   return rows[0][field]
 }
 
-function withinWindow(v: any, window: [number, number]): boolean {
+// The instants a time-tracked metric is narrowed to: a chip's calendar, one Timeline column's
+// period, or the Timeline filter. The filter is an ordinary date filter, so it can pick scattered
+// values ("Jan 2026, Mar 2026", or every January) — hence a test rather than a span.
+type DateWindow = (t: number) => boolean
+const spanWindow = ([lo, hi]: [number, number]): DateWindow => (t) => t >= lo && t <= hi
+
+function withinWindow(v: any, window: DateWindow): boolean {
   if (v == null) return false
-  const t = v instanceof Date ? v.getTime() : new Date(v).getTime()
-  return t >= window[0] && t <= window[1]
+  return window(v instanceof Date ? v.getTime() : new Date(v).getTime())
 }
 
 // Resolves a "Module::Field" key against a row at any grain — own field, ancestor
 // dimension, or rollup-collection — using the FK ids every generated row carries.
-function resolveFieldForRow(grainModule: string, row: Row, targetKey: string, dateWindow: [number, number] | null, role?: string): any {
+function resolveFieldForRow(grainModule: string, row: Row, targetKey: string, dateWindow: DateWindow | null, role?: string): any {
   const targetModule = fieldKeyModule(targetKey)
   const targetField = fieldDisplayName(targetKey)
   if (targetModule === grainModule) {
@@ -2119,6 +2124,7 @@ function relativeWindow(granularity: string, opt: string, n: number, today: Date
   const dir = opt.startsWith("Next") ? 1 : -1
   if (granularity === "Year") {
     if (opt === "This year") return [new Date(today.getFullYear(), 0, 1), new Date(today.getFullYear(), 11, 31, 23, 59, 59)]
+    if (opt === "Year to date") return [new Date(today.getFullYear(), 0, 1), today]
     if (opt === "Last year") return [new Date(today.getFullYear() - 1, 0, 1), new Date(today.getFullYear() - 1, 11, 31, 23, 59, 59)]
     if (opt === "Next year") return [new Date(today.getFullYear() + 1, 0, 1), new Date(today.getFullYear() + 1, 11, 31, 23, 59, 59)]
     if (isN) return dir < 0 ? [new Date(today.getFullYear() - n, today.getMonth(), today.getDate()), today] : [today, new Date(today.getFullYear() + n, today.getMonth(), today.getDate())]
@@ -2179,49 +2185,63 @@ function presetWindow(period: string, today: Date): [Date, Date] | null {
 // on one calendar. It only ever acts on those metrics: it never filters rows, and it never
 // touches a measure with no date of its own (a project's budget, say).
 const TIMELINE_GRANULARITIES = ["Week & Year", "Month & Year", "Quarter & Year", "Year"]
-const TIMELINE_PRESETS = [
-  "This week", "Last week", "This month", "Last month", "This quarter", "Last quarter",
-  "This year", "Year to date", "Last 12 months",
-]
 // Weekly columns over a couple of years would be unreadable; past this the latest are shown.
 const TIMELINE_MAX_PERIODS = 24
 
-function localDay(iso: string, endOfDay = false): Date | null {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso)
-  if (!m) return null
-  return endOfDay
-    ? new Date(+m[1], +m[2] - 1, +m[3], 23, 59, 59, 999)
-    : new Date(+m[1], +m[2] - 1, +m[3])
+// Has the date filter been given anything to filter by? An untouched one passes every date.
+function dateRuleIsSet(rule: FilterRule): boolean {
+  const mode = rule.dateMode ?? "actual"
+  if (mode === "actual") return (rule.values ?? []).length > 0
+  if (mode === "range") return !!rule.dateFrom || (rule.dateRangeOp === "between" && !!rule.dateTo)
+  return !!rule.dateRelativeOpt
+    && !!relativeWindow(rule.dateGranularity || "Month & Year", rule.dateRelativeOpt, rule.dateRelativeN || 1, TODAY)
 }
 
-function timelineRuleWindow(rule: FilterRule | undefined): [number, number] | null {
-  if (!rule?.tlPeriod) return null
-  if (rule.tlPeriod === "custom") {
-    const a = rule.tlFrom ? localDay(rule.tlFrom) : null
-    const b = rule.tlTo ? localDay(rule.tlTo, true) : null
-    return a && b ? [a.getTime(), b.getTime()] : null
+// The Timeline filter reads exactly like a filter on any date field — same modes, same matching.
+function timelineRuleWindow(rule: FilterRule | undefined): DateWindow | null {
+  if (!rule || !dateRuleIsSet(rule)) return null
+  return (t) => dateRuleMatches(new Date(t), rule)
+}
+
+// Where the Timeline filter has edges of its own (a relative period, a closed range), the column
+// split covers all of it, so a quiet stretch inside the period still gets its columns.
+function timelineRuleSpan(rule: FilterRule | undefined): [number, number] | null {
+  if (!rule || !dateRuleIsSet(rule)) return null
+  const mode = rule.dateMode ?? "actual"
+  if (mode === "relative") {
+    const w = relativeWindow(rule.dateGranularity || "Month & Year", rule.dateRelativeOpt, rule.dateRelativeN || 1, TODAY)
+    return w ? [w[0].getTime(), w[1].getTime()] : null
   }
-  const w = presetWindow(rule.tlPeriod, TODAY)
-  return w ? [w[0].getTime(), w[1].getTime()] : null
+  if (mode === "range" && rule.dateRangeOp === "between" && rule.dateFrom && rule.dateTo) {
+    return [localDay(rule.dateFrom)!.getTime(), localDay(rule.dateTo, true)!.getTime()]
+  }
+  return null
 }
 
 // A metric chip's own calendar as a window — the same reading aggregateBucket applies, kept in
 // one place so the Timeline and the chip calendar can never disagree about what "This month" is.
-function metricFilterWindow(f: MetricFilter | undefined): [number, number] | null {
+function metricFilterWindow(f: MetricFilter | undefined): DateWindow | null {
   if (!f?.period) return null
   if (f.period === "custom") {
     if (!f.customFrom || !f.customTo) return null
-    return [new Date(f.customFrom).getTime(), new Date(f.customTo).getTime()]
+    return spanWindow([new Date(f.customFrom).getTime(), new Date(f.customTo).getTime()])
   }
   const w = presetWindow(f.period, TODAY)
-  return w ? [w[0].getTime(), w[1].getTime()] : null
+  return w ? spanWindow([w[0].getTime(), w[1].getTime()]) : null
 }
 
-function intersectWindows(a: [number, number] | null, b: [number, number] | null): [number, number] | null {
+function intersectWindows(a: DateWindow | null, b: DateWindow | null): DateWindow | null {
   if (!a) return b
   if (!b) return a
-  const lo = Math.max(a[0], b[0]), hi = Math.min(a[1], b[1])
-  return lo <= hi ? [lo, hi] : [1, 0] // empty, but still a window: it must match nothing
+  return (t) => a(t) && b(t)
+}
+
+// Does any instant of this period pass the window? Sampled twice a day (hourly where the filter
+// picks hours) — enough for every period the Timeline splits by, and cheap.
+function periodTouches(span: [number, number], window: DateWindow, hourly: boolean): boolean {
+  const step = hourly ? 3600000 : 43200000
+  for (let t = span[0]; t <= span[1]; t += step) if (window(t)) return true
+  return false
 }
 
 function periodStart(d: Date, gran: string): Date {
@@ -2254,8 +2274,9 @@ function timelinePeriods(from: number, to: number, gran: string): { label: strin
   return out
 }
 
-// The span of dates the given metrics actually have, for a Timeline with no filter to bound it.
-function timelineDataExtent(metricKeys: string[]): [number, number] | null {
+// The span of dates the given metrics actually have (inside the Timeline filter, if any) — what
+// the column split covers when the filter has no edges of its own.
+function timelineDataExtent(metricKeys: string[], window: DateWindow | null): [number, number] | null {
   let lo = Infinity, hi = -Infinity
   new Set(metricKeys.map(fieldKeyModule)).forEach((mod) => {
     const df = ROLLUP_DATE_FIELD[mod]
@@ -2264,6 +2285,7 @@ function timelineDataExtent(metricKeys: string[]): [number, number] | null {
       const v = r[df]
       if (!v) return
       const t = (v instanceof Date ? v : new Date(v)).getTime()
+      if (window && !window(t)) return
       if (t < lo) lo = t
       if (t > hi) hi = t
     })
@@ -2278,6 +2300,16 @@ function followsTimeline(item: PivotItem, tlRule: FilterRule | undefined): boole
 }
 
 // ── Filter evaluation ─────────────────────────────────────────────────────────────
+// A date input's "YYYY-MM-DD" as a local day — its first instant, or with `endOfDay` its last, so
+// "between 1 Mar and 30 Apr" keeps the 30th. new Date("YYYY-MM-DD") would read UTC midnight.
+function localDay(iso: string, endOfDay = false): Date | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso)
+  if (!m) return iso ? new Date(iso) : null
+  return endOfDay
+    ? new Date(+m[1], +m[2] - 1, +m[3], 23, 59, 59, 999)
+    : new Date(+m[1], +m[2] - 1, +m[3])
+}
+
 function dateRuleMatches(raw: any, rule: FilterRule): boolean {
   if (raw == null || raw === "") return rule.dateIncludeNull === true
   const d = raw instanceof Date ? raw : new Date(raw)
@@ -2287,8 +2319,8 @@ function dateRuleMatches(raw: any, rule: FilterRule): boolean {
     return rule.values.includes(bucketDateLabel(d, rule.dateGranularity || "Month & Year"))
   }
   if (mode === "range") {
-    const from = rule.dateFrom ? new Date(rule.dateFrom) : null
-    const to = rule.dateTo ? new Date(rule.dateTo) : null
+    const from = rule.dateFrom ? localDay(rule.dateFrom) : null
+    const to = rule.dateTo ? localDay(rule.dateTo, true) : null
     const op = rule.dateRangeOp ?? "after"
     if (op === "after") return from ? d.getTime() >= from.getTime() : true
     if (op === "before") return from ? d.getTime() <= from.getTime() : true
@@ -2574,23 +2606,16 @@ function buildLabeler(grainModule: string, sampleRows: Row[], item: PivotItem, a
 // at Task grain) would otherwise fan out — the same ARR counted once per task instead
 // of once per project. Dedupe by the owning dimension's id before summing/averaging so
 // the number stays the real, non-inflated figure.
-function aggregateBucket(bucketRows: Row[], grainModule: string, item: PivotItem, agg: string, type: FieldType, timelineFilter?: MetricFilter, role?: string, windowOverride?: [number, number] | null): number {
+function aggregateBucket(bucketRows: Row[], grainModule: string, item: PivotItem, agg: string, type: FieldType, timelineFilter?: MetricFilter, role?: string, windowOverride?: DateWindow | null): number {
   const targetModule = fieldKeyModule(item.field)
 
-  let dateWindow: [number, number] | null = null
+  let dateWindow: DateWindow | null = null
   // A window handed in (the Timeline's period, or one column of it) replaces the chip's own
   // calendar; `undefined` means "none handed in" and falls through to the chip's calendar.
   if (windowOverride !== undefined) {
     if (TIMELINE_METRICS_SET.has(item.field)) dateWindow = windowOverride
-  } else if (timelineFilter?.period && TIMELINE_METRICS_SET.has(item.field)) {
-    if (timelineFilter.period === "custom") {
-      if (timelineFilter.customFrom && timelineFilter.customTo) {
-        dateWindow = [new Date(timelineFilter.customFrom).getTime(), new Date(timelineFilter.customTo).getTime()]
-      }
-    } else {
-      const win = presetWindow(timelineFilter.period, TODAY)
-      if (win) dateWindow = [win[0].getTime(), win[1].getTime()]
-    }
+  } else if (TIMELINE_METRICS_SET.has(item.field)) {
+    dateWindow = metricFilterWindow(timelineFilter)
   }
 
   if (agg === "Count") {
@@ -2752,9 +2777,10 @@ function previewGroupRows(
   const roledRules = withFilterRoles(grainModule, filterRules)
   const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, roledRules))
 
-  if (fields.rows.length === 0) return { grainModule, groups: [filteredRows] }
+  const rowFields = fields.rows.filter((r) => r.field !== TIMELINE_KEY)
+  if (rowFields.length === 0) return { grainModule, groups: [filteredRows] }
 
-  const rowLabelers = fields.rows.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths))
+  const rowLabelers = rowFields.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths))
   const groups = new Map<string, Row[]>()
   filteredRows.forEach((row) => {
     const key = rowLabelers.map((l) => l.label(row)).join("␟")
@@ -2843,6 +2869,10 @@ interface ComputedReport {
   /** A row's total across the columns — not always the sum of its cells, since a metric the
       Timeline doesn't split has blank period cells and a real total. */
   rowTotal: (ri: number, vi: number) => number
+  /** A column cell, and the total, for a group of displayed rows that pins the first `depth`
+      Rows fields — subtotals and grand totals. */
+  groupCell: (leaves: number[], depth: number, ci: number, vi: number) => number
+  groupTotal: (leaves: number[], depth: number, vi: number) => number
   timelineNotices: string[]
   /** Values shown under each data column. All of them normally; under a Timeline split only the
       ones it splits — a budget column under every month would always be empty. The Total
@@ -2885,23 +2915,28 @@ function computeReportData(
   const roledRules = withFilterRoles(baseGrain, allRules)
   const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, roledRules))
 
-  // Timeline: the report-level filter (base Filters only) and/or a Timeline column. Neither
-  // partitions rows — a Timeline column is a set of date windows applied to each time-tracked
-  // metric, so it is kept out of the column labelers below.
+  // Timeline: the report-level filter (base Filters only) and/or a Timeline in Rows or Columns.
+  // None of them partitions records — a Timeline row or column is a set of date windows applied
+  // to each time-tracked metric — so it is kept out of the labelers below.
   const tlRule = filterRules.find((r) => r.field === TIMELINE_KEY)
   const tlWindow = timelineRuleWindow(tlRule)
   const tlCol = fields.columns.find((c) => c.field === TIMELINE_KEY)
+  const tlRow = fields.rows.find((c) => c.field === TIMELINE_KEY)
+  const tlRowAt = fields.rows.findIndex((c) => c.field === TIMELINE_KEY)
   const baseColumns = fields.columns.filter((c) => c.field !== TIMELINE_KEY)
+  const baseRowFields = fields.rows.filter((c) => c.field !== TIMELINE_KEY)
   const follows = (item: PivotItem) => followsTimeline(item, tlRule)
-  // A Timeline column with nothing to split would only produce empty periods; fall back to the
-  // ordinary columns and say why instead.
-  const tlActive = !!tlCol && fields.values.some(follows)
+  // A Timeline with nothing to split would only produce empty periods; it stands aside and a
+  // notice says why.
+  const canSplit = fields.values.some(follows)
+  const tlActive = !!tlCol && canSplit
+  const tlRowActive = !!tlRow && canSplit
   // The window a following metric is narrowed to before any column split: the Timeline filter's
   // period if there is one, otherwise the metric's own calendar.
-  const outerWindow = (item: PivotItem): [number, number] | null =>
+  const outerWindow = (item: PivotItem): DateWindow | null =>
     tlRule ? tlWindow : metricFilterWindow(timelineFilters[item.id])
 
-  const rowLabelers = fields.rows.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths))
+  const rowLabelers = baseRowFields.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths))
   // Every Columns field participates. Each distinct combination gets one composite key (joined
   // for map-lookup purposes) but keeps its per-field label tuple around too (colLabelParts), so
   // the header can render true nested tiers — one row per Columns field, colSpan-grouped by
@@ -2943,7 +2978,54 @@ function computeReportData(
   const comboEntries = groupLevelRules.length > 0
     ? applyGroupLevelFilters(sortedEntries, groupLevelRules, grainModule)
     : sortedEntries
-  const displayRows = comboEntries.map((e) => e.combo).slice(0, 200)
+
+  const notices: string[] = []
+  const notice = (n: string) => { if (!notices.includes(n)) notices.push(n) }
+  if ((tlCol || tlRow) && !canSplit) notice("Timeline splits only time-tracked metrics, and none are in Values.")
+  // The periods a Timeline row or column splits into: from the first to the last dated record
+  // inside the filter, widened to the filter's own edges where it has them, keeping only the
+  // periods the filter lets through.
+  const timelineSplit = (item: PivotItem) => {
+    const gran = aggregations[item.id] || "Month & Year"
+    const extent = timelineDataExtent(fields.values.filter(follows).map((v) => v.field), tlWindow)
+    const edges = timelineRuleSpan(tlRule)
+    const bounds = extent && edges ? [Math.min(extent[0], edges[0]), Math.max(extent[1], edges[1])]
+      : extent ?? edges
+    const hourly = tlRule?.dateGranularity === "Date & Time" && (tlRule.dateMode ?? "actual") === "actual"
+    let periods = bounds ? timelinePeriods(bounds[0], bounds[1], gran) : []
+    if (tlWindow) periods = periods.filter((p) => periodTouches(p.window, tlWindow, hourly))
+    if (periods.length > TIMELINE_MAX_PERIODS) {
+      periods = periods.slice(-TIMELINE_MAX_PERIODS)
+      notice(`Showing the latest ${TIMELINE_MAX_PERIODS} periods — add a Timeline filter to choose the range.`)
+    }
+    return periods
+  }
+
+  // Each displayed row is a base group (the non-Timeline Rows fields) plus, with a Timeline in
+  // Rows, one period's window. Every group gets every period — "all projects" stays all of them.
+  type DisplayRow = { entry: ComboEntry; ei: number; combo: string[]; window: DateWindow | null }
+  let rowsOut: DisplayRow[] = comboEntries.map((entry, ei) => ({ entry, ei, combo: entry.combo, window: null }))
+  if (tlRow) {
+    const periods: { label: string; window: [number, number] | null }[] =
+      tlRowActive ? timelineSplit(tlRow) : [{ label: "All time", window: null }]
+    // Groups sharing the Rows fields before the Timeline nest the period inside them, then any
+    // fields after it — so order by that shared prefix, then period, then the rest.
+    let prefixGroup = -1, prevPrefix: string | null = null
+    const keyed: (DisplayRow & { pg: number; pi: number })[] = []
+    comboEntries.forEach((entry, ei) => {
+      const prefix = entry.combo.slice(0, tlRowAt).join(SEP)
+      if (prefix !== prevPrefix) { prefixGroup++; prevPrefix = prefix }
+      periods.forEach((p, pi) => {
+        const combo = [...entry.combo]
+        combo.splice(tlRowAt, 0, p.label)
+        keyed.push({ entry, ei, combo, window: p.window ? spanWindow(p.window) : null, pg: prefixGroup, pi })
+      })
+    })
+    keyed.sort((a, b) => a.pg - b.pg || a.pi - b.pi || a.ei - b.ei)
+    rowsOut = keyed
+  }
+  rowsOut = rowsOut.slice(0, 200)
+  const displayRows = rowsOut.map((r) => r.combo)
 
   let colValues = colLabelers.length > 0
     ? [...colLabelSort.entries()].sort((a, b) => {
@@ -2961,59 +3043,54 @@ function computeReportData(
   // Each displayed column is a base combination (the non-Timeline Columns fields) plus, when a
   // Timeline column is present, one period's date window.
   let colBase: string[] = colValues
-  let colWindow: ([number, number] | null)[] = colValues.map(() => null)
-  const notices: string[] = []
-  if (tlCol && !tlActive) notices.push("Timeline splits only time-tracked metrics, and none are in Values.")
+  let colWindow: (DateWindow | null)[] = colValues.map(() => null)
   if (tlCol && tlActive) {
-    const gran = aggregations[tlCol.id] || "Month & Year"
-    const split = fields.values.filter(follows)
-    const bounds = tlWindow ?? timelineDataExtent(split.map((v) => v.field))
-    let periods = bounds ? timelinePeriods(bounds[0], bounds[1], gran) : []
-    if (periods.length > TIMELINE_MAX_PERIODS) {
-      periods = periods.slice(-TIMELINE_MAX_PERIODS)
-      notices.push(`Showing the latest ${TIMELINE_MAX_PERIODS} periods — add a Timeline filter to choose the range.`)
-    }
+    const periods = timelineSplit(tlCol)
     const bases = baseColumns.length > 0 ? colValues : [""]
     const tlAt = fields.columns.findIndex((c) => c.field === TIMELINE_KEY)
     const outer = tlAt === 0 && baseColumns.length > 0 ? "period" : "base"
     const nextValues: string[] = [], nextTuples: string[][] = [], nextBase: string[] = []
-    const nextWindow: ([number, number] | null)[] = []
+    const nextWindow: (DateWindow | null)[] = []
     const push = (b: string, p: { label: string; window: [number, number] }) => {
       const parts = [...(colLabelParts.get(b) ?? [])]
       parts.splice(Math.min(tlAt, parts.length), 0, p.label)
-      nextValues.push(parts.join(SEP)); nextTuples.push(parts); nextBase.push(b); nextWindow.push(p.window)
+      nextValues.push(parts.join(SEP)); nextTuples.push(parts); nextBase.push(b); nextWindow.push(spanWindow(p.window))
     }
     if (outer === "period") periods.forEach((p) => bases.forEach((b) => push(b, p)))
     else bases.forEach((b) => periods.forEach((p) => push(b, p)))
     colValues = nextValues; colTuples = nextTuples; colBase = nextBase; colWindow = nextWindow
 
-    const unsplit = fields.values.filter((v) => !follows(v))
-    if (unsplit.length > 0) {
-      const names = unsplit.map((v) => fieldDisplayName(v.field)).join(", ")
-      notices.push(`${names} ${unsplit.length === 1 ? "isn't" : "aren't"} split by Timeline — see the Total column.`)
-    }
+  }
+  const unsplitItems = fields.values.filter((v) => !follows(v))
+  if ((tlActive || tlRowActive) && unsplitItems.length > 0) {
+    const names = unsplitItems.map((v) => fieldDisplayName(v.field)).join(", ")
+    notice(`${names} ${unsplitItems.length === 1 ? "isn't" : "aren't"} split by Timeline — see the ${tlActive ? "Total column" : "totals"}.`)
   }
 
   const hasColumns = colValues.length > 0
   const hasValues = fields.values.length > 0
 
   const bucketRows = (ri: number, ci: number): Row[] => {
-    const entry = comboEntries[ri]
+    const entry = rowsOut[ri]?.entry
     const colLabel = hasColumns ? colBase[ci] : ""
     return entry ? (entry.cols.get(colLabel) ?? []) : []
+  }
+
+  const aggOf = (item: PivotItem) => {
+    const type = getFieldType(item.field)
+    return { type, agg: aggregations[item.id] || (isNumericType(type) ? "Sum" : "Count") }
   }
 
   const cellNum = (ri: number, ci: number, vi: number): number => {
     const item = fields.values[vi]
     if (!item) return 0
-    const type = getFieldType(item.field)
-    const agg = aggregations[item.id] || (isNumericType(type) ? "Sum" : "Count")
+    const { type, agg } = aggOf(item)
     const rows = bucketRows(ri, ci)
-    if (tlActive) {
+    if (tlActive || tlRowActive) {
       // A metric the Timeline can't split has no value per period — NaN, which renders blank
       // and keeps any sum across periods blank too, rather than a zero that reads as real.
       if (!follows(item)) return NaN
-      const w = intersectWindows(colWindow[ci] ?? null, outerWindow(item))
+      const w = intersectWindows(intersectWindows(colWindow[ci] ?? null, rowsOut[ri]?.window ?? null), outerWindow(item))
       return aggregateBucket(rows, grainModule, item, agg, type, undefined, lookupPaths[item.id], w)
     }
     if (tlRule && follows(item)) {
@@ -3022,32 +3099,52 @@ function computeReportData(
     return aggregateBucket(rows, grainModule, item, agg, type, timelineFilters[item.id], lookupPaths[item.id])
   }
 
-  // A row's total across the columns. For a metric the Timeline doesn't split, that is the
-  // metric over all of the row's records, since adding up its (blank) period cells means nothing.
-  const rowTotal = (ri: number, vi: number): number => {
+  // Totals over a group of displayed rows that pins the first `depth` Rows fields (0 is the grand
+  // total, a single row pins them all). Normally the sum of the cells. A metric the Timeline
+  // doesn't split is the exception: its period cells are blank, so it is computed over the
+  // group's own records instead — once per base group, however many periods that group spans —
+  // and stays blank wherever the group pins a period.
+  const isUnsplit = (item: PivotItem) => (tlActive || tlRowActive) && !follows(item)
+  const pinsPeriod = (depth: number) => tlRowActive && depth > tlRowAt
+  const allCols = hasColumns ? colValues.map((_, ci) => ci) : [0]
+  const unsplitValue = (leaves: number[], cols: number[], item: PivotItem): number => {
+    const seen = new Set<string>()
+    const rows: Row[] = []
+    leaves.forEach((ri) => {
+      const r = rowsOut[ri]
+      if (!r) return
+      cols.forEach((ci) => {
+        const b = hasColumns ? colBase[ci] : ""
+        const key = `${r.ei}${SEP}${b}`
+        if (seen.has(key)) return
+        seen.add(key)
+        rows.push(...(r.entry.cols.get(b) ?? []))
+      })
+    })
+    const { type, agg } = aggOf(item)
+    return aggregateBucket(rows, grainModule, item, agg, type, timelineFilters[item.id], lookupPaths[item.id])
+  }
+  const groupCell = (leaves: number[], depth: number, ci: number, vi: number): number => {
     const item = fields.values[vi]
     if (!item) return 0
-    if (tlActive && !follows(item)) {
-      const entry = comboEntries[ri]
-      if (!entry) return 0
-      const seen = new Set<string>()
-      const rows: Row[] = []
-      colBase.forEach((b) => { if (!seen.has(b)) { seen.add(b); rows.push(...(entry.cols.get(b) ?? [])) } })
-      const type = getFieldType(item.field)
-      const agg = aggregations[item.id] || (isNumericType(type) ? "Sum" : "Count")
-      return aggregateBucket(rows, grainModule, item, agg, type, timelineFilters[item.id], lookupPaths[item.id])
-    }
-    return hasColumns ? colValues.reduce((s, _c, ci) => s + cellNum(ri, ci, vi), 0) : cellNum(ri, 0, vi)
+    if (isUnsplit(item)) return tlActive || pinsPeriod(depth) ? NaN : unsplitValue(leaves, [ci], item)
+    return leaves.reduce((s, ri) => s + cellNum(ri, ci, vi), 0)
   }
+  const groupTotal = (leaves: number[], depth: number, vi: number): number => {
+    const item = fields.values[vi]
+    if (!item) return 0
+    if (isUnsplit(item)) return pinsPeriod(depth) ? NaN : unsplitValue(leaves, allCols, item)
+    return leaves.reduce((s, ri) => s + allCols.reduce((t, ci) => t + cellNum(ri, ci, vi), 0), 0)
+  }
+  const rowTotal = (ri: number, vi: number): number => groupTotal([ri], fields.rows.length, vi)
 
-  const grandTotals = fields.values.map((_, vi) =>
-    displayRows.reduce((sum, _row, ri) => sum + rowTotal(ri, vi), 0)
-  )
+  const allLeaves = displayRows.map((_, ri) => ri)
+  const grandTotals = fields.values.map((_, vi) => groupTotal(allLeaves, 0, vi))
 
   const colValueIdx = fields.values.map((_, vi) => vi).filter((vi) => !tlActive || follows(fields.values[vi]))
 
   return {
-    displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, rowTotal, grandTotals, bucketRows, grainModule,
+    displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, rowTotal, groupCell, groupTotal, grandTotals, bucketRows, grainModule,
     fanoutNotice, timelineNotices: notices, colValueIdx,
   }
 }
@@ -4812,9 +4909,10 @@ function FieldBrowser({
 
         {/* Module tree */}
         <div className="flex-1 overflow-y-auto py-1">
-          {/* Timeline belongs to no module, so it sits above them all. Drop it in Columns to split
-              time-tracked metrics by period, or in Filters to narrow them to one. */}
+          {/* Timeline belongs to no module, so it sits above them all. Drop it in Rows or Columns
+              to split time-tracked metrics by period, or in Filters to narrow them to one. */}
           {(search.trim() === "" || "timeline".includes(search.trim().toLowerCase())) && (() => {
+            const inRows = fields.rows.find((it) => it.field === TIMELINE_KEY)
             const inColumns = fields.columns.find((it) => it.field === TIMELINE_KEY)
             return (
               <div
@@ -4825,14 +4923,15 @@ function FieldBrowser({
                   onDragStart(TIMELINE_KEY, "date")
                 }}
                 onDragEnd={onDragEnd}
-                onClick={() => inColumns ? onRemove("columns", inColumns.id) : onAdd("columns", TIMELINE_KEY, "date")}
-                title="Split time-tracked metrics by period (Columns), or narrow them to one (Filters)"
+                onClick={() => inRows ? onRemove("rows", inRows.id)
+                  : inColumns ? onRemove("columns", inColumns.id) : onAdd("columns", TIMELINE_KEY, "date")}
+                title="Split time-tracked metrics by period (Rows or Columns), or narrow them to one (Filters)"
                 className="flex items-center gap-2 mx-2 mb-1 px-2.5 py-1.5 rounded-md border border-sky-200 bg-sky-50/60
                   cursor-grab active:cursor-grabbing hover:bg-sky-100/70 transition-colors select-none"
               >
                 <span className="shrink-0 text-sky-600"><Ic.Calendar /></span>
                 <span className="text-[13px] font-medium flex-1 text-sky-800">Timeline</span>
-                {inColumns && <span className="shrink-0 text-indigo-500"><Ic.Check /></span>}
+                {(inRows || inColumns) && <span className="shrink-0 text-indigo-500"><Ic.Check /></span>}
               </div>
             )
           })()}
@@ -5682,10 +5781,6 @@ interface FilterRule {
   /** Which relationship this filter reads the field through, when it can be reached more than
       one way — the filter-side twin of a chip's role. Absent means the primary path. */
   lookupPath?: string
-  /** Timeline filter only: the period every included time-tracked metric is narrowed to. */
-  tlPeriod?: string
-  tlFrom?: string
-  tlTo?: string
   /** Timeline filter only: metric chips (by id) the user unticked. Stored as exemptions rather
       than inclusions so a metric dropped later is covered by default. */
   tlExempt?: string[]
@@ -5828,7 +5923,7 @@ const ACTUAL_DATE_VALUES: Record<string, string[]> = {
 }
 
 const RELATIVE_OPTIONS: Record<string, string[]> = {
-  "Year":           ["This year", "Last year", "Next year", "Last N years", "Next N years"],
+  "Year":           ["This year", "Year to date", "Last year", "Next year", "Last N years", "Next N years"],
   "Quarter & Year": ["This quarter", "Last quarter", "Next quarter", "Last N quarters", "Next N quarters"],
   "Quarter":        ["This quarter", "Last quarter", "Next quarter", "Last N quarters", "Next N quarters"],
   "Month & Year":   ["This month", "Last month", "Next month", "Last N months", "Next N months"],
@@ -5874,7 +5969,7 @@ function makeFilterRule(name: string, type: FieldType): FilterRule {
     numFunction: isNumericType(type) ? "Sum" : "Count",
     numMode: "actual", relativeDirection: "Top", relativeN: 5,
     vfDisplayName: "", vfComponent: "", vfListMode: "all", vfOfferedValues: [],
-    ...(name === TIMELINE_KEY ? { tlPeriod: "This month", tlExempt: [] } : {}),
+    ...(name === TIMELINE_KEY ? { tlExempt: [] } : {}),
   }
 }
 
@@ -6063,11 +6158,15 @@ function RangeSlider({ min, max, value, value2, onChange }: {
   )
 }
 
-function DateFilterModal({ rule, onChange, onClose }: {
+function DateFilterModal({ rule, onChange, onClose, strip }: {
   rule: FilterRule
   onChange: (patch: Partial<FilterRule>) => void
   onClose: () => void
+  /** Rendered under the header — the Timeline's "Applies to". */
+  strip?: React.ReactNode
 }) {
+  // Every record behind a time-tracked metric has a date, so the Timeline has no nulls to include.
+  const showNull = rule.field !== TIMELINE_KEY
   const mode = rule.dateMode ?? "actual"
   const gran = rule.dateGranularity || "Month & Year"
   const rangeOp = rule.dateRangeOp ?? "after"
@@ -6116,7 +6215,7 @@ function DateFilterModal({ rule, onChange, onClose }: {
     </div>
   )
 
-  const NullToggle = () => (
+  const NullToggle = () => !showNull ? null : (
     <label className="flex items-center gap-2 cursor-pointer select-none mt-3">
       <span
         onClick={() => onChange({ dateIncludeNull: !rule.dateIncludeNull })}
@@ -6153,6 +6252,8 @@ function DateFilterModal({ rule, onChange, onClose }: {
             <Ic.X size={14} />
           </button>
         </div>
+
+        {strip}
 
         {/* Body */}
         <div className="flex flex-1 overflow-hidden">
@@ -6206,7 +6307,7 @@ function DateFilterModal({ rule, onChange, onClose }: {
                       })
                   }
                 </div>
-                <div className="px-4 pb-3 pt-1 border-t border-gray-100"><NullToggle /></div>
+                {showNull && <div className="px-4 pb-3 pt-1 border-t border-gray-100"><NullToggle /></div>}
               </div>
             </>
           )}
@@ -6287,7 +6388,7 @@ function DateFilterModal({ rule, onChange, onClose }: {
                     </label>
                   )
                 })}
-                <div className="mt-2 pt-2 border-t border-gray-100"><NullToggle /></div>
+                {showNull && <div className="mt-2 pt-2 border-t border-gray-100"><NullToggle /></div>}
               </div>
             </>
           )}
@@ -7168,92 +7269,62 @@ function timelineMetricItems(fields: PivotFields): PivotItem[] {
   })
 }
 
-function timelinePeriodLabel(rule: FilterRule): string {
-  if (rule.tlPeriod === "custom") return rule.tlFrom && rule.tlTo ? `${rule.tlFrom} – ${rule.tlTo}` : "Custom range"
-  return rule.tlPeriod || "No period"
-}
-
-function TimelineFilterModal({ rule, fields, onChange, onClose }: {
+// The Timeline filter's one addition to the ordinary date modal: which time-tracked metrics it
+// governs. All of them by default; unticking one exempts it, and it keeps its own calendar.
+// Styled as the role strip ("Matched through") is, since both qualify what the filter acts on.
+function TimelineAppliesStrip({ rule, fields, onChange }: {
   rule: FilterRule
   fields: PivotFields
   onChange: (patch: Partial<FilterRule>) => void
-  onClose: () => void
 }) {
+  const [open, setOpen] = useState(false)
+  const btnRef = useRef<HTMLButtonElement>(null)
   const metrics = timelineMetricItems(fields)
   const exempt = rule.tlExempt ?? []
+  const included = metrics.filter((m) => !exempt.includes(m.id)).length
   const toggle = (id: string) =>
     onChange({ tlExempt: exempt.includes(id) ? exempt.filter((x) => x !== id) : [...exempt, id] })
-  const presetBtn = (label: string, value: string) => (
-    <button
-      key={value}
-      onClick={() => onChange({ tlPeriod: value })}
-      className={`px-2.5 py-1.5 rounded-md text-[12px] border transition-colors text-left
-        ${rule.tlPeriod === value
-          ? "bg-indigo-600 border-indigo-600 text-white"
-          : "bg-white border-gray-200 text-gray-700 hover:border-indigo-300"}`}
-    >
-      {label}
-    </button>
-  )
-  return createPortal(
-    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/30" onMouseDown={onClose}>
-      <div
-        className="bg-white rounded-2xl shadow-2xl w-[460px] max-h-[85vh] flex flex-col overflow-hidden"
-        onMouseDown={(e) => e.stopPropagation()}
+  const label = metrics.length === 0 ? "No time-tracked metrics yet"
+    : included === 0 ? "No metrics"
+    : included === 1 ? fieldDisplayName(metrics.find((m) => !exempt.includes(m.id))!.field)
+    : included === metrics.length ? `All ${metrics.length} time-tracked metrics`
+    : `${included} of ${metrics.length} metrics`
+  return (
+    <div className="flex items-center gap-2 px-5 py-2 border-b border-gray-100 bg-sky-50/50 text-[12px] text-gray-600">
+      <span className="shrink-0">Applies to</span>
+      <button
+        ref={btnRef}
+        disabled={metrics.length === 0}
+        onClick={() => setOpen((p) => !p)}
+        className="flex items-center gap-1 font-medium text-sky-700 bg-white border border-sky-200 rounded px-2 py-0.5
+          hover:bg-sky-50 transition-colors shrink-0 disabled:text-gray-400 disabled:border-gray-200 disabled:hover:bg-white"
       >
-        <div className="flex items-center gap-2.5 px-5 py-4 border-b border-gray-100">
-          <span className="text-sky-600"><Ic.Calendar /></span>
-          <span className="text-[15px] font-semibold text-gray-900">Timeline</span>
-          <button onClick={onClose} className="ml-auto text-gray-400 hover:text-gray-700 p-1 rounded-lg hover:bg-gray-100">
-            <Ic.X size={14} />
-          </button>
-        </div>
-
-        <div className="px-5 py-4 overflow-y-auto">
-          <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Period</p>
-          <div className="grid grid-cols-3 gap-1.5">
-            {TIMELINE_PRESETS.map((p) => presetBtn(p, p))}
-            {presetBtn("Custom range", "custom")}
+        {label}{metrics.length > 0 && <Ic.ChevDown size={9} />}
+      </button>
+      <span className="text-gray-400 truncate">Other measures and rows aren't filtered</span>
+      {open && (
+        <ChipPortalMenu anchorRef={btnRef} onClose={() => setOpen(false)}>
+          <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl py-1 w-60 overflow-hidden">
+            {metrics.map((m) => {
+              const on = !exempt.includes(m.id)
+              return (
+                <button
+                  key={m.id}
+                  onClick={() => toggle(m.id)}
+                  className="flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] text-left text-gray-700 hover:bg-gray-50 transition-colors"
+                >
+                  <span className={`flex items-center justify-center w-4 h-4 rounded border shrink-0 transition-colors
+                    ${on ? "bg-indigo-600 border-indigo-600" : "border-gray-300"}`}>
+                    {on && <svg width="9" height="9" viewBox="0 0 9 9" fill="none"><path d="M1.5 4.5L3.5 6.5L7.5 2.5" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+                  </span>
+                  {fieldDisplayName(m.field)}
+                </button>
+              )
+            })}
           </div>
-          {rule.tlPeriod === "custom" && (
-            <div className="flex items-center gap-2 mt-2.5">
-              <input type="date" value={rule.tlFrom ?? ""} onChange={(e) => onChange({ tlFrom: e.target.value })}
-                className="flex-1 border border-gray-200 rounded-md px-2 py-1.5 text-[12px] focus:outline-none focus:border-indigo-400" />
-              <span className="text-gray-400 text-[12px]">to</span>
-              <input type="date" value={rule.tlTo ?? ""} onChange={(e) => onChange({ tlTo: e.target.value })}
-                className="flex-1 border border-gray-200 rounded-md px-2 py-1.5 text-[12px] focus:outline-none focus:border-indigo-400" />
-            </div>
-          )}
-
-          <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mt-5 mb-1">Applies to</p>
-          <p className="text-[12px] text-gray-500 mb-2">Untick a metric to exempt it.</p>
-          {metrics.length === 0 ? (
-            <p className="text-[12px] text-gray-400 py-2">No time-tracked metrics in this report yet.</p>
-          ) : (
-            <div className="border border-gray-100 rounded-lg divide-y divide-gray-100">
-              {metrics.map((m) => {
-                const on = !exempt.includes(m.id)
-                return (
-                  <label key={m.id} className="flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-gray-50">
-                    <input type="checkbox" checked={on} onChange={() => toggle(m.id)} className="w-3.5 h-3.5 accent-indigo-600" />
-                    <span className="text-[13px] text-gray-800 flex-1">{fieldDisplayName(m.field)}</span>
-                    <span className="text-[11px] text-gray-400">{fieldKeyModule(m.field)}</span>
-                  </label>
-                )
-              })}
-            </div>
-          )}
-        </div>
-
-        <div className="px-5 py-3 border-t border-gray-100 flex justify-end">
-          <button onClick={onClose}
-            className="px-5 py-2 bg-indigo-600 text-white text-[13px] font-semibold rounded-lg hover:bg-indigo-700 transition-colors">
-            Apply
-          </button>
-        </div>
-      </div>
-    </div>,
-    document.body,
+        </ChipPortalMenu>
+      )}
+    </div>
   )
 }
 
@@ -7386,12 +7457,13 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
   })()
 
   const isTimeline = rule.field === TIMELINE_KEY
+  // A date summary, plus how many metrics it governs once any are exempt.
   const timelineSummary = (() => {
     if (!isTimeline) return ""
-    const total = timelineMetricItems(fields).length
-    const included = total - (rule.tlExempt ?? []).filter((id) => timelineMetricItems(fields).some((m) => m.id === id)).length
-    const period = timelinePeriodLabel(rule)
-    return total > 0 && included < total ? `${period} · ${included} of ${total} metrics` : period
+    const metrics = timelineMetricItems(fields)
+    const included = metrics.filter((m) => !(rule.tlExempt ?? []).includes(m.id)).length
+    return metrics.length > 0 && included < metrics.length
+      ? `${dateSummary} · ${included} of ${metrics.length} metrics` : dateSummary
   })()
   const summaryValue = isTimeline
     ? timelineSummary
@@ -7429,7 +7501,7 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
         {!isDateField && !isCategoricalField && !isNumericField && rule.operator && (
           <span className="text-gray-400 font-normal">{rule.operator}</span>
         )}
-        {isDateField && !isTimeline && rule.dateMode && (
+        {isDateField && rule.dateMode && (
           <span className="text-gray-400 font-normal capitalize">{rule.dateMode}</span>
         )}
         {isCategoricalField && (
@@ -7460,11 +7532,11 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
       </button>
 
       {/* Date modal */}
-      {open && isTimeline && (
-        <TimelineFilterModal rule={rule} fields={fields} onChange={onChange} onClose={() => setOpen(false)} />
-      )}
-      {open && isDateField && !isTimeline && (
-        <DateFilterModal rule={rule} onChange={onChange} onClose={() => setOpen(false)} />
+      {open && isDateField && (
+        <DateFilterModal
+          rule={rule} onChange={onChange} onClose={() => setOpen(false)}
+          strip={isTimeline ? <TimelineAppliesStrip rule={rule} fields={fields} onChange={onChange} /> : undefined}
+        />
       )}
 
       {/* Categorical (text/person) modal */}
@@ -9830,7 +9902,8 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
 
   const report = computeReportData(source, fields, aggregations, filterRules, viewFilterRules, timelineFilters, rangeConfigs, lookupPaths)
   const fanoutNotice = report.fanoutNotice
-  const { displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, rowTotal, grandTotals, bucketRows, grainModule } = report
+  const { displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, rowTotal, groupCell, groupTotal, grandTotals, bucketRows, grainModule } = report
+  const allLeaves = displayRows.map((_, ri) => ri)
   const timelineNotices = report.timelineNotices
   const colValueItems = report.colValueIdx.map((vi) => ({ item: fields.values[vi], vi }))
   const colHeaderTiers = hasColumns ? buildColumnHeaderTiers(colTuples) : []
@@ -9859,9 +9932,9 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
     const tree = buildCompactTree(displayRows)
     const flatNodes = flattenCompactTree(tree, collapsedNodes)
     const aggValue = (node: CompactNode, ci: number, vi: number) =>
-      node.leafIndices.reduce((s, ri) => s + cellNum(ri, ci, vi), 0)
+      groupCell(node.leafIndices, node.level + 1, ci, vi)
     const nodeRowTotal = (node: CompactNode, vi: number) =>
-      node.leafIndices.reduce((s, ri) => s + rowTotal(ri, vi), 0)
+      groupTotal(node.leafIndices, node.level + 1, vi)
     const nodeBuckets = (node: CompactNode, ci: number) => node.leafIndices.map((ri) => bucketRows(ri, ci))
     const nodeTotalBuckets = (node: CompactNode) =>
       hasColumns ? node.leafIndices.flatMap((ri) => colValues.map((_, ci) => bucketRows(ri, ci))) : nodeBuckets(node, 0)
@@ -10007,7 +10080,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                     ? colValues.flatMap((_, ci) =>
                         colValueItems.map(({ item, vi }) => (
                           <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums`}>
-                            {numCellValue(displayRows.reduce((s, _, ri) => s + cellNum(ri, ci, vi), 0), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
+                            {numCellValue(groupCell(allLeaves, 0, ci, vi), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
                           </td>
                         ))
                       )
@@ -10187,7 +10260,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                       ? colValues.flatMap((_, ci) =>
                           colValueItems.map(({ item, vi }) => {
                             const groupIndices = displayRows.flatMap((r, idx) => r[0] === combo[0] ? [idx] : [])
-                            const subtotal = groupIndices.reduce((s, absRi) => s + cellNum(absRi, ci, vi), 0)
+                            const subtotal = groupCell(groupIndices, 1, ci, vi)
                             const buckets = groupIndices.map((absRi) => bucketRows(absRi, ci))
                             return (
                               <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
@@ -10198,7 +10271,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                         )
                       : fields.values.map((item, vi) => {
                           const groupIndices = displayRows.flatMap((r, idx) => r[0] === combo[0] ? [idx] : [])
-                          const subtotal = groupIndices.reduce((s, absRi) => s + cellNum(absRi, 0, vi), 0)
+                          const subtotal = groupCell(groupIndices, 1, 0, vi)
                           const buckets = groupIndices.map((absRi) => bucketRows(absRi, 0))
                           return (
                             <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
@@ -10209,7 +10282,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                     }
                     {hasColumns && fields.values.map((item, vi) => {
                       const groupIndices = displayRows.flatMap((r, idx) => r[0] === combo[0] ? [idx] : [])
-                      const subtotal = groupIndices.reduce((s, absRi) => s + rowTotal(absRi, vi), 0)
+                      const subtotal = groupTotal(groupIndices, 1, vi)
                       const buckets = groupIndices.flatMap((absRi) => colValues.map((_, ci) => bucketRows(absRi, ci)))
                       return (
                         <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums bg-gray-100`}>
@@ -10231,7 +10304,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                 ? colValues.flatMap((_, ci) =>
                     colValueItems.map(({ item, vi }) => (
                       <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums`}>
-                        {numCellValue(displayRows.reduce((s, _, ri) => s + cellNum(ri, ci, vi), 0), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
+                        {numCellValue(groupCell(allLeaves, 0, ci, vi), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
                       </td>
                     ))
                   )
@@ -10467,9 +10540,10 @@ export default function App() {
   // carry its own aggregation/timeline-filter state, so both are keyed by this fresh id, never
   // by the field key itself (which duplicate pills would otherwise share).
   const handleAdd = (zone: PivotZoneKey, field: string, type: FieldType) => {
-    // Timeline splits metrics across columns; as a row it would have no records to group, and
-    // as a value nothing to add up. One is enough.
-    if (field === TIMELINE_KEY && (zone !== "columns" || fields.columns.some((c) => c.field === TIMELINE_KEY))) return
+    // Timeline splits metrics into periods, down the rows or across the columns; as a value it
+    // would have nothing to add up. One is enough.
+    if (field === TIMELINE_KEY
+      && (zone === "values" || [...fields.rows, ...fields.columns].some((c) => c.field === TIMELINE_KEY))) return
     const id = nextPivotItemId()
     setFields((prev) => ({ ...prev, [zone]: [...prev[zone], { id, field }] }))
     setAggregations((prev) => {
@@ -10505,13 +10579,15 @@ export default function App() {
   const handleMove = (from: PivotZoneKey, to: PivotZoneKey, id: string) => {
     const item = fields[from].find((it) => it.id === id)
     if (!item) return
-    if (item.field === TIMELINE_KEY && to !== "columns") return
+    if (item.field === TIMELINE_KEY && to === "values") return
     const type = getFieldType(item.field)
     setFields((prev) => ({
       ...prev,
       [from]: prev[from].filter((it) => it.id !== id),
       [to]: [...prev[to], item],
     }))
+    // The Timeline keeps its period size between Rows and Columns.
+    if (item.field === TIMELINE_KEY) return
     setAggregations((prev) => {
       let defaultMod: string | undefined
       if (to === "values") defaultMod = isNumericType(type) ? "Sum" : "Count"
