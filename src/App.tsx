@@ -2896,18 +2896,10 @@ interface ComputedReport {
   /** A row's total across the columns — not always the sum of its cells, since a metric the
       Timeline doesn't split has blank period cells and a real total. */
   rowTotal: (ri: number, vi: number) => number
-  /** A column cell, and the total, for a group of displayed rows that pins the first `depth`
-      Rows fields — subtotals and grand totals. */
-  groupCell: (leaves: number[], depth: number, ci: number, vi: number) => number
-  groupTotal: (leaves: number[], depth: number, vi: number) => number
+  /** A column cell, and the total, for a group of displayed rows — subtotals and grand totals. */
+  groupCell: (leaves: number[], ci: number, vi: number) => number
+  groupTotal: (leaves: number[], vi: number) => number
   timelineNotices: string[]
-  /** Measures a Timeline split doesn't apply to, which therefore show only in totals. */
-  unsplitNames: string[]
-  unsplitWhere: string
-  /** Values shown under each data column. All of them normally; under a Timeline split only the
-      ones it splits — a budget column under every month would always be empty. The Total
-      column still shows every value. */
-  colValueIdx: number[]
 }
 
 function computeReportData(
@@ -3092,10 +3084,11 @@ function computeReportData(
     colValues = nextValues; colTuples = nextTuples; colBase = nextBase; colWindow = nextWindow
 
   }
-  // Measures a Timeline split leaves whole — the canvas says where to find them, which depends on
-  // whether totals are showing.
-  const unsplitNames = tlActive || tlRowActive
-    ? fields.values.filter((v) => !follows(v)).map((v) => fieldDisplayName(v.field)) : []
+  const unsplitItems = fields.values.filter((v) => !follows(v))
+  if ((tlActive || tlRowActive) && unsplitItems.length > 0) {
+    const names = unsplitItems.map((v) => fieldDisplayName(v.field)).join(", ")
+    notice(`${names} ${unsplitItems.length === 1 ? "isn't" : "aren't"} split by Timeline — the same in every period.`)
+  }
 
   const hasColumns = colValues.length > 0
   const hasValues = fields.values.length > 0
@@ -3117,9 +3110,10 @@ function computeReportData(
     const { type, agg } = aggOf(item)
     const rows = bucketRows(ri, ci)
     if (tlActive || tlRowActive) {
-      // A metric the Timeline can't split has no value per period — NaN, which renders blank
-      // and keeps any sum across periods blank too, rather than a zero that reads as real.
-      if (!follows(item)) return NaN
+      // A metric the Timeline doesn't split is an ordinary value: the same in every period.
+      if (!follows(item)) {
+        return aggregateBucket(rows, grainModule, item, agg, type, timelineFilters[item.id], lookupPaths[item.id])
+      }
       const w = intersectWindows(intersectWindows(colWindow[ci] ?? null, rowsOut[ri]?.window ?? null), outerWindow(item))
       return aggregateBucket(rows, grainModule, item, agg, type, undefined, lookupPaths[item.id], w)
     }
@@ -3129,13 +3123,12 @@ function computeReportData(
     return aggregateBucket(rows, grainModule, item, agg, type, timelineFilters[item.id], lookupPaths[item.id])
   }
 
-  // Totals over a group of displayed rows that pins the first `depth` Rows fields (0 is the grand
-  // total, a single row pins them all). Normally the sum of the cells. A metric the Timeline
-  // doesn't split is the exception: its period cells are blank, so it is computed over the
-  // group's own records instead — once per base group, however many periods that group spans —
-  // and stays blank wherever the group pins a period.
+  // Totals over a group of displayed rows — a subtotal, a row's total, the grand total. Normally
+  // the sum of the cells. A metric the Timeline
+  // doesn't split is the exception: it repeats in every period, so adding up the periods would
+  // count it once per period. It is computed over the group's own records instead — once per
+  // base group, however many periods that group spans.
   const isUnsplit = (item: PivotItem) => (tlActive || tlRowActive) && !follows(item)
-  const pinsPeriod = (depth: number) => tlRowActive && depth > tlRowAt
   const allCols = hasColumns ? colValues.map((_, ci) => ci) : [0]
   const unsplitValue = (leaves: number[], cols: number[], item: PivotItem): number => {
     const seen = new Set<string>()
@@ -3154,29 +3147,27 @@ function computeReportData(
     const { type, agg } = aggOf(item)
     return aggregateBucket(rows, grainModule, item, agg, type, timelineFilters[item.id], lookupPaths[item.id])
   }
-  const groupCell = (leaves: number[], depth: number, ci: number, vi: number): number => {
+  const groupCell = (leaves: number[], ci: number, vi: number): number => {
     const item = fields.values[vi]
     if (!item) return 0
-    if (isUnsplit(item)) return tlActive || pinsPeriod(depth) ? NaN : unsplitValue(leaves, [ci], item)
+    if (isUnsplit(item)) return unsplitValue(leaves, [ci], item)
     return leaves.reduce((s, ri) => s + cellNum(ri, ci, vi), 0)
   }
-  const groupTotal = (leaves: number[], depth: number, vi: number): number => {
+  const groupTotal = (leaves: number[], vi: number): number => {
     const item = fields.values[vi]
     if (!item) return 0
-    if (isUnsplit(item)) return pinsPeriod(depth) ? NaN : unsplitValue(leaves, allCols, item)
+    if (isUnsplit(item)) return unsplitValue(leaves, allCols, item)
     return leaves.reduce((s, ri) => s + allCols.reduce((t, ci) => t + cellNum(ri, ci, vi), 0), 0)
   }
-  const rowTotal = (ri: number, vi: number): number => groupTotal([ri], fields.rows.length, vi)
+  const rowTotal = (ri: number, vi: number): number => groupTotal([ri], vi)
 
   const allLeaves = displayRows.map((_, ri) => ri)
-  const grandTotals = fields.values.map((_, vi) => groupTotal(allLeaves, 0, vi))
+  const grandTotals = fields.values.map((_, vi) => groupTotal(allLeaves, vi))
 
-  const colValueIdx = fields.values.map((_, vi) => vi).filter((vi) => !tlActive || follows(fields.values[vi]))
 
   return {
     displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, rowTotal, groupCell, groupTotal, grandTotals, bucketRows, grainModule,
-    fanoutNotice, timelineNotices: notices, colValueIdx, unsplitNames,
-    unsplitWhere: tlActive ? "Total column" : "totals",
+    fanoutNotice, timelineNotices: notices,
   }
 }
 
@@ -9982,14 +9973,8 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
   const allLeaves = displayRows.map((_, ri) => ri)
   // The right-hand Grand Total column is a total like the others — the totals toggle hides it too.
   const showColTotal = showTotals && hasColumns && hasValues
-  // A metric the Timeline doesn't split lives only in totals; with them hidden, say so rather
-  // than point at a column that isn't there.
-  const unsplitNotice = report.unsplitNames.length === 0 ? null
-    : `${report.unsplitNames.join(", ")} ${report.unsplitNames.length === 1 ? "isn't" : "aren't"} split by Timeline — `
-      + (showTotals ? `see the ${report.unsplitWhere}.`
-        : `${report.unsplitNames.length === 1 ? "it shows" : "they show"} only in totals, which are hidden.`)
-  const timelineNotices = unsplitNotice ? [...report.timelineNotices, unsplitNotice] : report.timelineNotices
-  const colValueItems = report.colValueIdx.map((vi) => ({ item: fields.values[vi], vi }))
+  const timelineNotices = report.timelineNotices
+  const colValueItems = fields.values.map((item, vi) => ({ item, vi }))
   const colHeaderTiers = hasColumns ? buildColumnHeaderTiers(colTuples) : []
 
   // "View table values in project's currency" — appends the resolved currency code to a
@@ -10016,9 +10001,9 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
     const tree = buildCompactTree(displayRows)
     const flatNodes = flattenCompactTree(tree, collapsedNodes)
     const aggValue = (node: CompactNode, ci: number, vi: number) =>
-      groupCell(node.leafIndices, node.level + 1, ci, vi)
+      groupCell(node.leafIndices, ci, vi)
     const nodeRowTotal = (node: CompactNode, vi: number) =>
-      groupTotal(node.leafIndices, node.level + 1, vi)
+      groupTotal(node.leafIndices, vi)
     const nodeBuckets = (node: CompactNode, ci: number) => node.leafIndices.map((ri) => bucketRows(ri, ci))
     const nodeTotalBuckets = (node: CompactNode) =>
       hasColumns ? node.leafIndices.flatMap((ri) => colValues.map((_, ci) => bucketRows(ri, ci))) : nodeBuckets(node, 0)
@@ -10164,7 +10149,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                     ? colValues.flatMap((_, ci) =>
                         colValueItems.map(({ item, vi }) => (
                           <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums`}>
-                            {numCellValue(groupCell(allLeaves, 0, ci, vi), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
+                            {numCellValue(groupCell(allLeaves, ci, vi), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
                           </td>
                         ))
                       )
@@ -10344,7 +10329,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                       ? colValues.flatMap((_, ci) =>
                           colValueItems.map(({ item, vi }) => {
                             const groupIndices = displayRows.flatMap((r, idx) => r[0] === combo[0] ? [idx] : [])
-                            const subtotal = groupCell(groupIndices, 1, ci, vi)
+                            const subtotal = groupCell(groupIndices, ci, vi)
                             const buckets = groupIndices.map((absRi) => bucketRows(absRi, ci))
                             return (
                               <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
@@ -10355,7 +10340,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                         )
                       : fields.values.map((item, vi) => {
                           const groupIndices = displayRows.flatMap((r, idx) => r[0] === combo[0] ? [idx] : [])
-                          const subtotal = groupCell(groupIndices, 1, 0, vi)
+                          const subtotal = groupCell(groupIndices, 0, vi)
                           const buckets = groupIndices.map((absRi) => bucketRows(absRi, 0))
                           return (
                             <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
@@ -10366,7 +10351,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                     }
                     {showColTotal && fields.values.map((item, vi) => {
                       const groupIndices = displayRows.flatMap((r, idx) => r[0] === combo[0] ? [idx] : [])
-                      const subtotal = groupTotal(groupIndices, 1, vi)
+                      const subtotal = groupTotal(groupIndices, vi)
                       const buckets = groupIndices.flatMap((absRi) => colValues.map((_, ci) => bucketRows(absRi, ci)))
                       return (
                         <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums bg-gray-100`}>
@@ -10388,7 +10373,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                 ? colValues.flatMap((_, ci) =>
                     colValueItems.map(({ item, vi }) => (
                       <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums`}>
-                        {numCellValue(groupCell(allLeaves, 0, ci, vi), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
+                        {numCellValue(groupCell(allLeaves, ci, vi), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
                       </td>
                     ))
                   )
