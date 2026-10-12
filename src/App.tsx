@@ -2203,6 +2203,15 @@ function timelineRuleWindow(rule: FilterRule | undefined): DateWindow | null {
   return (t) => dateRuleMatches(new Date(t), rule)
 }
 
+// The report's Timeline filter and a viewer's one together: the viewer narrows within the
+// report's period, never beyond it — the same order base and view filters run in everywhere.
+function combinedTimelineWindow(baseRules: FilterRule[], viewRules: FilterRule[]): DateWindow | null {
+  return intersectWindows(
+    timelineRuleWindow(baseRules.find((r) => r.field === TIMELINE_KEY)),
+    timelineRuleWindow(viewRules.find((r) => r.field === TIMELINE_KEY)),
+  )
+}
+
 // A metric chip's own calendar as a window — the same reading aggregateBucket applies, kept in
 // one place so the Timeline and the chip calendar can never disagree about what "This month" is.
 function metricFilterWindow(f: MetricFilter | undefined): DateWindow | null {
@@ -2262,8 +2271,9 @@ function metricRecordTimes(grainModule: string, row: Row, metricKey: string): nu
 // What a Timeline filter can pick at one granularity: the periods its metrics have records in,
 // read from each metric's own date (hours when logged, allocations when booked…) rather than a
 // generic calendar. Recurring granularities run in calendar order (every January together),
-// the rest chronologically.
-function timelineActualValues(metricKeys: string[], gran: string): string[] {
+// the rest chronologically. `within` keeps only records inside another Timeline filter — a view
+// filter offers only what the report's own Timeline lets through.
+function timelineActualValues(metricKeys: string[], gran: string, within: DateWindow | null = null): string[] {
   const order = new Map<string, number>()
   new Set(metricKeys.map(fieldKeyModule)).forEach((mod) => {
     const df = ROLLUP_DATE_FIELD[mod]
@@ -2272,6 +2282,7 @@ function timelineActualValues(metricKeys: string[], gran: string): string[] {
       const v = r[df]
       if (!v) return
       const d = v instanceof Date ? v : new Date(v)
+      if (within && !within(d.getTime())) return
       const label = bucketDateLabel(d, gran)
       const key = gran === "Month" ? d.getMonth()
         : gran === "Quarter" ? quarterOf(d)
@@ -2905,11 +2916,12 @@ function computeReportData(
   const roledRules = withFilterRoles(baseGrain, allRules)
   const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, roledRules))
 
-  // Timeline: the report-level filter (base Filters only) and/or a Timeline in Rows or Columns.
+  // Timeline: a filter (the report's, a viewer's, or both) and/or a Timeline in Rows or Columns.
   // None of them partitions records — a Timeline row or column is a set of date windows applied
-  // to each time-tracked metric — so it is kept out of the labelers below.
+  // to each time-tracked metric — so it is kept out of the labelers below. Which metrics it
+  // governs is the report's call: exemptions live on the report's own Timeline filter.
   const tlRule = filterRules.find((r) => r.field === TIMELINE_KEY)
-  const tlWindow = timelineRuleWindow(tlRule)
+  const tlWindow = combinedTimelineWindow(filterRules, viewFilterRules)
   const tlCol = fields.columns.find((c) => c.field === TIMELINE_KEY)
   const tlRow = fields.rows.find((c) => c.field === TIMELINE_KEY)
   const tlRowAt = fields.rows.findIndex((c) => c.field === TIMELINE_KEY)
@@ -2922,9 +2934,9 @@ function computeReportData(
   const tlActive = !!tlCol && canSplit
   const tlRowActive = !!tlRow && canSplit
   // The window a following metric is narrowed to before any column split: the Timeline filter's
-  // period if there is one, otherwise the metric's own calendar.
+  // period once one is picked, otherwise the metric's own calendar.
   const outerWindow = (item: PivotItem): DateWindow | null =>
-    tlRule ? tlWindow : metricFilterWindow(timelineFilters[item.id])
+    tlWindow ?? metricFilterWindow(timelineFilters[item.id])
 
   const labelWindow = (item: PivotItem) => (follows(item) ? tlWindow : null)
   const rowLabelers = baseRowFields.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths, labelWindow(item)))
@@ -3119,7 +3131,7 @@ function computeReportData(
       if (!recorded) return NaN
       return aggregateBucket(rows, grainModule, item, agg, type, undefined, lookupPaths[item.id], w)
     }
-    if (tlRule && follows(item)) {
+    if (tlWindow && follows(item)) {
       return aggregateBucket(rows, grainModule, item, agg, type, undefined, lookupPaths[item.id], tlWindow)
     }
     return aggregateBucket(rows, grainModule, item, agg, type, timelineFilters[item.id], lookupPaths[item.id])
@@ -3218,8 +3230,8 @@ function computeTabularData(
   // The Timeline filter narrows each included time-tracked field to its period — the columns and
   // anything grouped on; every other field, and the list of records itself, is untouched.
   const tlRule = filterRules.find((r) => r.field === TIMELINE_KEY)
-  const tlWindow = timelineRuleWindow(tlRule)
-  const tlWindowFor = (item: PivotItem) => (tlRule && followsTimeline(item, tlRule) ? tlWindow : null)
+  const tlWindow = combinedTimelineWindow(filterRules, viewFilterRules)
+  const tlWindowFor = (item: PivotItem) => (tlWindow && followsTimeline(item, tlRule) ? tlWindow : null)
 
   const groupLabelers = fields.groupBy.map((item) =>
     buildLabeler(grainModule, filtered, item, groupByAggregations, rangeConfigs, lookupPaths, tlWindowFor(item)))
@@ -7971,6 +7983,13 @@ function ViewFilterCard({ rule, baseRules, source, fields, aggregations, rangeCo
   // base-filtered value list threaded in from the pane.
   const allOptions = isNumericField
     ? [...new Set(aggValues)].sort((a, b) => a - b).map(String)
+    : rule.field === TIMELINE_KEY
+      // The periods the governed metrics have records in — exemptions come from the report's
+      // own Timeline filter, if it has one.
+      ? timelineActualValues(
+          timelineGovernedKeys(fields, baseRules.find((r) => r.field === TIMELINE_KEY) ?? rule),
+          rule.dateGranularity || "Month & Year",
+          timelineRuleWindow(baseRules.find((r) => r.field === TIMELINE_KEY)))
     : isDateField
       ? (ACTUAL_DATE_VALUES[rule.dateGranularity || "Month & Year"] ?? [])
       : (valueOptions ?? [])
@@ -8966,8 +8985,7 @@ function TabularBuilder() {
     setJustDroppedFilter(name)
   }
   const handleViewFilterDrop = (name: string, type: FieldType) => {
-    // The view-filter rail has no period control yet, so a Timeline there could not be set.
-    if (name === TIMELINE_KEY) return
+    if (name === TIMELINE_KEY && timelineBlocked) return
     if (!hasAnyField) { setNeedsFieldAlert(true); return }
     setViewFilterRules((prev) => {
       if (prev.find((r) => r.field === name)) return prev
@@ -10542,8 +10560,7 @@ export default function App() {
   // deduped within this list only; the same field may also sit in the base Filters above (base
   // locks the scope, the view filter lets a viewer pick within it).
   const handleViewFilterDrop = (name: string, type: FieldType) => {
-    // The view-filter rail has no period control yet, so a Timeline there could not be set.
-    if (name === TIMELINE_KEY) return
+    if (name === TIMELINE_KEY && timelineBlocked) return
     if (fields.columns.length === 0 && fields.rows.length === 0 && fields.values.length === 0) {
       setShowFilterNeedsFieldAlert(true)
       return
