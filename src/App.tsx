@@ -2901,6 +2901,9 @@ interface ComputedReport {
   groupCell: (leaves: number[], depth: number, ci: number, vi: number) => number
   groupTotal: (leaves: number[], depth: number, vi: number) => number
   timelineNotices: string[]
+  /** Measures a Timeline split doesn't apply to, which therefore show only in totals. */
+  unsplitNames: string[]
+  unsplitWhere: string
   /** Values shown under each data column. All of them normally; under a Timeline split only the
       ones it splits — a budget column under every month would always be empty. The Total
       column still shows every value. */
@@ -3089,11 +3092,10 @@ function computeReportData(
     colValues = nextValues; colTuples = nextTuples; colBase = nextBase; colWindow = nextWindow
 
   }
-  const unsplitItems = fields.values.filter((v) => !follows(v))
-  if ((tlActive || tlRowActive) && unsplitItems.length > 0) {
-    const names = unsplitItems.map((v) => fieldDisplayName(v.field)).join(", ")
-    notice(`${names} ${unsplitItems.length === 1 ? "isn't" : "aren't"} split by Timeline — see the ${tlActive ? "Total column" : "totals"}.`)
-  }
+  // Measures a Timeline split leaves whole — the canvas says where to find them, which depends on
+  // whether totals are showing.
+  const unsplitNames = tlActive || tlRowActive
+    ? fields.values.filter((v) => !follows(v)).map((v) => fieldDisplayName(v.field)) : []
 
   const hasColumns = colValues.length > 0
   const hasValues = fields.values.length > 0
@@ -3173,7 +3175,8 @@ function computeReportData(
 
   return {
     displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, rowTotal, groupCell, groupTotal, grandTotals, bucketRows, grainModule,
-    fanoutNotice, timelineNotices: notices, colValueIdx,
+    fanoutNotice, timelineNotices: notices, colValueIdx, unsplitNames,
+    unsplitWhere: tlActive ? "Total column" : "totals",
   }
 }
 
@@ -9977,7 +9980,15 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
   const fanoutNotice = report.fanoutNotice
   const { displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, rowTotal, groupCell, groupTotal, grandTotals, bucketRows, grainModule } = report
   const allLeaves = displayRows.map((_, ri) => ri)
-  const timelineNotices = report.timelineNotices
+  // The right-hand Grand Total column is a total like the others — the totals toggle hides it too.
+  const showColTotal = showTotals && hasColumns && hasValues
+  // A metric the Timeline doesn't split lives only in totals; with them hidden, say so rather
+  // than point at a column that isn't there.
+  const unsplitNotice = report.unsplitNames.length === 0 ? null
+    : `${report.unsplitNames.join(", ")} ${report.unsplitNames.length === 1 ? "isn't" : "aren't"} split by Timeline — `
+      + (showTotals ? `see the ${report.unsplitWhere}.`
+        : `${report.unsplitNames.length === 1 ? "it shows" : "they show"} only in totals, which are hidden.`)
+  const timelineNotices = unsplitNotice ? [...report.timelineNotices, unsplitNotice] : report.timelineNotices
   const colValueItems = report.colValueIdx.map((vi) => ({ item: fields.values[vi], vi }))
   const colHeaderTiers = hasColumns ? buildColumnHeaderTiers(colTuples) : []
 
@@ -10041,7 +10052,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                       {cell.label}
                     </th>
                   ))}
-                  {hasValues && (
+                  {showColTotal && (
                     level === 0 ? (
                       <th colSpan={fields.values.length} className={`${thCls} bg-gray-100 text-gray-600 text-center`}>
                         Grand Total
@@ -10080,7 +10091,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                       </th>
                     ))
                 }
-                {hasColumns && hasValues && fields.values.map((item, vi) => (
+                {showColTotal && fields.values.map((item, vi) => (
                   <th key={`gt-${vi}`} className={`${thCls} bg-gray-100 text-gray-600 ${alignClass(fieldFormats[item.id], "right")} min-w-[110px]`}>
                     {fieldItemLabel(item, fieldFormats)}
                     <ModuleTag field={item.field} show={showModuleTag} />
@@ -10117,7 +10128,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                         {hasColumns
                           ? colValues.flatMap((_, ci) => colValueItems.map(({ vi }) => <td key={`${ci}-${vi}`} className={tdCls} />))
                           : fields.values.map((_, vi) => <td key={vi} className={tdCls} />)}
-                        {hasColumns && fields.values.map((_, vi) => <td key={`gt-${vi}`} className={`${tdCls} bg-gray-50`} />)}
+                        {showColTotal && fields.values.map((_, vi) => <td key={`gt-${vi}`} className={`${tdCls} bg-gray-50`} />)}
                       </>
                     ) : (
                       <>
@@ -10135,7 +10146,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                               </td>
                             ))
                         }
-                        {hasColumns && fields.values.map((item, vi) => (
+                        {showColTotal && fields.values.map((item, vi) => (
                           <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} font-semibold tabular-nums bg-gray-50`}>
                             {numCellValue(nodeRowTotal(node, vi), fieldFormats[item.id])}{currencySuffix(item, nodeTotalBuckets(node))}
                           </td>
@@ -10161,7 +10172,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                         <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} text-gray-900 tabular-nums`}>{numCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], displayRows.map((_, ri) => bucketRows(ri, 0)))}</td>
                       ))
                   }
-                  {hasColumns && grandTotals.map((t, vi) => (
+                  {showColTotal && grandTotals.map((t, vi) => (
                     <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} text-gray-900 tabular-nums bg-gray-100`}>{numCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], displayRows.flatMap((_, ri) => colValues.map((_, ci) => bucketRows(ri, ci))))}</td>
                   ))}
                 </tr>
@@ -10202,7 +10213,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                   {cell.label}
                 </th>
               ))}
-              {hasValues && (
+              {showColTotal && (
                 level === 0 ? (
                   <th colSpan={fields.values.length} className={`${thCls} bg-gray-100 text-gray-600 text-center`}>
                     Grand Total
@@ -10243,7 +10254,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                   </th>
                 ))
             }
-            {hasColumns && hasValues && fields.values.map((item, vi) => (
+            {showColTotal && fields.values.map((item, vi) => (
               <th key={`gt-${vi}`} className={`${thCls} bg-gray-100 text-gray-600 ${alignClass(fieldFormats[item.id], "right")} min-w-[110px]`}>
                 {fieldItemLabel(item, fieldFormats)}
                 <ModuleTag field={item.field} show={showModuleTag} />
@@ -10316,7 +10327,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                         </td>
                       ))
                   }
-                  {hasColumns && hasValues && rowTotals.map((t, vi) => (
+                  {showColTotal && rowTotals.map((t, vi) => (
                     <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} font-semibold text-gray-800 tabular-nums bg-gray-50`}>
                       {numCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], colValues.map((_, ci) => bucketRows(ri, ci)))}
                     </td>
@@ -10353,7 +10364,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                           )
                         })
                     }
-                    {hasColumns && fields.values.map((item, vi) => {
+                    {showColTotal && fields.values.map((item, vi) => {
                       const groupIndices = displayRows.flatMap((r, idx) => r[0] === combo[0] ? [idx] : [])
                       const subtotal = groupTotal(groupIndices, 1, vi)
                       const buckets = groupIndices.flatMap((absRi) => colValues.map((_, ci) => bucketRows(absRi, ci)))
@@ -10385,7 +10396,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                     <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} text-gray-900 tabular-nums`}>{numCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], displayRows.map((_, ri) => bucketRows(ri, 0)))}</td>
                   ))
               }
-              {hasColumns && grandTotals.map((t, vi) => (
+              {showColTotal && grandTotals.map((t, vi) => (
                 <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} text-gray-900 tabular-nums bg-gray-100`}>{numCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], displayRows.flatMap((_, ri) => colValues.map((_, ci) => bucketRows(ri, ci))))}</td>
               ))}
             </tr>
