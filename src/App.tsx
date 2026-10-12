@@ -2203,21 +2203,6 @@ function timelineRuleWindow(rule: FilterRule | undefined): DateWindow | null {
   return (t) => dateRuleMatches(new Date(t), rule)
 }
 
-// Where the Timeline filter has edges of its own (a relative period, a closed range), the column
-// split covers all of it, so a quiet stretch inside the period still gets its columns.
-function timelineRuleSpan(rule: FilterRule | undefined): [number, number] | null {
-  if (!rule || !dateRuleIsSet(rule)) return null
-  const mode = rule.dateMode ?? "actual"
-  if (mode === "relative") {
-    const w = relativeWindow(rule.dateGranularity || "Month & Year", rule.dateRelativeOpt, rule.dateRelativeN || 1, TODAY)
-    return w ? [w[0].getTime(), w[1].getTime()] : null
-  }
-  if (mode === "range" && rule.dateRangeOp === "between" && rule.dateFrom && rule.dateTo) {
-    return [localDay(rule.dateFrom)!.getTime(), localDay(rule.dateTo, true)!.getTime()]
-  }
-  return null
-}
-
 // A metric chip's own calendar as a window — the same reading aggregateBucket applies, kept in
 // one place so the Timeline and the chip calendar can never disagree about what "This month" is.
 function metricFilterWindow(f: MetricFilter | undefined): DateWindow | null {
@@ -2234,14 +2219,6 @@ function intersectWindows(a: DateWindow | null, b: DateWindow | null): DateWindo
   if (!a) return b
   if (!b) return a
   return (t) => a(t) && b(t)
-}
-
-// Does any instant of this period pass the window? Sampled twice a day (hourly where the filter
-// picks hours) — enough for every period the Timeline splits by, and cheap.
-function periodTouches(span: [number, number], window: DateWindow, hourly: boolean): boolean {
-  const step = hourly ? 3600000 : 43200000
-  for (let t = span[0]; t <= span[1]; t += step) if (window(t)) return true
-  return false
 }
 
 function periodStart(d: Date, gran: string): Date {
@@ -2261,36 +2238,25 @@ function nextPeriodStart(d: Date, gran: string): Date {
   }
 }
 
-// Contiguous periods covering [from, to] — contiguous, so an empty month still gets a column
-// rather than silently closing the gap and making the series look unbroken.
-function timelinePeriods(from: number, to: number, gran: string): { label: string; window: [number, number] }[] {
-  const out: { label: string; window: [number, number] }[] = []
-  let cur = periodStart(new Date(from), gran)
-  while (cur.getTime() <= to && out.length < 1000) {
-    const next = nextPeriodStart(cur, gran)
-    out.push({ label: bucketDateLabel(cur, gran), window: [cur.getTime(), next.getTime() - 1] })
-    cur = next
-  }
-  return out
+// The period a date falls in, as a Timeline slot's label and window.
+function periodOf(start: number, gran: string): { label: string; window: [number, number] } {
+  const d = new Date(start)
+  return { label: bucketDateLabel(d, gran), window: [start, nextPeriodStart(d, gran).getTime() - 1] }
 }
 
-// The span of dates the given metrics actually have (inside the Timeline filter, if any) — what
-// the column split covers when the filter has no edges of its own.
-function timelineDataExtent(metricKeys: string[], window: DateWindow | null): [number, number] | null {
-  let lo = Infinity, hi = -Infinity
-  new Set(metricKeys.map(fieldKeyModule)).forEach((mod) => {
-    const df = ROLLUP_DATE_FIELD[mod]
-    if (!df) return
-    ;(MODULE_ROWS[mod] ?? []).forEach((r) => {
-      const v = r[df]
-      if (!v) return
-      const t = (v instanceof Date ? v : new Date(v)).getTime()
-      if (window && !window(t)) return
-      if (t < lo) lo = t
-      if (t > hi) hi = t
-    })
-  })
-  return lo <= hi ? [lo, hi] : null
+// The dates of the records behind a time-tracked metric for one row — the hours it logged, the
+// allocations it booked — reached the same way resolveFieldForRow reaches their values.
+function metricRecordTimes(grainModule: string, row: Row, metricKey: string): number[] {
+  const mod = fieldKeyModule(metricKey)
+  const df = ROLLUP_DATE_FIELD[mod]
+  if (!df) return []
+  const at = (v: any) => (v instanceof Date ? v : new Date(v)).getTime()
+  if (mod === grainModule) return row[df] ? [at(row[df])] : []
+  const fk = ROLLUP_FK[mod]
+  if (!fk) return []
+  const matchId = MODULE_OWN_ID_KEY[grainModule] === fk ? row.id : row[fk]
+  const records = matchId != null ? (ROLLUP_INDEX[mod]?.get(matchId) ?? []) : []
+  return records.filter((r) => r[df]).map((r) => at(r[df]))
 }
 
 // What a Timeline filter can pick at one granularity: the periods its metrics have records in,
@@ -3016,18 +2982,29 @@ function computeReportData(
   const withUnsplitSlot = (periods: TimelineSlot[]): TimelineSlot[] =>
     unsplitIdx.length > 0 ? [{ label: "", window: null, unsplit: true }, ...periods] : periods
 
-  // The periods a Timeline row or column splits into: from the first to the last dated record
-  // inside the filter, widened to the filter's own edges where it has them, keeping only the
-  // periods the filter lets through.
-  const timelineSplit = (item: PivotItem) => {
-    const gran = aggregations[item.id] || "Month & Year"
-    const extent = timelineDataExtent(fields.values.filter(follows).map((v) => v.field), tlWindow)
-    const edges = timelineRuleSpan(tlRule)
-    const bounds = extent && edges ? [Math.min(extent[0], edges[0]), Math.max(extent[1], edges[1])]
-      : extent ?? edges
-    const hourly = tlRule?.dateGranularity === "Date & Time" && (tlRule.dateMode ?? "actual") === "actual"
-    let periods = bounds ? timelinePeriods(bounds[0], bounds[1], gran) : []
-    if (tlWindow) periods = periods.filter((p) => periodTouches(p.window, tlWindow, hourly))
+  const tlItem = tlCol ?? tlRow
+  const tlGran = (tlItem && aggregations[tlItem.id]) || "Month & Year"
+  const splitItems = fields.values.filter(follows)
+  // The periods these rows have records in, for the measures the Timeline splits — each read from
+  // its own date and kept inside its own window (the Timeline filter, or the chip's calendar).
+  // Like grouping on a real date: a period exists only where something happened in it.
+  const periodStartsOf = (rows: Row[]): Set<number> => {
+    const out = new Set<number>()
+    splitItems.forEach((item) => {
+      const w = outerWindow(item)
+      rows.forEach((row) => metricRecordTimes(grainModule, row, item.field).forEach((t) => {
+        if (!w || w(t)) out.add(periodStart(new Date(t), tlGran).getTime())
+      }))
+    })
+    return out
+  }
+  const entryRows = (entry: ComboEntry): Row[] => ([] as Row[]).concat(...entry.cols.values())
+  // Every period any group has, in order — the columns of a Timeline in Columns, and the order of
+  // the period rows of one in Rows.
+  const timelineSplit = (): TimelineSlot[] => {
+    const starts = new Set<number>()
+    comboEntries.forEach((e) => periodStartsOf(entryRows(e)).forEach((t) => starts.add(t)))
+    let periods = [...starts].sort((a, b) => a - b).map((t) => periodOf(t, tlGran))
     if (periods.length > TIMELINE_MAX_PERIODS) {
       periods = periods.slice(-TIMELINE_MAX_PERIODS)
       notice(`Showing the latest ${TIMELINE_MAX_PERIODS} periods — add a Timeline filter to choose the range.`)
@@ -3036,12 +3013,13 @@ function computeReportData(
   }
 
   // Each displayed row is a base group (the non-Timeline Rows fields) plus, with a Timeline in
-  // Rows, one period's window. Every group gets every period — "all projects" stays all of them.
+  // Rows, one period's window — only the periods that group has records in. A group with none
+  // still keeps one row, so "all projects" stays all of them.
   type DisplayRow = { entry: ComboEntry; ei: number; combo: string[]; window: DateWindow | null; unsplit?: boolean }
   let rowsOut: DisplayRow[] = comboEntries.map((entry, ei) => ({ entry, ei, combo: entry.combo, window: null }))
   if (tlRow) {
     const periods: TimelineSlot[] =
-      tlRowActive ? withUnsplitSlot(timelineSplit(tlRow)) : [{ label: "All time", window: null }]
+      tlRowActive ? withUnsplitSlot(timelineSplit()) : [{ label: "All time", window: null }]
     // Groups sharing the Rows fields before the Timeline nest the period inside them, then any
     // fields after it — so order by that shared prefix, then period, then the rest.
     let prefixGroup = -1, prevPrefix: string | null = null
@@ -3049,7 +3027,10 @@ function computeReportData(
     comboEntries.forEach((entry, ei) => {
       const prefix = entry.combo.slice(0, tlRowAt).join(SEP)
       if (prefix !== prevPrefix) { prefixGroup++; prevPrefix = prefix }
-      periods.forEach((p, pi) => {
+      const own = tlRowActive ? periodStartsOf(entryRows(entry)) : null
+      const slots = periods.map((p, pi) => ({ p, pi })).filter(({ p }) => !own || !p.window || own.has(p.window[0]))
+      if (slots.length === 0) slots.push({ p: { label: "", window: null, unsplit: true }, pi: -1 })
+      slots.forEach(({ p, pi }) => {
         const combo = [...entry.combo]
         combo.splice(tlRowAt, 0, p.label)
         keyed.push({ entry, ei, combo, window: p.window ? spanWindow(p.window) : null, unsplit: p.unsplit, pg: prefixGroup, pi })
@@ -3080,7 +3061,7 @@ function computeReportData(
   let colWindow: (DateWindow | null)[] = colValues.map(() => null)
   let colUnsplit: boolean[] = colValues.map(() => false)
   if (tlCol && tlActive) {
-    const periods = withUnsplitSlot(timelineSplit(tlCol))
+    const periods = withUnsplitSlot(timelineSplit())
     const bases = baseColumns.length > 0 ? colValues : [""]
     const tlAt = fields.columns.findIndex((c) => c.field === TIMELINE_KEY)
     const outer = tlAt === 0 && baseColumns.length > 0 ? "period" : "base"
@@ -3133,6 +3114,9 @@ function computeReportData(
     const rows = bucketRows(ri, ci)
     if ((tlActive || tlRowActive) && follows(item)) {
       const w = intersectWindows(intersectWindows(colWindow[ci] ?? null, rowsOut[ri]?.window ?? null), outerWindow(item))
+      // Nothing recorded here in this period: blank, not a zero that reads as a real figure.
+      const recorded = rows.some((row) => metricRecordTimes(grainModule, row, item.field).some((t) => !w || w(t)))
+      if (!recorded) return NaN
       return aggregateBucket(rows, grainModule, item, agg, type, undefined, lookupPaths[item.id], w)
     }
     if (tlRule && follows(item)) {
