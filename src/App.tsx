@@ -2587,10 +2587,12 @@ interface FieldLabeler {
   sortKey: (row: Row) => number | string
 }
 
-function buildLabeler(grainModule: string, sampleRows: Row[], item: PivotItem, aggregations: Record<string, string>, rangeConfigs: Record<string, RangeConfig>, lookupPaths: Record<string, string> = {}): FieldLabeler {
+// `window` narrows a time-tracked field to the Timeline filter's period before it is grouped on —
+// projects banded by their hours this month, not their hours ever.
+function buildLabeler(grainModule: string, sampleRows: Row[], item: PivotItem, aggregations: Record<string, string>, rangeConfigs: Record<string, RangeConfig>, lookupPaths: Record<string, string> = {}, window: DateWindow | null = null): FieldLabeler {
   const type = getFieldType(item.field)
   const modifier = aggregations[item.id]
-  const resolve = (row: Row) => resolveFieldForRow(grainModule, row, item.field, null, lookupPaths[item.id])
+  const resolve = (row: Row) => resolveFieldForRow(grainModule, row, item.field, window, lookupPaths[item.id])
 
   if (type === "date") {
     const gran = modifier || "Quarter & Year"
@@ -2961,12 +2963,13 @@ function computeReportData(
   const outerWindow = (item: PivotItem): DateWindow | null =>
     tlRule ? tlWindow : metricFilterWindow(timelineFilters[item.id])
 
-  const rowLabelers = baseRowFields.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths))
+  const labelWindow = (item: PivotItem) => (follows(item) ? tlWindow : null)
+  const rowLabelers = baseRowFields.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths, labelWindow(item)))
   // Every Columns field participates. Each distinct combination gets one composite key (joined
   // for map-lookup purposes) but keeps its per-field label tuple around too (colLabelParts), so
   // the header can render true nested tiers — one row per Columns field, colSpan-grouped by
   // shared prefix — instead of flattening into a single joined label.
-  const colLabelers = baseColumns.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths))
+  const colLabelers = baseColumns.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths, labelWindow(item)))
 
   const SEP = "␟"
   const comboMap = new Map<string, { combo: string[]; sortTuple: (number | string)[]; cols: Map<string, Row[]> }>()
@@ -3239,8 +3242,14 @@ function computeTabularData(
   const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
   const filtered = filterRowsFlat(grainModule, allRows, withFilterRoles(pickGrain(source, pivotShape, allRules), allRules))
 
+  // The Timeline filter narrows each included time-tracked field to its period — the columns and
+  // anything grouped on; every other field, and the list of records itself, is untouched.
+  const tlRule = filterRules.find((r) => r.field === TIMELINE_KEY)
+  const tlWindow = timelineRuleWindow(tlRule)
+  const tlWindowFor = (item: PivotItem) => (tlRule && followsTimeline(item, tlRule) ? tlWindow : null)
+
   const groupLabelers = fields.groupBy.map((item) =>
-    buildLabeler(grainModule, filtered, item, groupByAggregations, rangeConfigs, lookupPaths))
+    buildLabeler(grainModule, filtered, item, groupByAggregations, rangeConfigs, lookupPaths, tlWindowFor(item)))
 
   const compareKey = (a: number | string, b: number | string) =>
     typeof a === "number" && typeof b === "number" ? a - b : String(a).localeCompare(String(b))
@@ -3263,16 +3272,10 @@ function computeTabularData(
     })
   }
 
-  // The Timeline filter narrows each included time-tracked column to its period; every other
-  // column, and the list of records itself, is untouched.
-  const tlRule = filterRules.find((r) => r.field === TIMELINE_KEY)
-  const tlWindow = timelineRuleWindow(tlRule)
-
   const rows: TabularRow[] = decorated.slice(0, TABULAR_ROW_CAP).map(({ row, labels }) => ({
     groupLabels: labels,
     cells: fields.columns.map((item) => {
-      const window = tlRule && followsTimeline(item, tlRule) ? tlWindow : null
-      const raw = resolveFieldForRow(grainModule, row, item.field, window, lookupPaths[item.id])
+      const raw = resolveFieldForRow(grainModule, row, item.field, tlWindowFor(item), lookupPaths[item.id])
       let text = tabularCellText(raw, item, fieldFormats)
       // Simpler than the pivot's version of this setting: a tabular row IS one record, so its
       // currency is unambiguous — no mixed-currency group to suppress the tag for.
@@ -7314,11 +7317,11 @@ function FilterBar({
 //                 survive the base filters, via relevantFieldValues)
 //   panelAlign  — which edge the boolean/fallback inline panel hangs off; "right" keeps it from
 //                 overflowing when the chip sits in the narrow right-hand pane
-// The time-tracked metric chips a Timeline filter can govern. Values in a pivot; Columns in a
-// tabular report (passed in as the pivot-shaped fields, where tabular Columns sit in `columns`).
+// The time-tracked chips a Timeline filter can govern, wherever they sit — Values, Rows or Columns
+// in a pivot; Columns or Group by in a tabular report (passed in pivot-shaped).
 function timelineMetricItems(fields: PivotFields): PivotItem[] {
   const seen = new Set<string>()
-  return [...fields.values, ...fields.columns].filter((it) => {
+  return [...fields.values, ...fields.rows, ...fields.columns].filter((it) => {
     if (!TIMELINE_METRICS_SET.has(it.field) || seen.has(it.id)) return false
     seen.add(it.id)
     return true
@@ -8980,9 +8983,8 @@ function TabularBuilder() {
 
   const makeRule = (name: string, type: FieldType) => makeFilterRule(name, type)
 
-  // In a flat list the Timeline is a filter on time-tracked columns, so it needs one first.
-  const timelineBlocked = fields.columns.some((c) => TIMELINE_METRICS_SET.has(c.field))
-    ? null : "Add a time-tracked field to Columns first"
+  // In a flat list the Timeline is a filter on time-tracked fields, so it needs one first.
+  const timelineBlocked = timelineMetricItems(pivotShape).length > 0 ? null : "Add a time-tracked metric first"
 
   const handleFilterDrop = (name: string, type: FieldType) => {
     if (name === TIMELINE_KEY && timelineBlocked) return
@@ -10530,9 +10532,9 @@ export default function App() {
     })
   }
 
-  // The Timeline only ever acts on time-tracked metrics, so it stays locked until one is in Values.
-  const timelineBlocked = fields.values.some((v) => TIMELINE_METRICS_SET.has(v.field))
-    ? null : "Add a time-tracked metric to Values first"
+  // The Timeline only ever acts on time-tracked metrics, so it stays locked until the report has
+  // one — in Values, Rows or Columns.
+  const timelineBlocked = timelineMetricItems(fields).length > 0 ? null : "Add a time-tracked metric first"
 
   const handleFilterDrop = (name: string, type: FieldType) => {
     if (name === TIMELINE_KEY && timelineBlocked) return
