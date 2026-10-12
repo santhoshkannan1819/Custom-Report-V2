@@ -2884,6 +2884,8 @@ interface ComputedReport {
   displayRows: string[][]
   colValues: string[]
   colTuples: string[][]
+  /** The Values (by index) shown under each data column. */
+  colItems: number[][]
   hasColumns: boolean
   hasValues: boolean
   cellNum: (ri: number, ci: number, vi: number) => number
@@ -3005,6 +3007,15 @@ function computeReportData(
   const notices: string[] = []
   const notice = (n: string) => { if (!notices.includes(n)) notices.push(n) }
   if ((tlCol || tlRow) && !canSplit) notice("Timeline splits only time-tracked metrics, and none are in Values.")
+  // A Timeline split lays out one slot per period. Measures it doesn't split (no date of their own,
+  // or exempted) are ordinary values shown once, in a leading slot with no period label — never
+  // repeated under each period, never only in a total.
+  type TimelineSlot = { label: string; window: [number, number] | null; unsplit?: boolean }
+  const unsplitIdx = fields.values.map((_, vi) => vi).filter((vi) => !follows(fields.values[vi]))
+  const splitIdx = fields.values.map((_, vi) => vi).filter((vi) => follows(fields.values[vi]))
+  const withUnsplitSlot = (periods: TimelineSlot[]): TimelineSlot[] =>
+    unsplitIdx.length > 0 ? [{ label: "", window: null, unsplit: true }, ...periods] : periods
+
   // The periods a Timeline row or column splits into: from the first to the last dated record
   // inside the filter, widened to the filter's own edges where it has them, keeping only the
   // periods the filter lets through.
@@ -3026,11 +3037,11 @@ function computeReportData(
 
   // Each displayed row is a base group (the non-Timeline Rows fields) plus, with a Timeline in
   // Rows, one period's window. Every group gets every period — "all projects" stays all of them.
-  type DisplayRow = { entry: ComboEntry; ei: number; combo: string[]; window: DateWindow | null }
+  type DisplayRow = { entry: ComboEntry; ei: number; combo: string[]; window: DateWindow | null; unsplit?: boolean }
   let rowsOut: DisplayRow[] = comboEntries.map((entry, ei) => ({ entry, ei, combo: entry.combo, window: null }))
   if (tlRow) {
-    const periods: { label: string; window: [number, number] | null }[] =
-      tlRowActive ? timelineSplit(tlRow) : [{ label: "All time", window: null }]
+    const periods: TimelineSlot[] =
+      tlRowActive ? withUnsplitSlot(timelineSplit(tlRow)) : [{ label: "All time", window: null }]
     // Groups sharing the Rows fields before the Timeline nest the period inside them, then any
     // fields after it — so order by that shared prefix, then period, then the rest.
     let prefixGroup = -1, prevPrefix: string | null = null
@@ -3041,7 +3052,7 @@ function computeReportData(
       periods.forEach((p, pi) => {
         const combo = [...entry.combo]
         combo.splice(tlRowAt, 0, p.label)
-        keyed.push({ entry, ei, combo, window: p.window ? spanWindow(p.window) : null, pg: prefixGroup, pi })
+        keyed.push({ entry, ei, combo, window: p.window ? spanWindow(p.window) : null, unsplit: p.unsplit, pg: prefixGroup, pi })
       })
     })
     keyed.sort((a, b) => a.pg - b.pg || a.pi - b.pi || a.ei - b.ei)
@@ -3067,28 +3078,29 @@ function computeReportData(
   // Timeline column is present, one period's date window.
   let colBase: string[] = colValues
   let colWindow: (DateWindow | null)[] = colValues.map(() => null)
+  let colUnsplit: boolean[] = colValues.map(() => false)
   if (tlCol && tlActive) {
-    const periods = timelineSplit(tlCol)
+    const periods = withUnsplitSlot(timelineSplit(tlCol))
     const bases = baseColumns.length > 0 ? colValues : [""]
     const tlAt = fields.columns.findIndex((c) => c.field === TIMELINE_KEY)
     const outer = tlAt === 0 && baseColumns.length > 0 ? "period" : "base"
     const nextValues: string[] = [], nextTuples: string[][] = [], nextBase: string[] = []
-    const nextWindow: (DateWindow | null)[] = []
-    const push = (b: string, p: { label: string; window: [number, number] }) => {
+    const nextWindow: (DateWindow | null)[] = [], nextUnsplit: boolean[] = []
+    const push = (b: string, p: TimelineSlot) => {
       const parts = [...(colLabelParts.get(b) ?? [])]
       parts.splice(Math.min(tlAt, parts.length), 0, p.label)
-      nextValues.push(parts.join(SEP)); nextTuples.push(parts); nextBase.push(b); nextWindow.push(spanWindow(p.window))
+      nextValues.push(parts.join(SEP)); nextTuples.push(parts); nextBase.push(b)
+      nextWindow.push(p.window ? spanWindow(p.window) : null); nextUnsplit.push(!!p.unsplit)
     }
     if (outer === "period") periods.forEach((p) => bases.forEach((b) => push(b, p)))
     else bases.forEach((b) => periods.forEach((p) => push(b, p)))
     colValues = nextValues; colTuples = nextTuples; colBase = nextBase; colWindow = nextWindow
-
+    colUnsplit = nextUnsplit
   }
-  const unsplitItems = fields.values.filter((v) => !follows(v))
-  if ((tlActive || tlRowActive) && unsplitItems.length > 0) {
-    const names = unsplitItems.map((v) => fieldDisplayName(v.field)).join(", ")
-    notice(`${names} ${unsplitItems.length === 1 ? "isn't" : "aren't"} split by Timeline — the same in every period.`)
-  }
+  // The measures each column shows: all of them, except under a Timeline column — the leading
+  // slot holds the ones it doesn't split, every period the ones it does.
+  const colItems = colValues.map((_, ci) =>
+    !tlActive ? fields.values.map((_, vi) => vi) : colUnsplit[ci] ? unsplitIdx : splitIdx)
 
   const hasColumns = colValues.length > 0
   const hasValues = fields.values.length > 0
@@ -3104,16 +3116,22 @@ function computeReportData(
     return { type, agg: aggregations[item.id] || (isNumericType(type) ? "Sum" : "Count") }
   }
 
+  // Is this measure shown at this row and column? Under a Timeline split, a measure it doesn't
+  // split lives only in the leading slot, and one it does only in the periods.
+  const shown = (ri: number, ci: number, vi: number): boolean => {
+    if (!tlActive && !tlRowActive) return true
+    const inUnsplitSlot = tlActive ? !!colUnsplit[ci] : !!rowsOut[ri]?.unsplit
+    return follows(fields.values[vi]) ? !inUnsplitSlot : inUnsplitSlot
+  }
+
   const cellNum = (ri: number, ci: number, vi: number): number => {
     const item = fields.values[vi]
     if (!item) return 0
+    // NaN renders blank, and the totals below skip it.
+    if (!shown(ri, ci, vi)) return NaN
     const { type, agg } = aggOf(item)
     const rows = bucketRows(ri, ci)
-    if (tlActive || tlRowActive) {
-      // A metric the Timeline doesn't split is an ordinary value: the same in every period.
-      if (!follows(item)) {
-        return aggregateBucket(rows, grainModule, item, agg, type, timelineFilters[item.id], lookupPaths[item.id])
-      }
+    if ((tlActive || tlRowActive) && follows(item)) {
       const w = intersectWindows(intersectWindows(colWindow[ci] ?? null, rowsOut[ri]?.window ?? null), outerWindow(item))
       return aggregateBucket(rows, grainModule, item, agg, type, undefined, lookupPaths[item.id], w)
     }
@@ -3123,42 +3141,19 @@ function computeReportData(
     return aggregateBucket(rows, grainModule, item, agg, type, timelineFilters[item.id], lookupPaths[item.id])
   }
 
-  // Totals over a group of displayed rows — a subtotal, a row's total, the grand total. Normally
-  // the sum of the cells. A metric the Timeline
-  // doesn't split is the exception: it repeats in every period, so adding up the periods would
-  // count it once per period. It is computed over the group's own records instead — once per
-  // base group, however many periods that group spans.
-  const isUnsplit = (item: PivotItem) => (tlActive || tlRowActive) && !follows(item)
+  // Totals over a group of displayed rows — a subtotal, a row's total, the grand total: the sum of
+  // the cells it covers that show the measure, blank only if none do. Each measure appears once
+  // per record, so nothing is counted twice.
+  const sumShown = (vals: number[]): number => {
+    let any = vals.length === 0, sum = 0
+    vals.forEach((v) => { if (!Number.isNaN(v)) { any = true; sum += v } })
+    return any ? sum : NaN
+  }
   const allCols = hasColumns ? colValues.map((_, ci) => ci) : [0]
-  const unsplitValue = (leaves: number[], cols: number[], item: PivotItem): number => {
-    const seen = new Set<string>()
-    const rows: Row[] = []
-    leaves.forEach((ri) => {
-      const r = rowsOut[ri]
-      if (!r) return
-      cols.forEach((ci) => {
-        const b = hasColumns ? colBase[ci] : ""
-        const key = `${r.ei}${SEP}${b}`
-        if (seen.has(key)) return
-        seen.add(key)
-        rows.push(...(r.entry.cols.get(b) ?? []))
-      })
-    })
-    const { type, agg } = aggOf(item)
-    return aggregateBucket(rows, grainModule, item, agg, type, timelineFilters[item.id], lookupPaths[item.id])
-  }
-  const groupCell = (leaves: number[], ci: number, vi: number): number => {
-    const item = fields.values[vi]
-    if (!item) return 0
-    if (isUnsplit(item)) return unsplitValue(leaves, [ci], item)
-    return leaves.reduce((s, ri) => s + cellNum(ri, ci, vi), 0)
-  }
-  const groupTotal = (leaves: number[], vi: number): number => {
-    const item = fields.values[vi]
-    if (!item) return 0
-    if (isUnsplit(item)) return unsplitValue(leaves, allCols, item)
-    return leaves.reduce((s, ri) => s + allCols.reduce((t, ci) => t + cellNum(ri, ci, vi), 0), 0)
-  }
+  const groupCell = (leaves: number[], ci: number, vi: number): number =>
+    sumShown(leaves.map((ri) => cellNum(ri, ci, vi)))
+  const groupTotal = (leaves: number[], vi: number): number =>
+    sumShown(leaves.flatMap((ri) => allCols.map((ci) => cellNum(ri, ci, vi))))
   const rowTotal = (ri: number, vi: number): number => groupTotal([ri], vi)
 
   const allLeaves = displayRows.map((_, ri) => ri)
@@ -3166,7 +3161,7 @@ function computeReportData(
 
 
   return {
-    displayRows, colValues, colTuples, hasColumns, hasValues, cellNum, rowTotal, groupCell, groupTotal, grandTotals, bucketRows, grainModule,
+    displayRows, colValues, colTuples, colItems, hasColumns, hasValues, cellNum, rowTotal, groupCell, groupTotal, grandTotals, bucketRows, grainModule,
     fanoutNotice, timelineNotices: notices,
   }
 }
@@ -9880,7 +9875,7 @@ function buildCompactTree(rowCombinations: string[][]): CompactNode[] {
     let siblings = roots
     for (let level = 0; level < combo.length; level++) {
       const label = combo[level]
-      path = path ? `${path} ${label}` : label
+      path = level === 0 ? label : `${path} ${label}`
       let node = nodeMap.get(path)
       if (!node) {
         node = { key: path, label, level, leafIndices: [], children: [] }
@@ -9974,7 +9969,15 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
   // The right-hand Grand Total column is a total like the others — the totals toggle hides it too.
   const showColTotal = showTotals && hasColumns && hasValues
   const timelineNotices = report.timelineNotices
-  const colValueItems = fields.values.map((item, vi) => ({ item, vi }))
+  const colItemsAt = (ci: number) => report.colItems[ci].map((vi) => ({ item: fields.values[vi], vi }))
+  // A header tier cell spans every measure under its columns — not a fixed count per column,
+  // since a Timeline's leading slot holds only the measures it doesn't split.
+  const tierSpan = (tierRow: { span: number }[], i: number) => {
+    const start = tierRow.slice(0, i).reduce((s, c) => s + c.span, 0)
+    return hasValues
+      ? report.colItems.slice(start, start + tierRow[i].span).reduce((s, items) => s + items.length, 0)
+      : tierRow[i].span
+  }
   const colHeaderTiers = hasColumns ? buildColumnHeaderTiers(colTuples) : []
 
   // "View table values in project's currency" — appends the resolved currency code to a
@@ -10031,8 +10034,8 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                   <th className={`${thCls} bg-white border-b-0`} colSpan={1} />
                   {tierRow.map((cell, ci) => (
                     <th key={ci}
-                      colSpan={cell.span * (hasValues ? colValueItems.length : 1)}
-                      className={`${thCls} bg-indigo-50 text-indigo-600 text-center`}
+                      colSpan={tierSpan(tierRow, ci)}
+                      className={`${thCls} text-center ${cell.label === "" ? "bg-white" : "bg-indigo-50 text-indigo-600"}`}
                     >
                       {cell.label}
                     </th>
@@ -10060,7 +10063,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                 </th>
                 {hasColumns
                   ? colValues.flatMap((_, ci) =>
-                      colValueItems.map(({ item, vi }) => (
+                      colItemsAt(ci).map(({ item, vi }) => (
                         <th key={`${ci}-${vi}`} className={`${thCls} bg-gray-50 ${alignClass(fieldFormats[item.id], "right")} min-w-[110px]`}>
                           <span className="text-[10px] text-gray-400 font-normal mr-1">{aggregations[item.id]}</span>
                           <span className="text-emerald-600">{fieldItemLabel(item, fieldFormats)}</span>
@@ -10111,7 +10114,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                     {!hasValues ? null : !showAggregate ? (
                       <>
                         {hasColumns
-                          ? colValues.flatMap((_, ci) => colValueItems.map(({ vi }) => <td key={`${ci}-${vi}`} className={tdCls} />))
+                          ? colValues.flatMap((_, ci) => colItemsAt(ci).map(({ vi }) => <td key={`${ci}-${vi}`} className={tdCls} />))
                           : fields.values.map((_, vi) => <td key={vi} className={tdCls} />)}
                         {showColTotal && fields.values.map((_, vi) => <td key={`gt-${vi}`} className={`${tdCls} bg-gray-50`} />)}
                       </>
@@ -10119,7 +10122,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                       <>
                         {hasColumns
                           ? colValues.flatMap((_, ci) =>
-                              colValueItems.map(({ item, vi }) => (
+                              colItemsAt(ci).map(({ item, vi }) => (
                                 <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} tabular-nums ${valueCls}`}>
                                   {numCellValue(aggValue(node, ci, vi), fieldFormats[item.id])}{currencySuffix(item, nodeBuckets(node, ci))}
                                 </td>
@@ -10147,7 +10150,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                   <td className={`${tdCls} text-gray-800`}>Grand Total</td>
                   {hasColumns
                     ? colValues.flatMap((_, ci) =>
-                        colValueItems.map(({ item, vi }) => (
+                        colItemsAt(ci).map(({ item, vi }) => (
                           <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums`}>
                             {numCellValue(groupCell(allLeaves, ci, vi), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
                           </td>
@@ -10192,8 +10195,8 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
               <th className={`${thCls} bg-white border-b-0`} colSpan={Math.max(1, rowSamples.length)} />
               {tierRow.map((cell, ci) => (
                 <th key={ci}
-                  colSpan={cell.span * (hasValues ? colValueItems.length : 1)}
-                  className={`${thCls} bg-indigo-50 text-indigo-600 text-center`}
+                  colSpan={tierSpan(tierRow, ci)}
+                  className={`${thCls} text-center ${cell.label === "" ? "bg-white" : "bg-indigo-50 text-indigo-600"}`}
                 >
                   {cell.label}
                 </th>
@@ -10223,7 +10226,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
             }
             {hasColumns
               ? colValues.flatMap((_, ci) =>
-                  colValueItems.map(({ item, vi }) => (
+                  colItemsAt(ci).map(({ item, vi }) => (
                     <th key={`${ci}-${vi}`} className={`${thCls} bg-gray-50 ${alignClass(fieldFormats[item.id], "right")} min-w-[110px]`}>
                       <span className="text-[10px] text-gray-400 font-normal mr-1">{aggregations[item.id]}</span>
                       <span className="text-emerald-600">{fieldItemLabel(item, fieldFormats)}</span>
@@ -10300,7 +10303,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                   {/* Value cells */}
                   {hasColumns
                     ? colValues.flatMap((_, ci) =>
-                        colValueItems.map(({ item, vi }) => (
+                        colItemsAt(ci).map(({ item, vi }) => (
                           <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
                             {numCellValue(cellNum(ri, ci, vi), fieldFormats[item.id])}{currencySuffix(item, [bucketRows(ri, ci)])}
                           </td>
@@ -10327,7 +10330,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                     </td>
                     {hasColumns
                       ? colValues.flatMap((_, ci) =>
-                          colValueItems.map(({ item, vi }) => {
+                          colItemsAt(ci).map(({ item, vi }) => {
                             const groupIndices = displayRows.flatMap((r, idx) => r[0] === combo[0] ? [idx] : [])
                             const subtotal = groupCell(groupIndices, ci, vi)
                             const buckets = groupIndices.map((absRi) => bucketRows(absRi, ci))
@@ -10371,7 +10374,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
               <td className={`${tdCls} text-gray-800`} colSpan={Math.max(1, rowSamples.length)}>Grand Total</td>
               {hasColumns
                 ? colValues.flatMap((_, ci) =>
-                    colValueItems.map(({ item, vi }) => (
+                    colItemsAt(ci).map(({ item, vi }) => (
                       <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums`}>
                         {numCellValue(groupCell(allLeaves, ci, vi), fieldFormats[item.id])}{currencySuffix(item, displayRows.map((_, ri) => bucketRows(ri, ci)))}
                       </td>
