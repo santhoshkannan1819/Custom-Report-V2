@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useLayoutEffect, Fragment } from "react"
+import { useState, useRef, useEffect, useLayoutEffect, useMemo, Fragment } from "react"
 import { createPortal } from "react-dom"
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -2291,6 +2291,31 @@ function timelineDataExtent(metricKeys: string[], window: DateWindow | null): [n
     })
   })
   return lo <= hi ? [lo, hi] : null
+}
+
+// What a Timeline filter can pick at one granularity: the periods its metrics have records in,
+// read from each metric's own date (hours when logged, allocations when booked…) rather than a
+// generic calendar. Recurring granularities run in calendar order (every January together),
+// the rest chronologically.
+function timelineActualValues(metricKeys: string[], gran: string): string[] {
+  const order = new Map<string, number>()
+  new Set(metricKeys.map(fieldKeyModule)).forEach((mod) => {
+    const df = ROLLUP_DATE_FIELD[mod]
+    if (!df) return
+    ;(MODULE_ROWS[mod] ?? []).forEach((r) => {
+      const v = r[df]
+      if (!v) return
+      const d = v instanceof Date ? v : new Date(v)
+      const label = bucketDateLabel(d, gran)
+      const key = gran === "Month" ? d.getMonth()
+        : gran === "Quarter" ? quarterOf(d)
+        : gran === "Week" ? isoWeekNumber(d)
+        : d.getTime()
+      const prev = order.get(label)
+      if (prev === undefined || key < prev) order.set(label, key)
+    })
+  })
+  return [...order.entries()].sort((a, b) => a[1] - b[1]).map(([label]) => label)
 }
 
 // Does this metric chip answer to the Timeline? Only time-tracked metrics can, and the user may
@@ -4638,6 +4663,7 @@ function FieldBrowser({
   onDupAlert,
   onDragStart,
   onDragEnd,
+  timelineBlocked,
 }: {
   fields: PivotFields
   source: string
@@ -4646,8 +4672,12 @@ function FieldBrowser({
   onDupAlert: (field: string, count: number) => void
   onDragStart: (field: string, type: FieldType) => void
   onDragEnd: () => void
+  /** Why the Timeline can't be used yet — it only ever acts on time-tracked metrics, so it is
+      locked until the report has one. Null when it can. */
+  timelineBlocked: string | null
 }) {
   const [search, setSearch] = useState("")
+  const [tlTipAt, setTlTipAt] = useState<{ x: number; y: number } | null>(null)
   // Only the source module starts expanded — everything else joined in is collapsed
   // until the user opens it, so switching source doesn't dump the whole catalog open.
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => {
@@ -4914,6 +4944,23 @@ function FieldBrowser({
           {(search.trim() === "" || "timeline".includes(search.trim().toLowerCase())) && (() => {
             const inRows = fields.rows.find((it) => it.field === TIMELINE_KEY)
             const inColumns = fields.columns.find((it) => it.field === TIMELINE_KEY)
+            // Once placed it can always be taken out again, even if its metrics have since gone.
+            const locked = !!timelineBlocked && !inRows && !inColumns
+            if (locked) {
+              return (
+                <div
+                  aria-disabled
+                  onMouseMove={(e) => setTlTipAt({ x: e.clientX, y: e.clientY })}
+                  onMouseLeave={() => setTlTipAt(null)}
+                  className="flex items-center gap-2 mx-2 mb-1 px-2.5 py-1.5 rounded-md border border-gray-200 bg-gray-50
+                    cursor-not-allowed select-none"
+                >
+                  <span className="shrink-0 text-gray-300"><Ic.Calendar /></span>
+                  <span className="text-[13px] font-medium flex-1 text-gray-400">Timeline</span>
+                  {tlTipAt && <CursorTooltip text={timelineBlocked!} at={tlTipAt} />}
+                </div>
+              )
+            }
             return (
               <div
                 draggable
@@ -6158,12 +6205,15 @@ function RangeSlider({ min, max, value, value2, onChange }: {
   )
 }
 
-function DateFilterModal({ rule, onChange, onClose, strip }: {
+function DateFilterModal({ rule, onChange, onClose, strip, timelineMetricKeys }: {
   rule: FilterRule
   onChange: (patch: Partial<FilterRule>) => void
   onClose: () => void
   /** Rendered under the header — the Timeline's "Applies to". */
   strip?: React.ReactNode
+  /** Timeline only: the metrics it governs. Actual Data then lists the periods their own dates
+      fall in, instead of a field's values. */
+  timelineMetricKeys?: string[]
 }) {
   // Every record behind a time-tracked metric has a date, so the Timeline has no nulls to include.
   const showNull = rule.field !== TIMELINE_KEY
@@ -6174,7 +6224,13 @@ function DateFilterModal({ rule, onChange, onClose, strip }: {
   const [search, setSearch] = useState("")
 
   const granList = DATE_GRANULARITY.map((g) => g.label)
-  const actualOptions = (ACTUAL_DATE_VALUES[gran] ?? []).filter(v =>
+  const metricKeysSig = timelineMetricKeys?.join("|")
+  const allActual = useMemo(
+    () => timelineMetricKeys ? timelineActualValues(timelineMetricKeys, gran) : (ACTUAL_DATE_VALUES[gran] ?? []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [gran, metricKeysSig],
+  )
+  const actualOptions = allActual.filter(v =>
     v.toLowerCase().includes(search.toLowerCase())
   )
   const relativeOpts = RELATIVE_OPTIONS[gran] ?? []
@@ -6280,9 +6336,9 @@ function DateFilterModal({ rule, onChange, onClose, strip }: {
                 </div>
                 {/* Select all/none */}
                 <div className="flex items-center justify-between px-4 py-1.5 border-b border-gray-100 bg-gray-50">
-                  <span className="text-[11px] text-gray-400">{selectedValues.length} of {(ACTUAL_DATE_VALUES[gran] ?? []).length} selected</span>
+                  <span className="text-[11px] text-gray-400">{selectedValues.length} of {allActual.length} selected</span>
                   <div className="flex gap-2">
-                    <button onClick={() => onChange({ values: ACTUAL_DATE_VALUES[gran] ?? [] })} className="text-[11px] text-indigo-500 hover:text-indigo-700 font-medium">All</button>
+                    <button onClick={() => onChange({ values: allActual })} className="text-[11px] text-indigo-500 hover:text-indigo-700 font-medium">All</button>
                     <button onClick={() => onChange({ values: [] })} className="text-[11px] text-gray-400 hover:text-gray-600">None</button>
                   </div>
                 </div>
@@ -7269,6 +7325,14 @@ function timelineMetricItems(fields: PivotFields): PivotItem[] {
   })
 }
 
+// The metrics a Timeline filter governs — all but the exempted ones. With every one exempted, all
+// of them, so the period list still has something to describe.
+function timelineGovernedKeys(fields: PivotFields, rule: FilterRule): string[] {
+  const metrics = timelineMetricItems(fields)
+  const governed = metrics.filter((m) => !(rule.tlExempt ?? []).includes(m.id))
+  return (governed.length > 0 ? governed : metrics).map((m) => m.field)
+}
+
 // The Timeline filter's one addition to the ordinary date modal: which time-tracked metrics it
 // governs. All of them by default; unticking one exempts it, and it keeps its own calendar.
 // Styled as the role strip ("Matched through") is, since both qualify what the filter acts on.
@@ -7536,6 +7600,7 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
         <DateFilterModal
           rule={rule} onChange={onChange} onClose={() => setOpen(false)}
           strip={isTimeline ? <TimelineAppliesStrip rule={rule} fields={fields} onChange={onChange} /> : undefined}
+          timelineMetricKeys={isTimeline ? timelineGovernedKeys(fields, rule) : undefined}
         />
       )}
 
@@ -8915,7 +8980,12 @@ function TabularBuilder() {
 
   const makeRule = (name: string, type: FieldType) => makeFilterRule(name, type)
 
+  // In a flat list the Timeline is a filter on time-tracked columns, so it needs one first.
+  const timelineBlocked = fields.columns.some((c) => TIMELINE_METRICS_SET.has(c.field))
+    ? null : "Add a time-tracked field to Columns first"
+
   const handleFilterDrop = (name: string, type: FieldType) => {
+    if (name === TIMELINE_KEY && timelineBlocked) return
     if (!hasAnyField) { setNeedsFieldAlert(true); return }
     setFilterRules((prev) => (prev.find((r) => r.field === name) ? prev : [...prev, makeRule(name, type)]))
     setJustDroppedFilter(name)
@@ -9016,6 +9086,7 @@ function TabularBuilder() {
           <FieldBrowser
             fields={pivotShape}
             source={source}
+            timelineBlocked={timelineBlocked}
             onAdd={(zone, field, type) => addField(zoneOf(zone), field, type)}
             onRemove={(zone, id) => removeField(zoneOf(zone), id)}
             onDupAlert={(name) => setDupAlert(name)}
@@ -10459,7 +10530,12 @@ export default function App() {
     })
   }
 
+  // The Timeline only ever acts on time-tracked metrics, so it stays locked until one is in Values.
+  const timelineBlocked = fields.values.some((v) => TIMELINE_METRICS_SET.has(v.field))
+    ? null : "Add a time-tracked metric to Values first"
+
   const handleFilterDrop = (name: string, type: FieldType) => {
+    if (name === TIMELINE_KEY && timelineBlocked) return
     if (fields.columns.length === 0 && fields.rows.length === 0 && fields.values.length === 0) {
       setShowFilterNeedsFieldAlert(true)
       return
@@ -10540,6 +10616,7 @@ export default function App() {
   // carry its own aggregation/timeline-filter state, so both are keyed by this fresh id, never
   // by the field key itself (which duplicate pills would otherwise share).
   const handleAdd = (zone: PivotZoneKey, field: string, type: FieldType) => {
+    if (field === TIMELINE_KEY && timelineBlocked) return
     // Timeline splits metrics into periods, down the rows or across the columns; as a value it
     // would have nothing to add up. One is enough.
     if (field === TIMELINE_KEY
@@ -10680,6 +10757,7 @@ export default function App() {
                 <FieldBrowser
                   fields={fields}
                   source={source}
+                  timelineBlocked={timelineBlocked}
                   onAdd={handleAdd}
                   onRemove={handleRemove}
                   onDupAlert={(name) => setDupAlert(name)}
