@@ -4692,7 +4692,14 @@ function FieldBrowser({
   const added = allAddedFields(fields)
   const allChips = [...fields.columns, ...fields.rows, ...fields.values]
   const fieldCount = (key: string) => allChips.filter((item) => item.field === key).length
-  const query = search.toLowerCase()
+  const query = search.trim().toLowerCase()
+  // Searching opens every module it finds something in — a match hidden inside a collapsed
+  // module reads as no match at all. The user can still fold one away mid-search; that is kept
+  // apart from their normal open/closed choices, and forgotten when the search changes.
+  const [searchCollapsed, setSearchCollapsed] = useState<Record<string, boolean>>({})
+  useEffect(() => { setSearchCollapsed({}) }, [query])
+  const isModuleCollapsed = (name: string) => (query ? !!searchCollapsed[name] : !!collapsed[name])
+  const toggleModule = (name: string) => (query ? setSearchCollapsed : setCollapsed)((p) => ({ ...p, [name]: !p[name] }))
 
   // Only modules reachable from the current source are browsable — the source decides
   // which other modules can be joined in, the module itself decides what it contains.
@@ -4705,7 +4712,8 @@ function FieldBrowser({
     .filter((m): m is Module => !!m)
     .map((m) => {
     let mFields = m.fields
-    if (query) mFields = mFields.filter((f) => f.name.toLowerCase().includes(query))
+    // A search naming the module ("account") lists all of it; otherwise it matches field names.
+    if (query && !m.name.toLowerCase().includes(query)) mFields = mFields.filter((f) => f.name.toLowerCase().includes(query))
     if (showInvolved) mFields = mFields.filter((f) => added.has(makeFieldKey(m.name, f.name)))
     if (typeFilters.length > 0) mFields = mFields.filter((f) => typeFilters.includes(f.type))
     if (onlyTimeTracked) mFields = mFields.filter((f) => TIMELINE_METRICS_SET.has(makeFieldKey(m.name, f.name)))
@@ -4975,12 +4983,12 @@ function FieldBrowser({
               {showInvolved ? "No fields in use yet" : "No fields match your filters"}
             </p>
           ) : processedModules.map((mod) => {
-            const isCollapsed = !!collapsed[mod.name]
+            const isCollapsed = isModuleCollapsed(mod.name)
             const addedCount = mod.fields.filter((f) => added.has(makeFieldKey(mod.name, f.name))).length
             return (
               <div key={mod.name}>
                 <button
-                  onClick={() => setCollapsed((p) => ({ ...p, [mod.name]: !p[mod.name] }))}
+                  onClick={() => toggleModule(mod.name)}
                   className="flex items-center gap-1.5 w-full px-3 py-2 hover:bg-gray-50 transition-colors"
                 >
                   <span className="text-gray-400" style={{ transform: isCollapsed ? "rotate(-90deg)" : "rotate(0deg)", display: "inline-block" }}>
