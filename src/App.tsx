@@ -24,6 +24,9 @@ type AppMode = "reports" | "dashboard" | "tabular"
 interface Field {
   name: string
   type: FieldType
+  /** One answer can hold several values (a checkbox question, a multi-user pick). Grouping on it
+      puts a record under every value it has; totals still count the record once. */
+  multi?: boolean
 }
 
 interface Module {
@@ -107,6 +110,124 @@ const ALL_TIMELINE_METRICS = TIMELINE_GROUPS.flatMap(g => g.metrics)
 // Set for O(1) membership checks — this gets tested per field row in the browser tree
 // (potentially hundreds of rows), not just for the one field a user has already added.
 const TIMELINE_METRICS_SET = new Set(ALL_TIMELINE_METRICS)
+
+// ── Form templates ─────────────────────────────────────────────────────────────
+// A Forms report is always about ONE template: its questions are the fields, so the template is
+// picked with the source and behaves as one — each template is its own source module, holding the
+// submission details and that template's questions. Question kinds mirror the form builder's.
+
+type FormQuestionKind =
+  | "shortText" | "longText" | "email" | "phone" | "statement"
+  | "radio" | "dropdown" | "checkbox" | "multiDropdown"
+  | "singleGrid" | "multiGrid"
+  | "number" | "currency" | "rating" | "percent" | "date"
+  | "user" | "multiUser" | "attachment"
+
+interface FormQuestion {
+  text: string
+  kind: FormQuestionKind
+  options?: string[]
+  /** Grid questions only: each row is answered on its own. */
+  gridRows?: string[]
+}
+
+interface FormTemplate { name: string; questions: FormQuestion[] }
+
+const FORM_TEMPLATES: FormTemplate[] = [
+  {
+    name: "Kickoff Questionnaire",
+    questions: [
+      { text: "Welcome — this takes about five minutes", kind: "statement" },
+      { text: "Primary goal", kind: "radio", options: ["Faster onboarding", "Lower delivery cost", "Better visibility", "Compliance"] },
+      { text: "Modules in scope", kind: "checkbox", options: ["Projects", "Time tracking", "Resourcing", "Financials", "Customer portal"] },
+      { text: "Integrations needed", kind: "multiDropdown", options: ["Salesforce", "HubSpot", "Jira", "Slack", "NetSuite"] },
+      { text: "Team size", kind: "number" },
+      { text: "Target go-live", kind: "date" },
+      { text: "Executive sponsor", kind: "user" },
+      { text: "Stakeholders", kind: "multiUser" },
+      { text: "Additional context", kind: "longText" },
+    ],
+  },
+  {
+    name: "Client Feedback Form",
+    questions: [
+      { text: "Overall satisfaction", kind: "rating" },
+      { text: "Would recommend", kind: "radio", options: ["Yes", "Maybe", "No"] },
+      { text: "What went well", kind: "checkbox", options: ["Communication", "Timeliness", "Quality", "Expertise", "Responsiveness"] },
+      { text: "Rate each area", kind: "singleGrid", gridRows: ["Communication", "Delivery", "Support"], options: ["Poor", "Fair", "Good", "Excellent"] },
+      { text: "Comments", kind: "longText" },
+      { text: "Contact email", kind: "email" },
+    ],
+  },
+  {
+    name: "Change Request",
+    questions: [
+      { text: "Change type", kind: "dropdown", options: ["Scope", "Timeline", "Budget", "Resourcing"] },
+      { text: "Priority", kind: "dropdown", options: ["Low", "Medium", "High", "Urgent"] },
+      { text: "Impacted areas", kind: "multiDropdown", options: ["Design", "Build", "Testing", "Training", "Go-live"] },
+      { text: "Estimated cost", kind: "currency" },
+      { text: "Extra hours", kind: "number" },
+      { text: "Needed by", kind: "date" },
+      { text: "Requested by", kind: "user" },
+      { text: "Supporting documents", kind: "attachment" },
+    ],
+  },
+  {
+    name: "Risk Assessment",
+    questions: [
+      { text: "Risk level", kind: "radio", options: ["Low", "Medium", "High", "Critical"] },
+      { text: "Risk areas by phase", kind: "multiGrid", gridRows: ["Planning", "Execution", "Go-live"], options: ["Scope", "Budget", "Resourcing", "Technical"] },
+      { text: "Likelihood", kind: "percent" },
+      { text: "Mitigation owners", kind: "multiUser" },
+      { text: "Mitigation plan", kind: "longText" },
+      { text: "Review date", kind: "date" },
+      { text: "Evidence", kind: "attachment" },
+    ],
+  },
+]
+const FORM_TEMPLATE_NAMES = new Set(FORM_TEMPLATES.map((t) => t.name))
+const isFormTemplateSource = (source: string) => FORM_TEMPLATE_NAMES.has(source)
+/** What the source picker shows: a template reads as "Forms · <template>". */
+const sourceLabel = (source: string) => (isFormTemplateSource(source) ? `Forms · ${source}` : source)
+
+// A question becomes one field, except: a statement holds no answer (none); a grid is answered row
+// by row (one field per row, named "[row] question"); an attachment reports as a file count and a
+// yes/no. A single choice grid row takes one pick, so it is an ordinary single-choice field.
+interface FormAnswerField extends Field { question: FormQuestion; gridRow?: string; part?: "count" | "has" }
+function formQuestionFields(q: FormQuestion): FormAnswerField[] {
+  switch (q.kind) {
+    case "statement": return []
+    case "singleGrid":
+    case "multiGrid":
+      return (q.gridRows ?? []).map((r) => ({ name: `[${r}] ${q.text}`, type: "text", multi: q.kind === "multiGrid", question: q, gridRow: r }))
+    case "attachment":
+      return [
+        { name: `${q.text}: File count`, type: "number", question: q, part: "count" },
+        { name: `${q.text}: Has attachment`, type: "boolean", question: q, part: "has" },
+      ]
+    case "checkbox": case "multiDropdown": return [{ name: q.text, type: "text", multi: true, question: q }]
+    case "multiUser": return [{ name: q.text, type: "person", multi: true, question: q }]
+    case "user": return [{ name: q.text, type: "person", question: q }]
+    case "number": case "rating": return [{ name: q.text, type: "number", question: q }]
+    case "currency": return [{ name: q.text, type: "money", question: q }]
+    case "percent": return [{ name: q.text, type: "percent", question: q }]
+    case "date": return [{ name: q.text, type: "date", question: q }]
+    default: return [{ name: q.text, type: "text", question: q }]
+  }
+}
+
+// The submission's own details, ahead of the questions in every template.
+const FORM_SUBMISSION_FIELDS: Field[] = [
+  { name: "Submission Date", type: "date" },
+  { name: "Submitted By", type: "person" },
+  { name: "Template Version", type: "text" },
+]
+
+// Every answer field, by its "Template::Field" key — so blanks read "(No answer)", choices keep the
+// form's own option order, and Count means "answered".
+const FORM_ANSWER_FIELDS = new Map<string, FormAnswerField>()
+FORM_TEMPLATES.forEach((t) => t.questions.flatMap(formQuestionFields)
+  .forEach((f) => FORM_ANSWER_FIELDS.set(`${t.name}::${f.name}`, f)))
 
 // ── Field catalog ──────────────────────────────────────────────────────────────
 
@@ -443,12 +564,6 @@ const MODULES: Module[] = [
     ],
   },
   {
-    name: "Form questions",
-    iconType: "misc",
-    canBeSource: false,
-    fields: [],
-  },
-  {
     name: "Invoice",
     iconType: "metrics",
     canBeSource: false,
@@ -590,6 +705,13 @@ const MODULES: Module[] = [
     canBeSource: false,
     fields: [],
   },
+  // One per form template: the submission details, then the template's questions.
+  ...FORM_TEMPLATES.map((t): Module => ({
+    name: t.name,
+    iconType: "misc",
+    canBeSource: true,
+    fields: [...FORM_SUBMISSION_FIELDS, ...t.questions.flatMap(formQuestionFields).map(({ name, type, multi }) => ({ name, type, multi }))],
+  })),
 ]
 
 // Which modules are reachable from each source, per MODULES.md's "which modules each
@@ -604,9 +726,13 @@ const SOURCE_MODULES: Record<string, string[]> = {
   "Role": ["Role", "People", "Time tracking", "Capacity", "Allocations", "Actual financials", "Leave & holiday", "Project", "Estimated financials", "Daily rollup", "Task"],
   "Account": ["Account", "Project", "Actual financials", "Time tracking", "Invoice", "Revenue entries", "Budget", "Meeting", "Daily rollup", "Task"],
   "Forms": ["Forms", "Project", "Account", "Task", "Phase", "People"],
+  // A Forms report runs on one template. Each submission belongs to a task (and so its phase,
+  // project and account), and People is reached through who submitted it.
+  ...Object.fromEntries(FORM_TEMPLATES.map((t) => [t.name, [t.name, "Project", "Account", "Task", "Phase", "People"]])),
 }
 
-const SOURCE_OPTIONS = Object.keys(SOURCE_MODULES)
+// "Forms" opens the template list rather than being a source of its own.
+const SOURCE_OPTIONS = ["Time tracking", "Project", "Task", "Budget", "People", "Role", "Account", "Forms"]
 
 const AGG_OPTIONS = ["Sum", "Count", "Distinct Count", "Average", "Min", "Max"]
 
@@ -646,8 +772,8 @@ function fieldValues(key: string, type: FieldType): string[] | null {
   if (!rows || rows.length === 0) return null
   const values = new Set<string>()
   rows.forEach((row) => {
-    const v = row[field]
-    if (v != null && v !== "") values.add(String(v))
+    const raw = row[field]
+    ;(Array.isArray(raw) ? raw : [raw]).forEach((v) => { if (v != null && v !== "") values.add(String(v)) })
   })
   return values.size > 0 ? [...values].sort((a, b) => a.localeCompare(b)) : null
 }
@@ -979,6 +1105,13 @@ function getFieldType(key: string): FieldType {
   return field?.type ?? "text"
 }
 
+const MULTI_FIELDS = new Set<string>()
+// Filled once MODULES exists — read through isMultiField, never before render.
+function isMultiField(key: string): boolean {
+  if (MULTI_FIELDS.size === 0) MODULES.forEach((m) => m.fields.forEach((f) => { if (f.multi) MULTI_FIELDS.add(makeFieldKey(m.name, f.name)) }))
+  return MULTI_FIELDS.has(key)
+}
+
 // Which module a field belongs to (for detecting when a report spans more than one module).
 function getFieldModule(key: string): string | null {
   const mod = fieldKeyModule(key)
@@ -997,10 +1130,9 @@ const JOIN_EDGES: JoinEdge[] = [
   { from: "Budget", to: "Project", label: "Project" },
 
   { from: "Forms", to: "Account", label: "Company" },
-  { from: "Forms", to: "Form questions", label: "Form instance" },
-  { from: "Forms", to: "Task", label: "Form instance" },
   { from: "Forms", to: "Project", label: "Project" },
   { from: "Forms", to: "Task", label: "Task" },
+  { from: "Forms", to: "People", label: "Submitted by" },
 
   { from: "People", to: "Account", label: "Company" },
   { from: "People", to: "Role", label: "Role" },
@@ -1827,7 +1959,83 @@ const CAPACITY: Row[] = PEOPLE.flatMap((person) => {
 })
 
 // ── Module → rows, and the join/grain machinery that resolves any field from any row ──
+// ── Form submissions: answers ─────────────────────────────────────────────────────
+// Its own seeded generator, and run after every other generator, so adding answers shifts no
+// other module's numbers. Each submission is tied to a task on its project, and to the person who
+// submitted it, so Task / Phase / People resolve as plain lookups. More submissions are added per
+// project than the base set so a template has enough answers to group on.
+const formRng = makeRng(20261027)
+const fInt = (min: number, max: number) => Math.floor(formRng() * (max - min + 1)) + min
+const fPick = <T,>(arr: T[]): T => arr[fInt(0, arr.length - 1)]
+const fSubset = <T,>(arr: T[], min: number, max: number): T[] =>
+  [...arr].sort(() => formRng() - 0.5).slice(0, Math.min(arr.length, fInt(min, max)))
+
+function formAnswer(q: FormQuestion, field: FormAnswerField, team: Row[]): any {
+  if (formRng() < 0.12) return field.multi ? [] : null // left blank
+  const opts = q.options ?? []
+  switch (q.kind) {
+    case "radio": case "dropdown": case "singleGrid": return fPick(opts)
+    case "checkbox": case "multiDropdown": case "multiGrid": return fSubset(opts, 1, 3).sort((a, b) => opts.indexOf(a) - opts.indexOf(b))
+    case "user": return fPick(team)["Team member name"]
+    case "multiUser": return fSubset(team, 1, 3).map((p) => p["Team member name"])
+    case "rating": return fInt(1, 5)
+    case "number": return fInt(1, q.text === "Team size" ? 40 : 60)
+    case "currency": return fInt(2, 80) * 500
+    case "percent": return fInt(1, 19) * 5
+    case "date": return addDays(TODAY, fInt(-60, 120))
+    case "email": return `${fPick(["ops", "pm", "cs", "it"])}@${fPick(COMPANY_NAMES).toLowerCase().replace(/[^a-z]/g, "")}.com`
+    case "attachment": {
+      const files = fInt(1, 4)
+      return field.part === "count" ? files : true
+    }
+    default: return fPick(["Looks good so far", "Need more training sessions", "Timeline feels tight", "Great collaboration", "Waiting on data migration"])
+  }
+}
+
+function fillFormSubmission(row: Row, project: Row): void {
+  const template = FORM_TEMPLATES.find((t) => t.name === row["Template Name"]) ?? FORM_TEMPLATES[0]
+  const team: Row[] = project.teamIds.map((id: string) => PEOPLE_BY_ID[id])
+  const task = fPick(TASKS_BY_PROJECT[project.id] ?? [])
+  const submitter = PEOPLE.find((p) => p["Team member name"] === row["Submitted By"]) ?? fPick(team)
+  row.taskId = task?.id ?? null
+  row.phaseId = task?.phaseId ?? null
+  row.userId = submitter.id
+  row["Submitted By"] = submitter["Team member name"]
+  row["Template Version"] = row["Template Version Id"]
+  template.questions.forEach((q) => {
+    const fields = formQuestionFields(q)
+    if (q.kind === "attachment") {
+      // One upload decision drives both of its fields.
+      const files = formRng() < 0.35 ? 0 : fInt(1, 4)
+      row[fields[0].name] = files || null
+      row[fields[1].name] = files > 0
+      return
+    }
+    fields.forEach((f) => { row[f.name] = formAnswer(q, f, team) })
+  })
+}
+
+FORMS.forEach((row) => fillFormSubmission(row, PROJECTS_BY_ID[row.projectId]))
+PROJECTS.forEach((project, pi) => {
+  const extra = fInt(2, 5)
+  for (let i = 0; i < extra; i++) {
+    const team: Row[] = project.teamIds.map((id: string) => PEOPLE_BY_ID[id])
+    const row: Row = {
+      id: `form-x${pi}-${i}`, projectId: project.id, accountId: project.accountId,
+      "Template Name": fPick(FORM_TEMPLATES).name,
+      "Submission Date": new Date(project["Start Date"].getTime() + formRng() * Math.max(0, TODAY.getTime() - project["Start Date"].getTime())),
+      "Submitted By": fPick(team)["Team member name"],
+      "Template Version Id": `v${fInt(1, 3)}`,
+      "Answer Id": fInt(1000, 9999),
+    }
+    fillFormSubmission(row, project)
+    FORMS.push(row)
+  }
+})
+
 const MODULE_ROWS: Record<string, Row[]> = {
+  // Each template's submissions are that template's rows.
+  ...Object.fromEntries(FORM_TEMPLATES.map((t) => [t.name, FORMS.filter((r) => r["Template Name"] === t.name)])),
   "Account": ACCOUNTS,
   "Role": ROLES,
   "People": PEOPLE,
@@ -2038,6 +2246,9 @@ function resolveGroupCurrency(buckets: Row[][], grainModule: string): string | n
 // it must not itself depend on the roles they have chosen — otherwise picking a role could
 // change which roles are on offer.
 function pickGrain(source: string, fields: PivotFields, filterRules: FilterRule[], extra?: Set<string>): string {
+  // A form submission belongs to one task, project, account and submitter, so everything a
+  // template report reaches is a lookup from the submission: the records stay the submissions.
+  if (isFormTemplateSource(source)) return source
   const used = new Set<string>(extra)
   ;[...fields.columns, ...fields.rows, ...fields.values].forEach((item) => used.add(fieldKeyModule(item.field)))
   filterRules.forEach((r) => used.add(fieldKeyModule(r.field)))
@@ -2437,7 +2648,11 @@ function filterValuesForRow(grainModule: string, row: Row, rule: FilterRule): an
     const field = fieldDisplayName(rule.field)
     return ids.map((id) => DIMENSION_BY_ID[target]?.[id]?.[field])
   }
-  return [resolveFieldForRow(grainModule, row, rule.field, null, role)]
+  const v = resolveFieldForRow(grainModule, row, rule.field, null, role)
+  // A multi-value answer is tested value by value, like the members above; an empty one reads as
+  // a single blank so "none of" treats it the way it treats any blank.
+  if (Array.isArray(v)) return v.length > 0 ? v : [undefined]
+  return [v]
 }
 
 // "None of" and "not me" must hold for EVERY value a row has; the positive modes need just one.
@@ -2562,6 +2777,24 @@ function rangeBucketLabel(n: number, type: FieldType, bounds: { min: number; max
 interface FieldLabeler {
   label: (row: Row) => string
   sortKey: (row: Row) => number | string
+  /** Set for a multi-value field: every group the record belongs in, one per value it holds. */
+  labels?: (row: Row) => { label: string; sortKey: number | string }[]
+}
+
+// Every group a record falls in for this labeler: one normally, one per value for a multi-value one.
+function labelOptions(l: FieldLabeler, row: Row): { label: string; sortKey: number | string }[] {
+  return l.labels ? l.labels(row) : [{ label: l.label(row), sortKey: l.sortKey(row) }]
+}
+
+// Each record's group per labeler, crossed — a record with two values in one field and two in
+// another sits in four combinations.
+function labelCombos(labelers: FieldLabeler[], row: Row): { labels: string[]; sortKeys: (number | string)[] }[] {
+  let out: { labels: string[]; sortKeys: (number | string)[] }[] = [{ labels: [], sortKeys: [] }]
+  labelers.forEach((l) => {
+    const opts = labelOptions(l, row)
+    out = out.flatMap((c) => opts.map((o) => ({ labels: [...c.labels, o.label], sortKeys: [...c.sortKeys, o.sortKey] })))
+  })
+  return out
 }
 
 // `window` narrows a time-tracked field to the Timeline filter's period before it is grouped on —
@@ -2571,10 +2804,32 @@ function buildLabeler(grainModule: string, sampleRows: Row[], item: PivotItem, a
   const modifier = aggregations[item.id]
   const resolve = (row: Row) => resolveFieldForRow(grainModule, row, item.field, window, lookupPaths[item.id])
 
+  // A form answer: a skipped question groups as "(No answer)" — last — and choices keep the form's
+  // own option order rather than the alphabet.
+  const answer = FORM_ANSWER_FIELDS.get(item.field)
+  if (answer && !isNumericType(type) && type !== "date" && type !== "boolean") {
+    const order = answer.question.options ?? []
+    const keyOf = (v: string): number | string => { const i = order.indexOf(v); return i === -1 ? v : i }
+    // Last either way: past every option index, or past every name for a free-text / person answer.
+    const NO_ANSWER = { label: "(No answer)", sortKey: order.length ? Infinity : "\uffff" }
+    const values = (row: Row): string[] => {
+      const raw = resolve(row)
+      return (Array.isArray(raw) ? raw : [raw]).filter((v) => v != null && v !== "").map(String)
+    }
+    return {
+      label: (row) => values(row).join(", ") || NO_ANSWER.label,
+      sortKey: (row) => { const v = values(row); return v.length ? keyOf(v[0]) : NO_ANSWER.sortKey },
+      labels: answer.multi
+        ? (row) => { const v = values(row); return v.length ? v.map((x) => ({ label: x, sortKey: keyOf(x) })) : [NO_ANSWER] }
+        : undefined,
+    }
+  }
+
+  const blank = answer ? "(No answer)" : "(blank)"
   if (type === "date") {
     const gran = modifier || "Quarter & Year"
     return {
-      label: (row) => { const raw = resolve(row); return raw == null || raw === "" ? "(blank)" : bucketDateLabel(raw instanceof Date ? raw : new Date(raw), gran) },
+      label: (row) => { const raw = resolve(row); return raw == null || raw === "" ? blank : bucketDateLabel(raw instanceof Date ? raw : new Date(raw), gran) },
       sortKey: (row) => { const raw = resolve(row); return raw == null || raw === "" ? Infinity : (raw instanceof Date ? raw : new Date(raw)).getTime() },
     }
   }
@@ -2583,24 +2838,24 @@ function buildLabeler(grainModule: string, sampleRows: Row[], item: PivotItem, a
     const bounds = nums.length ? { min: Math.min(...nums), max: Math.max(...nums) } : { min: 0, max: 1 }
     const rangeConfig = rangeConfigs[item.id]
     return {
-      label: (row) => { const raw = resolve(row); return raw == null || raw === "" ? "(blank)" : rangeBucketLabel(Number(raw), type, bounds, rangeConfig) },
+      label: (row) => { const raw = resolve(row); return raw == null || raw === "" ? blank : rangeBucketLabel(Number(raw), type, bounds, rangeConfig) },
       sortKey: (row) => { const raw = resolve(row); return raw == null || raw === "" ? Infinity : Number(raw) },
     }
   }
   if (isNumericType(type)) { // "Dimension" mode — exact value
     return {
-      label: (row) => { const raw = resolve(row); return raw == null || raw === "" ? "(blank)" : String(raw) },
+      label: (row) => { const raw = resolve(row); return raw == null || raw === "" ? blank : String(raw) },
       sortKey: (row) => { const raw = resolve(row); return raw == null || raw === "" ? Infinity : Number(raw) },
     }
   }
   if (type === "boolean") {
     return {
-      label: (row) => { const raw = resolve(row); return raw == null ? "(blank)" : raw ? "Yes" : "No" },
+      label: (row) => { const raw = resolve(row); return raw == null ? blank : raw ? "Yes" : "No" },
       sortKey: (row) => { const raw = resolve(row); return raw == null ? "" : raw ? "0" : "1" },
     }
   }
   return {
-    label: (row) => { const raw = resolve(row); return raw == null || raw === "" ? "(blank)" : String(raw) },
+    label: (row) => { const raw = resolve(row); return raw == null || raw === "" ? blank : String(raw) },
     sortKey: (row) => { const raw = resolve(row); return raw == null || raw === "" ? "" : String(raw) },
   }
 }
@@ -2622,6 +2877,14 @@ function aggregateBucket(bucketRows: Row[], grainModule: string, item: PivotItem
     dateWindow = metricFilterWindow(timelineFilter)
   }
 
+  // Counting a question counts the submissions that answered it — a skipped question is not a
+  // response, and a multi-select answer is still one submission however many options it ticks.
+  if (agg === "Count" && FORM_ANSWER_FIELDS.has(item.field)) {
+    return bucketRows.filter((r) => {
+      const v = resolveFieldForRow(grainModule, r, item.field, null, role)
+      return Array.isArray(v) ? v.length > 0 : v != null && v !== "" && v !== false
+    }).length
+  }
   if (agg === "Count") {
     if (dateWindow && targetModule === grainModule) {
       const ownDateField = ROLLUP_DATE_FIELD[targetModule]
@@ -2645,7 +2908,9 @@ function aggregateBucket(bucketRows: Row[], grainModule: string, item: PivotItem
     if (v !== undefined && v !== null && v !== "") values.push(v)
   }
 
-  if (agg === "Distinct Count") return new Set(values.map((v) => String(v))).size
+  // Distinct values across the bucket — for a multi-value answer, the different options used.
+  if (agg === "Distinct Count") return new Set(values.flat().map((v) => String(v))).size
+  if (!isNumericType(type) && values.some(Array.isArray)) return values.filter((v) => !Array.isArray(v) || v.length > 0).length
   if (!isNumericType(type)) return values.length
 
   const nums = values.map(Number).filter((n) => !Number.isNaN(n))
@@ -2705,7 +2970,8 @@ function groupAggregateFromRows(rows: Row[], grainModule: string, fieldKey: stri
 }
 
 function comboAggregateValue(entry: ComboEntry, grainModule: string, fieldKey: string, agg: string): number {
-  return groupAggregateFromRows(([] as Row[]).concat(...entry.cols.values()), grainModule, fieldKey, agg)
+  // A record split across this group's columns is still one record of the group.
+  return groupAggregateFromRows([...new Set(([] as Row[]).concat(...entry.cols.values()))], grainModule, fieldKey, agg)
 }
 
 // The distinct, case-insensitive, blank-excluding value-set a group's rows carry for a
@@ -2787,9 +3053,11 @@ function previewGroupRows(
   const rowLabelers = rowFields.map((item) => buildLabeler(grainModule, filteredRows, item, aggregations, rangeConfigs, lookupPaths))
   const groups = new Map<string, Row[]>()
   filteredRows.forEach((row) => {
-    const key = rowLabelers.map((l) => l.label(row)).join("␟")
-    if (!groups.has(key)) groups.set(key, [])
-    groups.get(key)!.push(row)
+    labelCombos(rowLabelers, row).forEach(({ labels }) => {
+      const key = labels.join("␟")
+      if (!groups.has(key)) groups.set(key, [])
+      groups.get(key)!.push(row)
+    })
   })
   return { grainModule, groups: [...groups.values()] }
 }
@@ -2951,20 +3219,25 @@ function computeReportData(
   const colLabelSort = new Map<string, (number | string)[]>()
   const colLabelParts = new Map<string, string[]>()
 
+  // A multi-value field in Rows or Columns puts a record in every group it has a value for, so the
+  // same record can sit in several cells — and totals must then count it once, not once per cell.
+  const splitsRecords = [...rowLabelers, ...colLabelers].some((l) => !!l.labels)
   filteredRows.forEach((row) => {
-    const combo = rowLabelers.map((l) => l.label(row))
-    const sortTuple = rowLabelers.map((l) => l.sortKey(row))
-    const comboKey = combo.join(SEP)
-    if (!comboMap.has(comboKey)) comboMap.set(comboKey, { combo, sortTuple, cols: new Map() })
-    const entry = comboMap.get(comboKey)!
-    const colParts = colLabelers.map((l) => l.label(row))
-    const colLabel = colParts.join(SEP)
-    if (!entry.cols.has(colLabel)) entry.cols.set(colLabel, [])
-    entry.cols.get(colLabel)!.push(row)
-    if (colLabelers.length > 0 && !colLabelSort.has(colLabel)) {
-      colLabelSort.set(colLabel, colLabelers.map((l) => l.sortKey(row)))
-      colLabelParts.set(colLabel, colParts)
-    }
+    const colCombos = labelCombos(colLabelers, row)
+    labelCombos(rowLabelers, row).forEach(({ labels: combo, sortKeys: sortTuple }) => {
+      const comboKey = combo.join(SEP)
+      if (!comboMap.has(comboKey)) comboMap.set(comboKey, { combo, sortTuple, cols: new Map() })
+      const entry = comboMap.get(comboKey)!
+      colCombos.forEach(({ labels: colParts, sortKeys: colSort }) => {
+        const colLabel = colParts.join(SEP)
+        if (!entry.cols.has(colLabel)) entry.cols.set(colLabel, [])
+        entry.cols.get(colLabel)!.push(row)
+        if (colLabelers.length > 0 && !colLabelSort.has(colLabel)) {
+          colLabelSort.set(colLabel, colSort)
+          colLabelParts.set(colLabel, colParts)
+        }
+      })
+    })
   })
 
   const compareKey = (a: number | string, b: number | string) =>
@@ -3146,10 +3419,29 @@ function computeReportData(
     return any ? sum : NaN
   }
   const allCols = hasColumns ? colValues.map((_, ci) => ci) : [0]
+  // When records were split across groups, a total is the measure over the distinct records it
+  // covers — the same submission under two options adds to the total once.
+  const distinctTotal = (cells: [number, number][], vi: number): number => {
+    const item = fields.values[vi]
+    if (!item) return 0
+    const rows = [...new Set(cells.flatMap(([ri, ci]) => bucketRows(ri, ci)))]
+    const { type, agg } = aggOf(item)
+    if (tlWindow && follows(item)) return aggregateBucket(rows, grainModule, item, agg, type, undefined, lookupPaths[item.id], tlWindow)
+    return aggregateBucket(rows, grainModule, item, agg, type, timelineFilters[item.id], lookupPaths[item.id])
+  }
+  // The same holds for any measure that doesn't add up: the total of a distinct count, an average,
+  // a min or a max is that measure over the records, never the sum of the cells.
+  const NON_ADDITIVE = ["Distinct Count", "Average", "Min", "Max"]
+  const distinctTotals = (vi: number) => !tlActive && !tlRowActive
+    && (splitsRecords || (!!fields.values[vi] && NON_ADDITIVE.includes(aggOf(fields.values[vi]).agg)))
   const groupCell = (leaves: number[], ci: number, vi: number): number =>
-    sumShown(leaves.map((ri) => cellNum(ri, ci, vi)))
+    distinctTotals(vi)
+      ? distinctTotal(leaves.map((ri) => [ri, ci]), vi)
+      : sumShown(leaves.map((ri) => cellNum(ri, ci, vi)))
   const groupTotal = (leaves: number[], vi: number): number =>
-    sumShown(leaves.flatMap((ri) => allCols.map((ci) => cellNum(ri, ci, vi))))
+    distinctTotals(vi)
+      ? distinctTotal(leaves.flatMap((ri) => allCols.map((ci): [number, number] => [ri, ci])), vi)
+      : sumShown(leaves.flatMap((ri) => allCols.map((ci) => cellNum(ri, ci, vi))))
   const rowTotal = (ri: number, vi: number): number => groupTotal([ri], vi)
 
   const allLeaves = displayRows.map((_, ri) => ri)
@@ -3278,6 +3570,7 @@ function computeTabularData(
 // formatCellValue only knows numbers, and a flat table shows dates, text and booleans too —
 // so non-numeric values get sensible plain rendering and skip the numeric formatter entirely.
 function tabularCellText(raw: any, item: PivotItem, fieldFormats: Record<string, FieldFormat>): string {
+  if (Array.isArray(raw)) return raw.join(", ")
   if (raw == null || raw === "") return ""
   const type = getFieldType(item.field)
   if (isNumericType(type)) {
@@ -4234,6 +4527,66 @@ function PageHeader({ reportMode, onReportModeChange, onSave, justSaved, dirty, 
 
 // ── Toolbar ────────────────────────────────────────────────────────────────────
 
+// The source chooser, shared by both builders. Forms leads on to its templates: a Forms report is
+// always one template's, and picking one is picking the source (same confirm, same reset).
+function SourcePicker({ source, setSource }: { source: string; setSource: (s: string) => void }) {
+  const [open, setOpen] = useState(false)
+  const [templates, setTemplates] = useState(false)
+  const toggle = () => { setOpen((p) => !p); setTemplates(isFormTemplateSource(source)) }
+  const choose = (s: string) => { setSource(s); setOpen(false) }
+  const item = (label: string, active: boolean, onClick: () => void, trailing?: React.ReactNode) => (
+    <button
+      key={label}
+      onClick={onClick}
+      className={`flex items-center justify-between w-full px-3 py-1.5 text-[13px] text-left hover:bg-indigo-50 transition-colors
+        ${active ? "text-indigo-600 font-medium" : "text-gray-700"}`}
+    >
+      <span className="truncate">{label}</span>
+      {trailing ?? (active && <Ic.Check />)}
+    </button>
+  )
+  return (
+    <div className="relative">
+      <button
+        onClick={toggle}
+        className="flex items-center gap-1.5 text-gray-700 pr-3 border-r border-gray-200 hover:text-gray-900 transition-colors"
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
+        </svg>
+        <span className="font-semibold">{sourceLabel(source)}</span>
+        <Ic.ChevDown size={12} />
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-xl py-1 w-56">
+            {templates ? (
+              <>
+                <button
+                  onClick={() => setTemplates(false)}
+                  className="flex items-center gap-1 px-3 pt-2 pb-1 text-[10px] font-semibold text-gray-400 uppercase tracking-wider hover:text-gray-600"
+                >
+                  <span className="rotate-180 inline-flex"><Ic.ChevRight size={10} /></span>
+                  Forms · Template
+                </button>
+                {FORM_TEMPLATES.map((t) => item(t.name, source === t.name, () => choose(t.name)))}
+              </>
+            ) : (
+              <>
+                <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-3 pt-2 pb-1">Source</p>
+                {SOURCE_OPTIONS.map((opt) => opt === "Forms"
+                  ? item(opt, isFormTemplateSource(source), () => setTemplates(true), <span className="text-gray-400"><Ic.ChevRight size={11} /></span>)
+                  : item(opt, source === opt, () => choose(opt)))}
+              </>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 function Toolbar({ source, setSource, fields, reportView, onReportViewChange, showTotals, onShowTotalsChange, fieldFormats, onFieldFormatChange, showModuleTag, onShowModuleTagChange, showProjectCurrency, onShowProjectCurrencyChange, reportMode, viewBar }: {
   source: string; setSource: (s: string) => void
   /** The saved-views controls, which take over this bar's left side in view mode. */
@@ -4251,48 +4604,12 @@ function Toolbar({ source, setSource, fields, reportView, onReportViewChange, sh
   onShowProjectCurrencyChange: (v: boolean) => void
   reportMode: ReportMode
 }) {
-  const [open, setOpen] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   return (
     <div className="flex items-center gap-3 px-5 py-2 border-b border-gray-200 bg-white text-[13px] print-hide">
       {reportMode === "view" && viewBar}
       {/* Source chooser + Lookups — build-time-only, hidden in view mode */}
-      {reportMode === "create" && (
-        <>
-          <div className="relative">
-            <button
-              onClick={() => setOpen((p) => !p)}
-              className="flex items-center gap-1.5 text-gray-700 pr-3 border-r border-gray-200 hover:text-gray-900 transition-colors"
-            >
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
-              </svg>
-              <span className="font-semibold">{source}</span>
-              <Ic.ChevDown size={12} />
-            </button>
-            {open && (
-              <>
-                <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-                <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-xl py-1 w-44">
-                  <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-3 pt-2 pb-1">Source</p>
-                  {SOURCE_OPTIONS.map((opt) => (
-                    <button
-                      key={opt}
-                      onClick={() => { setSource(opt); setOpen(false) }}
-                      className={`flex items-center justify-between w-full px-3 py-1.5 text-[13px] hover:bg-indigo-50 transition-colors
-                        ${source === opt ? "text-indigo-600 font-medium" : "text-gray-700"}`}
-                    >
-                      {opt}
-                      {source === opt && <Ic.Check />}
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
-          </div>
-
-        </>
-      )}
+      {reportMode === "create" && <SourcePicker source={source} setSource={setSource} />}
 
       <div className="flex items-center gap-1 ml-auto">
         {/* Compact / Detail view toggle — also in the settings panel; both stay in sync */}
@@ -6142,7 +6459,7 @@ function SourceChangeConfirmModal({ nextSource, onConfirm, onCancel }: {
             </svg>
           </div>
           <div>
-            <p className="text-[15px] font-bold text-gray-900 mb-1">Switch source to "{nextSource}"?</p>
+            <p className="text-[15px] font-bold text-gray-900 mb-1">Switch source to "{sourceLabel(nextSource)}"?</p>
             <p className="text-[13px] text-gray-600 leading-relaxed">
               Every field currently in Columns, Rows, Values, and Filters will be cleared. This can't be undone.
             </p>
@@ -8659,44 +8976,11 @@ function TabularToolbar({
   fieldFormats: Record<string, FieldFormat>
   onFieldFormatChange: (id: string, patch: Partial<FieldFormat>) => void
 }) {
-  const [open, setOpen] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   return (
     <div className="flex items-center gap-3 px-5 py-2 border-b border-gray-200 bg-white text-[13px] print-hide">
       {reportMode === "view" && viewBar}
-      {reportMode === "create" && (
-        <div className="relative">
-          <button
-            onClick={() => setOpen((p) => !p)}
-            className="flex items-center gap-1.5 text-gray-700 pr-3 border-r border-gray-200 hover:text-gray-900 transition-colors"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/>
-            </svg>
-            <span className="font-semibold">{source}</span>
-            <Ic.ChevDown size={12} />
-          </button>
-          {open && (
-            <>
-              <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-              <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-xl py-1 w-44">
-                <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-3 pt-2 pb-1">Source</p>
-                {SOURCE_OPTIONS.map((opt) => (
-                  <button
-                    key={opt}
-                    onClick={() => { setSource(opt); setOpen(false) }}
-                    className={`flex items-center justify-between w-full px-3 py-1.5 text-[13px] hover:bg-indigo-50 transition-colors
-                      ${source === opt ? "text-indigo-600 font-medium" : "text-gray-700"}`}
-                  >
-                    {opt}
-                    {source === opt && <Ic.Check />}
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
-      )}
+      {reportMode === "create" && <SourcePicker source={source} setSource={setSource} />}
 
       <div className="flex items-center gap-1 ml-auto">
         <button
