@@ -272,6 +272,22 @@ const MODULES: Module[] = [
       { name: "Budget Actual Revenue", type: "money" },
       { name: "Budget Estimated Cost", type: "money" },
       { name: "Budget Estimated Revenue", type: "money" },
+      { name: "Status", type: "text" },
+      { name: "Actual time cost", type: "money" },
+      { name: "Estimated time cost", type: "money" },
+      { name: "Actual expense cost", type: "money" },
+      { name: "Estimated expense cost", type: "money" },
+      { name: "Subscription frequency", type: "text" },
+      { name: "No. of periods", type: "number" },
+      { name: "Subscription start", type: "date" },
+      { name: "Current period no.", type: "number" },
+      { name: "Current period start", type: "date" },
+      { name: "Current period end", type: "date" },
+      { name: "Current period revenue", type: "money" },
+      { name: "Current period budget", type: "money" },
+      { name: "Current period tracked time", type: "hours" },
+      { name: "Created at", type: "date" },
+      { name: "Last updated at", type: "date" },
     ],
   },
   {
@@ -284,6 +300,8 @@ const MODULES: Module[] = [
       { name: "Submitted By", type: "person" },
       { name: "Template Version Id", type: "text" },
       { name: "Answer Id", type: "number" },
+      { name: "Last edited by", type: "person" },
+      { name: "Last edited at", type: "date" },
     ],
   },
   {
@@ -331,6 +349,31 @@ const MODULES: Module[] = [
       { name: "Project Cost", type: "money" },
       { name: "Project Profit", type: "money" },
       { name: "Project Revenue", type: "money" },
+      { name: "Actual start date", type: "date" },
+      { name: "Actual end date", type: "date" },
+      { name: "Inferred progress", type: "text" },
+      { name: "Last status update", type: "date" },
+      { name: "Project age", type: "number" },
+      { name: "CSAT rating", type: "number" },
+      { name: "Last milestone CSAT", type: "number" },
+      { name: "Budgeted hours", type: "hours" },
+      { name: "% budgeted hours consumed", type: "percent" },
+      { name: "Remaining hours", type: "hours" },
+      { name: "Estimated cost", type: "money" },
+      { name: "Actual margin", type: "percent" },
+      { name: "Actual time cost", type: "money" },
+      { name: "Estimated time cost", type: "money" },
+      { name: "Actual expense cost", type: "money" },
+      { name: "Estimated expense cost", type: "money" },
+      { name: "Template", type: "text" },
+      { name: "Partners", type: "text", multi: true },
+      { name: "Current phases", type: "text", multi: true },
+      { name: "Total recognised revenue", type: "money" },
+      { name: "Customer members invited", type: "number" },
+      { name: "Customer members accepted", type: "number" },
+      { name: "Last allocation date", type: "date" },
+      { name: "Created at", type: "date" },
+      { name: "Last updated at", type: "date" },
     ],
   },
   {
@@ -370,6 +413,11 @@ const MODULES: Module[] = [
       { name: "Completed tasks", type: "number" },
       { name: "Remaining hours", type: "hours" },
       { name: "Assignees", type: "person" },
+      { name: "CSAT rating", type: "number" },
+      { name: "Type", type: "text" },
+      { name: "Description", type: "text" },
+      { name: "Created by", type: "person" },
+      { name: "Created at", type: "date" },
     ],
   },
   {
@@ -397,6 +445,16 @@ const MODULES: Module[] = [
       { name: "Actual Margin", type: "money" },
       { name: "Actual Profit", type: "money" },
       { name: "Rejected Hours", type: "hours" },
+      { name: "Notes", type: "text" },
+      { name: "Submitted by", type: "person" },
+      { name: "Submitted on", type: "date" },
+      { name: "Approved by", type: "person" },
+      { name: "Approved on", type: "date" },
+      { name: "Rejected by", type: "person" },
+      { name: "Rejected on", type: "date" },
+      { name: "Created by", type: "person" },
+      { name: "Created at", type: "date" },
+      { name: "Last updated at", type: "date" },
     ],
   },
 
@@ -414,6 +472,9 @@ const MODULES: Module[] = [
       { name: "Actual Time Cost", type: "money" },
       { name: "Bill Rate", type: "money" },
       { name: "Billable Hours", type: "hours" },
+      { name: "Tracked hours", type: "hours" },
+      { name: "Non-billable hours", type: "hours" },
+      { name: "Cost rate", type: "money" },
     ],
   },
   {
@@ -429,6 +490,9 @@ const MODULES: Module[] = [
       { name: "Soft allocated hours", type: "hours" },
       { name: "Work Type", type: "text" },
       { name: "Allocated Seconds", type: "hours" },
+      { name: "Start date", type: "date" },
+      { name: "End date", type: "date" },
+      { name: "Allocation medium", type: "text" },
     ],
   },
   {
@@ -437,6 +501,10 @@ const MODULES: Module[] = [
     canBeSource: false,
     fields: [
       { name: "Assignee effort", type: "hours" },
+      { name: "Created by", type: "person" },
+      { name: "Created at", type: "date" },
+      { name: "Last updated by", type: "person" },
+      { name: "Last updated at", type: "date" },
     ],
   },
   {
@@ -493,6 +561,11 @@ const MODULES: Module[] = [
       { name: "Estimated Revenue", type: "money" },
       { name: "Estimated cost", type: "money" },
       { name: "Hard Allocated Hours", type: "hours" },
+      { name: "Planned utilisation", type: "percent" },
+      { name: "Soft allocated hours", type: "hours" },
+      { name: "Tracked hours", type: "hours" },
+      { name: "Billable hours", type: "hours" },
+      { name: "Non-billable hours", type: "hours" },
     ],
   },
   {
@@ -523,6 +596,11 @@ const MODULES: Module[] = [
       { name: "Hard Allocated Hours", type: "hours" },
       { name: "Soft Allocated Hours", type: "hours" },
       { name: "Bill Rate", type: "money" },
+      { name: "Billable allocated hours", type: "hours" },
+      { name: "Non-billable allocated hours", type: "hours" },
+      { name: "Estimated time cost", type: "money" },
+      { name: "Estimated expense cost", type: "money" },
+      { name: "Cost rate", type: "money" },
     ],
   },
   {
@@ -2031,6 +2109,164 @@ PROJECTS.forEach((project, pi) => {
     fillFormSubmission(row, project)
     FORMS.push(row)
   }
+})
+
+// ── Fields today's product reports on, filled in after everything else ─────────────
+// Its own seeded generator, run last like the form answers, so these values shift no other
+// module's numbers.
+const auditRng = makeRng(20261029)
+const aInt = (min: number, max: number) => Math.floor(auditRng() * (max - min + 1)) + min
+const aPick = <T,>(arr: T[]): T => arr[aInt(0, arr.length - 1)]
+const notAfterToday = (d: Date) => (d > TODAY ? TODAY : d)
+const sumBy = (rows: Row[], key: string) => rows.reduce((s, r) => s + (Number(r[key]) || 0), 0)
+
+TIME_ENTRIES.forEach((e) => {
+  const person = PEOPLE_BY_ID[e.userId]
+  const approver = person["Timesheet approver"]
+  const date: Date = e["Created date"]
+  const createdAt = notAfterToday(addDays(date, aInt(0, 2)))
+  const submittedOn = notAfterToday(addDays(createdAt, aInt(0, 4)))
+  const decidedOn = notAfterToday(addDays(submittedOn, aInt(1, 4)))
+  const approved = e["Approved Status"] === "Approved"
+  const rejected = e["Approved Status"] === "Rejected"
+  e["Notes"] = auditRng() < 0.4 ? aPick(["Client call", "Follow-up on review comments", "Pairing session", "Blocked on access", "Prep for demo"]) : ""
+  e["Created by"] = auditRng() < 0.1 ? approver : person["Team member name"]
+  e["Created at"] = createdAt
+  e["Submitted by"] = person["Team member name"]
+  e["Submitted on"] = submittedOn
+  e["Approved by"] = approved ? approver : null
+  e["Approved on"] = approved ? decidedOn : null
+  e["Rejected by"] = rejected ? approver : null
+  e["Rejected on"] = rejected ? decidedOn : null
+  e["Last updated at"] = approved || rejected ? decidedOn : submittedOn
+})
+
+TASKS.forEach((t) => {
+  const project = PROJECTS_BY_ID[t.projectId]
+  const done = t["Status"] === "Completed"
+  t["CSAT rating"] = done && auditRng() < 0.3 ? aInt(3, 5) : null
+  t["Type"] = auditRng() < 0.12 ? "Milestone" : "Task"
+  t["Description"] = `${t["Task name"]} for ${project["Project Name"]}`
+  t["Created by"] = project["Project owner"]
+  t["Created at"] = addDays(t["Start date"], -aInt(3, 20))
+})
+
+ACTUAL_FINANCIALS.forEach((r) => {
+  const entries = (TIME_BY_TASK[r.taskId] ?? []).filter((e) => {
+    const d: Date = e["Created date"], m: Date = r["Recognised date"]
+    return d.getFullYear() === m.getFullYear() && d.getMonth() === m.getMonth()
+  })
+  r["Tracked hours"] = Math.round(sumBy(entries, "Tracked Hours") / 60)
+  r["Non-billable hours"] = Math.round(sumBy(entries, "Non Billable Hours") / 60)
+  r["Cost rate"] = ROLES_BY_ID[r.roleId]["Cost rate"]
+})
+
+ESTIMATED_FINANCIALS.forEach((r) => {
+  const task = TASKS_BY_ID[r.taskId]
+  const billable = task["Billable"] ? Math.round(r["Allocated Hours"] * 0.85) : 0
+  r["Billable allocated hours"] = billable
+  r["Non-billable allocated hours"] = r["Allocated Hours"] - billable
+  r["Estimated time cost"] = r["Estimated Cost"]
+  r["Estimated expense cost"] = Math.round(sumBy(EXPENSE_BY_TASK[r.taskId] ?? [], "Amount") * (0.9 + auditRng() * 0.3))
+  r["Cost rate"] = ROLES_BY_ID[r.roleId]["Cost rate"]
+})
+
+ALLOCATIONS.forEach((a) => {
+  const project = PROJECTS_BY_ID[a.projectId]
+  const start: Date = a["Allocation date"]
+  a["Start date"] = start
+  a["End date"] = new Date(Math.min(addDays(start, aInt(14, 60)).getTime(), project["Due Date"].getTime()))
+  a["Allocation medium"] = aPick(["Hours per day", "Total hours", "% of capacity"])
+})
+
+DAILY_ROLLUP.forEach((r) => {
+  const tracked = r["Allocated Hours"]
+  const billable = Math.round(tracked * (0.6 + auditRng() * 0.3))
+  r["Planned utilisation"] = aInt(60, 100)
+  r["Soft allocated hours"] = Math.max(0, r["Allocated Hours"] - r["Hard Allocated Hours"])
+  r["Tracked hours"] = tracked
+  r["Billable hours"] = billable
+  r["Non-billable hours"] = tracked - billable
+})
+
+ASSIGNEE_EFFORT.forEach((r) => {
+  const task = TASKS_BY_ID[r.taskId]
+  const project = PROJECTS_BY_ID[r.projectId]
+  r["Created by"] = project["Project owner"]
+  r["Created at"] = task["Created at"]
+  r["Last updated by"] = auditRng() < 0.5 ? project["Project owner"] : PEOPLE_BY_ID[task.userId]["Team member name"]
+  r["Last updated at"] = notAfterToday(addDays(task["Created at"], aInt(1, 40)))
+})
+
+FORMS.forEach((f) => {
+  const edited = auditRng() < 0.35
+  f["Last edited by"] = edited ? PEOPLE_BY_ID[PROJECTS_BY_ID[f.projectId].ownerId]["Team member name"] : f["Submitted By"]
+  f["Last edited at"] = edited ? notAfterToday(addDays(f["Submission Date"], aInt(1, 20))) : f["Submission Date"]
+})
+
+BUDGETS.forEach((b) => {
+  const project = PROJECTS_BY_ID[b.projectId]
+  const tasks = TASKS_BY_PROJECT[b.projectId] ?? []
+  const status = project["Project status"]
+  const retainer = project["Billing type"] === "Retainer"
+  const subStart: Date = project["Start Date"]
+  const periodNo = Math.max(1, Math.min(12, Math.floor((TODAY.getTime() - subStart.getTime()) / (30 * 86400000)) + 1))
+  const periodStart = addDays(subStart, (periodNo - 1) * 30)
+  const periodEntries = tasks.flatMap((t) => TIME_BY_TASK[t.id] ?? []).filter((e) => e["Created date"] >= periodStart)
+  b["Status"] = status === "Completed" || status === "Cancelled" ? "Completed" : status === "Not Started" ? "Proposed" : "Active"
+  b["Actual time cost"] = b["Budget Actual Cost"]
+  b["Estimated time cost"] = b["Budget Estimated Cost"]
+  b["Actual expense cost"] = tasks.reduce((s, t) => s + sumBy(EXPENSE_BY_TASK[t.id] ?? [], "Amount"), 0)
+  b["Estimated expense cost"] = Math.round(b["Actual expense cost"] * (1 + auditRng() * 0.25))
+  b["Subscription frequency"] = retainer ? "Monthly" : null
+  b["No. of periods"] = retainer ? 12 : null
+  b["Subscription start"] = retainer ? subStart : null
+  b["Current period no."] = retainer ? periodNo : null
+  b["Current period start"] = retainer ? periodStart : null
+  b["Current period end"] = retainer ? addDays(periodStart, 29) : null
+  b["Current period revenue"] = retainer ? sumBy(periodEntries, "Actual Revenue") : null
+  b["Current period budget"] = retainer ? Math.round(b["Project Budget"] / 12) : null
+  b["Current period tracked time"] = retainer ? Math.round(sumBy(periodEntries, "Tracked Hours") / 60) : null
+  b["Created at"] = addDays(subStart, -aInt(5, 30))
+  b["Last updated at"] = notAfterToday(addDays(TODAY, -aInt(0, 45)))
+})
+
+PROJECTS.forEach((p) => {
+  const budget = BUDGET_BY_PROJECT[p.id]
+  const status = p["Project status"]
+  const started = status !== "Not Started"
+  const start: Date = p["Start Date"], due: Date = p["Due Date"]
+  const budgetedHours = budget["Budgeted Hours"]
+  const trackedHours = Math.round(budget["Budget Tracked Minutes"] / 60)
+  const estCost = budget["Budget Estimated Cost"]
+  const allocs = ALLOCATIONS.filter((a) => a.projectId === p.id)
+  const inProgressPhases = (PHASES_BY_PROJECT[p.id] ?? []).filter((ph) => ph["Phase status"] === "In Progress").map((ph) => ph["Project phase"])
+  const late = status !== "Completed" && due < TODAY
+  p["Actual start date"] = started ? addDays(start, aInt(0, 10)) : null
+  p["Actual end date"] = status === "Completed" ? addDays(due, aInt(-10, 25)) : null
+  p["Inferred progress"] = status === "Completed" ? "Completed" : late ? "Delayed" : p["Progress Percent"] < 30 && due < addDays(TODAY, 30) ? "At risk" : "On track"
+  p["Last status update"] = started ? notAfterToday(addDays(TODAY, -aInt(0, 30))) : null
+  p["Project age"] = Math.max(0, Math.round((TODAY.getTime() - start.getTime()) / 86400000))
+  p["CSAT rating"] = status === "Completed" || auditRng() < 0.5 ? Math.round((3 + auditRng() * 2) * 10) / 10 : null
+  p["Last milestone CSAT"] = p["CSAT rating"] == null ? null : aInt(3, 5)
+  p["Budgeted hours"] = budgetedHours
+  p["% budgeted hours consumed"] = budgetedHours > 0 ? Math.round((trackedHours / budgetedHours) * 100) : 0
+  p["Remaining hours"] = Math.max(0, budgetedHours - trackedHours)
+  p["Estimated cost"] = estCost
+  p["Actual margin"] = p["Project Revenue"] > 0 ? Math.round((p["Project Profit"] / p["Project Revenue"]) * 100) : 0
+  p["Actual time cost"] = budget["Actual time cost"]
+  p["Estimated time cost"] = budget["Estimated time cost"]
+  p["Actual expense cost"] = budget["Actual expense cost"]
+  p["Estimated expense cost"] = budget["Estimated expense cost"]
+  p["Template"] = aPick(["Standard Onboarding", "Enterprise Implementation", "Quick Start", "Migration Playbook"])
+  p["Partners"] = auditRng() < 0.4 ? [aPick(["Deloitte", "Accenture", "Slalom", "Thoughtworks"])] : []
+  p["Current phases"] = inProgressPhases
+  p["Total recognised revenue"] = p["Project Revenue"]
+  p["Customer members invited"] = aInt(2, 12)
+  p["Customer members accepted"] = Math.max(0, p["Customer members invited"] - aInt(0, 3))
+  p["Last allocation date"] = allocs.reduce<Date | null>((m, a) => (!m || a["End date"] > m ? a["End date"] : m), null)
+  p["Created at"] = addDays(start, -aInt(7, 40))
+  p["Last updated at"] = notAfterToday(addDays(TODAY, -aInt(0, 20)))
 })
 
 const MODULE_ROWS: Record<string, Row[]> = {
