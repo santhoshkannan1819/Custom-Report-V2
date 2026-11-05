@@ -480,7 +480,7 @@ const MODULES: Module[] = [
   {
     name: "Allocations",
     iconType: "metrics",
-    canBeSource: false,
+    canBeSource: true,
     fields: [
       { name: "Allocated Mins Raw", type: "hours" },
       { name: "Allocation Type", type: "text" },
@@ -606,7 +606,7 @@ const MODULES: Module[] = [
   {
     name: "Expense",
     iconType: "metrics",
-    canBeSource: false,
+    canBeSource: true,
     fields: [
       { name: "Amount", type: "money" },
       { name: "Billable Amount", type: "money" },
@@ -644,7 +644,7 @@ const MODULES: Module[] = [
   {
     name: "Invoice",
     iconType: "metrics",
-    canBeSource: false,
+    canBeSource: true,
     fields: [
       { name: "Invoice number", type: "text" },
       { name: "Amount", type: "money" },
@@ -804,13 +804,19 @@ const SOURCE_MODULES: Record<string, string[]> = {
   "Role": ["Role", "People", "Time tracking", "Capacity", "Allocations", "Actual financials", "Leave & holiday", "Project", "Estimated financials", "Daily rollup", "Task"],
   "Account": ["Account", "Project", "Actual financials", "Time tracking", "Invoice", "Revenue entries", "Budget", "Meeting", "Daily rollup", "Task"],
   "Forms": ["Forms", "Project", "Account", "Task", "Phase", "People"],
+  // Each allocation, expense and invoice row points at exactly one of these, so they are all
+  // lookups and the records stay one per allocation, expense or invoice.
+  "Allocations": ["Allocations", "Project", "People", "Role", "Task", "Phase", "Budget", "Account"],
+  "Expense": ["Expense", "Project", "People", "Role", "Task", "Phase", "Budget", "Invoice", "Account"],
+  // Time tracking and Expense are billed on an invoice, so they fan out from it.
+  "Invoice": ["Invoice", "Account", "Project", "Budget", "Time tracking", "Expense", "Revenue entries"],
   // A Forms report runs on one template. Each submission belongs to a task (and so its phase,
   // project and account), and People is reached through who submitted it.
   ...Object.fromEntries(FORM_TEMPLATES.map((t) => [t.name, [t.name, "Project", "Account", "Task", "Phase", "People"]])),
 }
 
 // "Forms" opens the template list rather than being a source of its own.
-const SOURCE_OPTIONS = ["Time tracking", "Project", "Task", "Budget", "People", "Role", "Account", "Forms"]
+const SOURCE_OPTIONS = ["Time tracking", "Project", "Task", "Budget", "People", "Role", "Account", "Allocations", "Expense", "Invoice", "Forms"]
 
 const AGG_OPTIONS = ["Sum", "Count", "Distinct Count", "Average", "Min", "Max"]
 
@@ -1292,9 +1298,9 @@ const JOIN_EDGES: JoinEdge[] = [
   { from: "Estimated financials", to: "Team", label: "Team" },
   { from: "Estimated financials", to: "People", label: "Team member" },
 
+  { from: "Expense", to: "People", label: "Expense Owner" },
   { from: "Expense", to: "People", label: "All Approvers" },
   { from: "Expense", to: "Expense budget", label: "Expense Budget" },
-  { from: "Expense", to: "People", label: "Expense Owner" },
   { from: "Expense", to: "Expense report", label: "Expense Report" },
   { from: "Expense", to: "Invoice", label: "Invoice" },
   { from: "Expense", to: "Budget", label: "Project Financials Budget" },
@@ -1788,7 +1794,9 @@ const EXPENSE: Row[] = TASKS.flatMap((task) => {
     const amount = randInt(20, 800)
     const billableAmount = task["Billable"] ? Math.round(amount * randFloat(0.7, 1)) : 0
     return {
+      // The expense owner is the task's assignee: derived, not drawn, so later seeded data is unchanged.
       id: nextId("exp"), projectId: task.projectId, phaseId: task.phaseId, taskId: task.id, accountId: task.accountId,
+      userId: task.userId, roleId: PEOPLE_BY_ID[task.userId]?.roleId,
       "Amount": amount,
       "Billable Amount": billableAmount,
       "Currency": project["Project currency"],
@@ -2338,6 +2346,7 @@ const ROLE_FK: Record<string, string> = {
   "Task|People|Responsible": "responsibleUserId",
   "Project|People|Project owner": "ownerId",
   "Project|People|Project creator": "createdById",
+  "Expense|People|Expense Owner": "userId",
   // The same two roles again at the junction grain, because choosing "Project member" for one
   // chip raises the whole report to it — and the other chips must keep resolving as they read.
   "Project members|People|Project owner": "ownerId",
