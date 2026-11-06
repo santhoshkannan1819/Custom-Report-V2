@@ -2495,9 +2495,22 @@ function pickGrain(source: string, fields: PivotFields, filterRules: FilterRule[
   // template report reaches is a lookup from the submission: the records stay the submissions.
   if (isFormTemplateSource(source)) return source
   const used = new Set<string>(extra)
-  ;[...fields.columns, ...fields.rows, ...fields.values].forEach((item) => used.add(fieldKeyModule(item.field)))
-  filterRules.forEach((r) => used.add(fieldKeyModule(r.field)))
   const reachable = new Set(SOURCE_MODULES[source] ?? [source])
+  ;[...fields.columns, ...fields.rows].forEach((item) => used.add(fieldKeyModule(item.field)))
+  filterRules.forEach((r) => used.add(fieldKeyModule(r.field)))
+  // Numbers from two tables that sit side by side (hours and expenses, both per task) are each
+  // totalled from their own records, one level up — at the record of either table, every
+  // record of the other would be brought in again. Nothing splits by either table's own fields
+  // here; if something did, the report would have to be at that table's records.
+  const valueMods = [...new Set(fields.values.map((item) => fieldKeyModule(item.field)))]
+  const siblings = valueMods.filter((m) => reachable.has(m) && ROLLUP_FK[m] && !used.has(m))
+  const parentOf = (m: string) => Object.keys(MODULE_OWN_ID_KEY).find((k) => MODULE_OWN_ID_KEY[k] === ROLLUP_FK[m])
+  if (siblings.length >= 2) {
+    siblings.forEach((m) => { const p = parentOf(m); if (p) { used.add(p); reachable.add(p) } })
+    valueMods.filter((m) => !siblings.includes(m)).forEach((m) => used.add(m))
+  } else {
+    valueMods.forEach((m) => used.add(m))
+  }
   let best = source
   let bestRank = MODULE_RANK[source] ?? 0
   used.forEach((m) => {
@@ -2542,6 +2555,97 @@ function pickGrainWithRoles(
   })
   return implied.size === 0 ? base : pickGrain(source, fields, filterRules, implied)
 }
+
+// ── Splitting a number (drop-time check) ──────────────────────────────────────────
+// A number can only be split by things above it. Each record of the number's own table must
+// land under exactly one row or column; if it lands under several (one invoice, several people
+// who logged time to it), every one of them shows the full amount and the rows add up to more
+// than the total. Filters never copy a number, and reports with no numbers have nothing to
+// split, so only Rows/Columns × numeric Values are checked.
+const SPLIT_OWNER_NOUN: Record<string, string> = {
+  Account: "account", Role: "role", People: "person", Project: "project", Phase: "phase", Task: "task",
+  Budget: "budget", Invoice: "invoice",
+}
+
+interface SplitConflict { valueId: string; splitId: string; message: string }
+
+// "Amount" alone could be an invoice's or an expense's, so the number is named with its table.
+function splitValueName(key: string): string {
+  const mod = fieldKeyModule(key), name = fieldDisplayName(key)
+  return name.toLowerCase().includes(mod.toLowerCase()) ? name : `${mod} ${name.charAt(0).toLowerCase()}${name.slice(1)}`
+}
+
+function splitConflicts(
+  source: string, fields: PivotFields, filterRules: FilterRule[], lookupPaths: Record<string, string>,
+): SplitConflict[] {
+  if (isFormTemplateSource(source)) return []
+  const grain = pickGrainWithRoles(source, fields, filterRules, lookupPaths)
+  const roles = resolveChipRoles(pickGrain(source, fields, filterRules), fields, lookupPaths)
+  const rows = MODULE_ROWS[grain] ?? []
+  const splits = [...fields.rows, ...fields.columns].filter((s) => s.field !== TIMELINE_KEY)
+  const out: SplitConflict[] = []
+  for (const v of fields.values) {
+    const m = fieldKeyModule(v.field)
+    if (m === grain || !isNumericType(getFieldType(v.field))) continue
+    // Which record of the number's table each report row stands for: a looked-up parent's id,
+    // or the key a rolled-up collection hangs off.
+    let owner: (r: Row) => any
+    let noun: string
+    const dimKey = (roles[v.id] ? ROLE_FK[roleFkKey(grain, m, roles[v.id])] : undefined) ?? DIMENSION_ID_KEY[m]
+    if (dimKey) {
+      owner = (r) => r[dimKey]
+      noun = SPLIT_OWNER_NOUN[m] ?? m.toLowerCase()
+    } else if (ROLLUP_FK[m]) {
+      const fk = ROLLUP_FK[m]
+      owner = MODULE_OWN_ID_KEY[grain] === fk ? (r) => r.id : (r) => r[fk]
+      const ownerModule = Object.keys(MODULE_OWN_ID_KEY).find((k) => MODULE_OWN_ID_KEY[k] === fk)
+      noun = ownerModule ? SPLIT_OWNER_NOUN[ownerModule] ?? ownerModule.toLowerCase() : "record"
+    } else continue
+    for (const s of splits) {
+      if (fieldKeyModule(s.field) === m) continue
+      const seen = new Map<any, string>()
+      const clash = rows.some((r) => {
+        const id = owner(r)
+        if (id == null) return false
+        const label = JSON.stringify(resolveFieldForRow(grain, r, s.field, null, roles[s.id]) ?? null)
+        const prev = seen.get(id)
+        if (prev === undefined) { seen.set(id, label); return false }
+        return prev !== label
+      })
+      if (clash) {
+        out.push({
+          valueId: v.id, splitId: s.id,
+          message: `${splitValueName(v.field)} can't be split by ${fieldDisplayName(s.field)}: one ${noun} has several`,
+        })
+      }
+    }
+  }
+  return out
+}
+
+// The reason a field can't go where it's headed, or null. Only clashes the move itself creates
+// count, so an unrelated drop is never blocked by something already on the shelves.
+const PENDING_ITEM_ID = "pending-drop"
+function pivotDropBlockReason(
+  source: string, fields: PivotFields, filterRules: FilterRule[], lookupPaths: Record<string, string>,
+  zone: PivotZoneKey, field: string, id?: string,
+): string | null {
+  if (field === TIMELINE_KEY) return null
+  const itemId = id ?? PENDING_ITEM_ID
+  const without = (arr: PivotItem[]) => arr.filter((it) => it.id !== itemId)
+  const next: PivotFields = { columns: without(fields.columns), rows: without(fields.rows), values: without(fields.values) }
+  next[zone] = [...next[zone], { id: itemId, field }]
+  const hit = splitConflicts(source, next, filterRules, lookupPaths)
+    .find((c) => c.valueId === itemId || c.splitId === itemId)
+  return hit?.message ?? null
+}
+
+// What is being dragged right now. A drop zone can't read the drag payload until the drop, but it
+// has to say "no" while the pointer is still over it.
+let activeDrag: { field: string; id?: string } | null = null
+const dropReasonCache = new Map<string, string | null>()
+function startDrag(field: string, id?: string) { activeDrag = { field, id }; dropReasonCache.clear() }
+function endDrag() { activeDrag = null; dropReasonCache.clear() }
 
 // ── Date bucketing / relative windows (shared by row & column grouping, and filters) ──
 function quarterOf(d: Date): number { return Math.floor(d.getMonth() / 3) + 1 }
@@ -3130,6 +3234,19 @@ function aggregateBucket(bucketRows: Row[], grainModule: string, item: PivotItem
       return Array.isArray(v) ? v.length > 0 : v != null && v !== "" && v !== false
     }).length
   }
+  // A rolled-up table counts its own records, not the report rows they hang off.
+  const countFk = targetModule !== grainModule && !DIMENSION_ID_KEY[targetModule] ? ROLLUP_FK[targetModule] : undefined
+  if (agg === "Count" && countFk) {
+    const key = MODULE_OWN_ID_KEY[grainModule] === countFk ? "id" : countFk
+    const dateField = ROLLUP_DATE_FIELD[targetModule]
+    const owners = new Set(bucketRows.map((r) => r[key]).filter((id) => id != null))
+    let n = 0
+    owners.forEach((id) => {
+      const recs = ROLLUP_INDEX[targetModule]?.get(id) ?? []
+      n += dateWindow && dateField ? recs.filter((r) => withinWindow(r[dateField], dateWindow!)).length : recs.length
+    })
+    return n
+  }
   if (agg === "Count") {
     if (dateWindow && targetModule === grainModule) {
       const ownDateField = ROLLUP_DATE_FIELD[targetModule]
@@ -3139,11 +3256,16 @@ function aggregateBucket(bucketRows: Row[], grainModule: string, item: PivotItem
   }
 
   const isDim = targetModule !== grainModule && !!DIMENSION_ID_KEY[targetModule]
+  // A sibling collection (expenses beside time entries) is rolled up per parent it hangs off —
+  // every time entry on a task would otherwise bring that task's expenses in again.
+  const rollupFk = !isDim && targetModule !== grainModule ? ROLLUP_FK[targetModule] : undefined
+  const ownerKey = isDim ? DIMENSION_ID_KEY[targetModule]
+    : rollupFk ? (MODULE_OWN_ID_KEY[grainModule] === rollupFk ? "id" : rollupFk) : undefined
   const seen = new Set<string>()
   const values: any[] = []
   for (const row of bucketRows) {
-    if (isDim) {
-      const ownerId = row[DIMENSION_ID_KEY[targetModule]]
+    if (ownerKey) {
+      const ownerId = row[ownerKey]
       if (ownerId != null) {
         if (seen.has(ownerId)) continue
         seen.add(ownerId)
@@ -5640,10 +5762,12 @@ interface DropZoneBarProps {
   onTimelineChange: (id: string, f: MetricFilter | null) => void
   onRangeConfigChange: (id: string, cfg: RangeConfig) => void
   onFieldFormatChange: (id: string, patch: Partial<FieldFormat>) => void
+  blockReason?: (zone: PivotZoneKey, field: string, id?: string) => string | null
+  notice?: string | null
 }
 
 function DropZoneBar(props: DropZoneBarProps) {
-  const { fields, dragging, dragType, grainModule, lookupPaths, aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange } = props
+  const { fields, dragging, dragType, grainModule, lookupPaths, aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange, blockReason, notice } = props
 
   const zones: { key: PivotZoneKey; label: string; suggestValues?: boolean }[] = [
     { key: "columns", label: "Columns" },
@@ -5652,7 +5776,12 @@ function DropZoneBar(props: DropZoneBarProps) {
   ]
 
   return (
-    <div className="flex gap-3 border-b border-gray-200 bg-white px-3 py-3 h-[192px] shrink-0 print-hide">
+    <div className="relative flex gap-3 border-b border-gray-200 bg-white px-3 py-3 h-[192px] shrink-0 print-hide">
+      {notice && (
+        <div role="status" className="absolute left-1/2 top-2 z-20 -translate-x-1/2 whitespace-nowrap rounded-md bg-gray-900 px-2.5 py-1 text-[11px] text-white shadow-lg">
+          {notice}
+        </div>
+      )}
       {zones.map(({ key, label, suggestValues }) => (
         <DropZone
           key={key}
@@ -5676,6 +5805,7 @@ function DropZoneBar(props: DropZoneBarProps) {
           onTimelineChange={onTimelineChange}
           onRangeConfigChange={onRangeConfigChange}
           onFieldFormatChange={onFieldFormatChange}
+          blockReason={blockReason}
         />
       ))}
     </div>
@@ -5687,7 +5817,7 @@ function DropZoneBar(props: DropZoneBarProps) {
 // handed the other's zone by mistake.
 function DropZone<Z extends ZoneKey>({
   zone, label, chips, dragging, isSuggested, grainModule, lookupPaths,
-  aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange,
+  aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange, blockReason,
 }: {
   zone: Z; label: string; chips: PivotItem[]; dragging: boolean
   isSuggested: boolean; aggregations: Record<string, string>
@@ -5706,24 +5836,53 @@ function DropZone<Z extends ZoneKey>({
   onTimelineChange: (id: string, f: MetricFilter | null) => void
   onRangeConfigChange: (id: string, cfg: RangeConfig) => void
   onFieldFormatChange: (id: string, patch: Partial<FieldFormat>) => void
+  /** Why the field being dragged can't land here (shown at the pointer), or null. */
+  blockReason?: (zone: Z, field: string, id?: string) => string | null
 }) {
   const [over, setOver] = useState(false)
   const [insertAt, setInsertAt] = useState<number | null>(null)
+  const [blocked, setBlocked] = useState<{ text: string; at: { x: number; y: number } } | null>(null)
+
+  // A cancelled drag never fires dragleave on the zone, so clear the "no" on any drag ending.
+  useEffect(() => {
+    const clear = () => setBlocked(null)
+    document.addEventListener("dragend", clear)
+    document.addEventListener("drop", clear)
+    return () => { document.removeEventListener("dragend", clear); document.removeEventListener("drop", clear) }
+  }, [])
+
+  // Dragover fires many times a second, so each zone/field answer is worked out once per drag.
+  const reasonFor = (): string | null => {
+    if (!blockReason || !activeDrag) return null
+    const key = `${zone}|${activeDrag.field}|${activeDrag.id ?? ""}`
+    if (!dropReasonCache.has(key)) dropReasonCache.set(key, blockReason(zone, activeDrag.field, activeDrag.id))
+    return dropReasonCache.get(key) ?? null
+  }
+  // True when the drop must be refused: shows the reason at the pointer and a no-drop cursor.
+  const refuse = (e: React.DragEvent): boolean => {
+    const reason = reasonFor()
+    if (!reason) { if (blocked) setBlocked(null); return false }
+    e.dataTransfer.dropEffect = "none"
+    setOver(false); setInsertAt(null)
+    setBlocked({ text: reason, at: { x: e.clientX, y: e.clientY } })
+    return true
+  }
 
   const parseField = (e: React.DragEvent) =>
     JSON.parse(e.dataTransfer.getData("application/field")) as {
       id?: string; field: string; type: FieldType; fromZone?: Z
     }
 
-  const handleZoneDragOver = (e: React.DragEvent) => { e.preventDefault(); setOver(true) }
+  const handleZoneDragOver = (e: React.DragEvent) => { e.preventDefault(); if (!refuse(e)) setOver(true) }
   const handleZoneDragLeave = (e: React.DragEvent) => {
     if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) {
-      setOver(false); setInsertAt(null)
+      setOver(false); setInsertAt(null); setBlocked(null)
     }
   }
   const handleZoneDrop = (e: React.DragEvent) => {
     e.preventDefault()
-    setOver(false); setInsertAt(null)
+    setOver(false); setInsertAt(null); setBlocked(null)
+    if (reasonFor()) return
     try {
       const data = parseField(e)
       if (data.fromZone === zone && data.id) {
@@ -5737,11 +5896,13 @@ function DropZone<Z extends ZoneKey>({
   }
 
   const handleChipDragOver = (e: React.DragEvent, index: number) => {
-    e.preventDefault(); e.stopPropagation(); setOver(true); setInsertAt(index)
+    e.preventDefault(); e.stopPropagation()
+    if (!refuse(e)) { setOver(true); setInsertAt(index) }
   }
   const handleChipDrop = (e: React.DragEvent, index: number) => {
     e.preventDefault(); e.stopPropagation()
-    setOver(false); setInsertAt(null)
+    setOver(false); setInsertAt(null); setBlocked(null)
+    if (reasonFor()) return
     try {
       const data = parseField(e)
       if (data.fromZone === zone && data.id) {
@@ -5754,7 +5915,7 @@ function DropZone<Z extends ZoneKey>({
     } catch {}
   }
 
-  const highlight = over || (dragging && isSuggested)
+  const highlight = !blocked && (over || (dragging && isSuggested))
   const isEmpty = chips.length === 0
 
   return (
@@ -5763,12 +5924,15 @@ function DropZone<Z extends ZoneKey>({
       onDragLeave={handleZoneDragLeave}
       onDrop={handleZoneDrop}
       className={`flex-1 min-w-0 rounded-lg flex flex-col transition-all
-        ${highlight
+        ${blocked
+          ? "border-2 border-dashed border-gray-300 bg-gray-100 opacity-60 cursor-not-allowed"
+          : highlight
           ? "border-2 border-dashed border-indigo-300 bg-indigo-50"
           : isEmpty
             ? "border-2 border-dashed border-gray-200 bg-gray-50/60"
             : "border border-gray-200 bg-gray-50/60 shadow-sm"}`}
     >
+      {blocked && <CursorTooltip text={blocked.text} at={blocked.at} />}
       {/* Zone label */}
       <div className="flex items-center gap-1.5 px-3 pt-2.5 pb-1.5 shrink-0">
         <span className={`text-[11px] font-bold uppercase tracking-wider transition-colors
@@ -6151,7 +6315,9 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
           JSON.stringify({ id, field: name, type: fieldType, fromZone: zone })
         )
         e.dataTransfer.effectAllowed = "move"
+        startDrag(name, id)
       }}
+      onDragEnd={endDrag}
       className="relative flex items-center gap-1.5 pl-2.5 pr-1 py-1 bg-white border border-gray-200
         rounded-md text-[12px] text-gray-700 shadow-sm hover:border-gray-300 transition-colors group
         cursor-grab active:cursor-grabbing active:opacity-50 active:shadow-none w-full min-w-0"
@@ -11154,8 +11320,23 @@ export default function App() {
   // Each drop is a distinct instance — dropping the same field twice must let each occurrence
   // carry its own aggregation/timeline-filter state, so both are keyed by this fresh id, never
   // by the field key itself (which duplicate pills would otherwise share).
+  const dropBlockReason = (zone: PivotZoneKey, field: string, id?: string) =>
+    pivotDropBlockReason(source, fields, filterRules, lookupPaths, zone, field, id)
+  // A click-to-add has no pointer over a shelf to explain itself at, so it says why up top.
+  const [splitNotice, setSplitNotice] = useState<string | null>(null)
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const refuseSplit = (zone: PivotZoneKey, field: string, id?: string): boolean => {
+    const reason = dropBlockReason(zone, field, id)
+    if (!reason) return false
+    setSplitNotice(reason)
+    if (noticeTimer.current) clearTimeout(noticeTimer.current)
+    noticeTimer.current = setTimeout(() => setSplitNotice(null), 3500)
+    return true
+  }
+
   const handleAdd = (zone: PivotZoneKey, field: string, type: FieldType) => {
     if (field === TIMELINE_KEY && timelineBlocked) return
+    if (refuseSplit(zone, field)) return
     // Timeline splits metrics into periods, down the rows or across the columns; as a value it
     // would have nothing to add up. One is enough.
     if (field === TIMELINE_KEY
@@ -11196,6 +11377,7 @@ export default function App() {
     const item = fields[from].find((it) => it.id === id)
     if (!item) return
     if (item.field === TIMELINE_KEY && to === "values") return
+    if (refuseSplit(to, item.field, id)) return
     const type = getFieldType(item.field)
     setFields((prev) => ({
       ...prev,
@@ -11300,8 +11482,8 @@ export default function App() {
                   onAdd={handleAdd}
                   onRemove={handleRemove}
                   onDupAlert={(name) => setDupAlert(name)}
-                  onDragStart={(_, type) => { setDragging(true); setDragType(type) }}
-                  onDragEnd={() => { setDragging(false); setDragType(null) }}
+                  onDragStart={(field, type) => { startDrag(field); setDragging(true); setDragType(type) }}
+                  onDragEnd={() => { endDrag(); setDragging(false); setDragType(null) }}
                 />
               )}
               <div className="flex flex-col flex-1 min-w-0">
@@ -11325,6 +11507,8 @@ export default function App() {
                     onTimelineChange={handleReportTimelineChange}
                     onRangeConfigChange={handleRangeConfigChange}
                     onFieldFormatChange={handleFieldFormatChange}
+                    blockReason={dropBlockReason}
+                    notice={splitNotice}
                   />
                 )}
                 {reportMode === "create" && (
