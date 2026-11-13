@@ -6693,6 +6693,16 @@ const ACTUAL_DATE_VALUES: Record<string, string[]> = {
   "Date & Time":    Array.from({ length: 24 }, (_, i) => `2026-08-04 ${String(i).padStart(2, "0")}:00`),
 }
 
+// Filters offer four period levels. Quarter and Month always carry the year (Q1 2025, Jan 2026);
+// the stored keys stay the bucket names the date logic already understands.
+const FILTER_GRANULARITIES: { key: string; label: string }[] = [
+  { key: "Year", label: "Year" },
+  { key: "Quarter & Year", label: "Quarter" },
+  { key: "Month & Year", label: "Month" },
+  { key: "Date", label: "Date" },
+]
+const filterGranLabel = (key: string) => FILTER_GRANULARITIES.find((g) => g.key === key)?.label ?? key
+
 const RELATIVE_OPTIONS: Record<string, string[]> = {
   "Year":           ["This year", "Year to date", "Last year", "Next year", "Last N years", "Next N years"],
   "Quarter & Year": ["This quarter", "Last quarter", "Next quarter", "Last N quarters", "Next N quarters"],
@@ -6947,7 +6957,7 @@ function DateFilterModal({ rule, onChange, onClose, strip, timelineMetricKeys }:
   const selectedValues: string[] = rule.values ?? []
   const [search, setSearch] = useState("")
 
-  const granList = DATE_GRANULARITY.map((g) => g.label)
+  const granList = FILTER_GRANULARITIES.map((g) => g.key)
   const metricKeysSig = timelineMetricKeys?.join("|")
   const allActual = useMemo(
     () => timelineMetricKeys ? timelineActualValues(timelineMetricKeys, gran) : (ACTUAL_DATE_VALUES[gran] ?? []),
@@ -6980,18 +6990,17 @@ function DateFilterModal({ rule, onChange, onClose, strip, timelineMetricKeys }:
     </button>
   )
 
-  const GranSidebar = ({ activeKey, onSelect }: { activeKey: string; onSelect: (g: string) => void }) => (
-    <div className="w-40 shrink-0 border-r border-gray-100 py-1 overflow-y-auto">
-      {granList.map(g => (
-        <button
-          key={g}
-          onClick={() => onSelect(g)}
-          className={`w-full text-left px-3 py-2 text-[13px] transition-colors rounded-none
-            ${activeKey === g ? "bg-indigo-50 text-indigo-700 font-semibold" : "text-gray-600 hover:bg-gray-50"}`}
-        >
-          {g}
-        </button>
-      ))}
+  const GranSelect = ({ activeKey, onSelect }: { activeKey: string; onSelect: (g: string) => void }) => (
+    <div className="relative shrink-0">
+      <select
+        value={activeKey}
+        onChange={(e) => onSelect(e.target.value)}
+        aria-label="Date grain"
+        className="appearance-none border border-gray-200 rounded-lg pl-3 pr-8 py-1.5 text-[13px] font-medium text-gray-700 bg-white cursor-pointer focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100"
+      >
+        {granList.map((g) => <option key={g} value={g}>{filterGranLabel(g)}</option>)}
+      </select>
+      <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400"><Ic.ChevDown /></span>
     </div>
   )
 
@@ -7041,11 +7050,11 @@ function DateFilterModal({ rule, onChange, onClose, strip, timelineMetricKeys }:
           {/* ── Actual Data ── */}
           {mode === "actual" && (
             <>
-              <GranSidebar activeKey={gran} onSelect={(g) => onChange({ dateGranularity: g, values: [] })} />
               <div className="flex-1 flex flex-col overflow-hidden">
-                {/* Search */}
-                <div className="px-3 py-2.5 border-b border-gray-100">
-                  <div className="flex items-center gap-2 bg-gray-50 rounded-lg px-3 py-1.5">
+                {/* Grain + search */}
+                <div className="flex items-center gap-2 px-3 py-2.5 border-b border-gray-100">
+                  <GranSelect activeKey={gran} onSelect={(g) => onChange({ dateGranularity: g, values: [] })} />
+                  <div className="flex-1 flex items-center gap-2 bg-gray-50 rounded-lg px-3 py-1.5">
                     <Ic.Search />
                     <input
                       autoFocus
@@ -7070,21 +7079,21 @@ function DateFilterModal({ rule, onChange, onClose, strip, timelineMetricKeys }:
                 <div className="overflow-y-auto flex-1">
                   {actualOptions.length === 0
                     ? <p className="text-[13px] text-gray-400 text-center py-8">No matches</p>
-                    : actualOptions.map(v => {
+                    : <div className="grid grid-cols-3 gap-1 p-2 content-start">{actualOptions.map(v => {
                         const checked = selectedValues.includes(v)
                         return (
-                          <button key={v} onClick={() => toggleValue(v)}
-                            className={`flex items-center gap-3 w-full px-4 py-2 text-[13px] text-left transition-colors
+                          <button key={v} onClick={() => toggleValue(v)} title={v}
+                            className={`flex items-center gap-2.5 w-full min-w-0 px-2.5 py-2 rounded-md text-[13px] text-left transition-colors
                               ${checked ? "bg-indigo-50 text-indigo-700" : "text-gray-700 hover:bg-gray-50"}`}
                           >
                             <span className={`flex items-center justify-center w-4 h-4 rounded border shrink-0 transition-colors
                               ${checked ? "bg-indigo-600 border-indigo-600" : "border-gray-300"}`}>
                               {checked && <svg width="9" height="9" viewBox="0 0 9 9" fill="none"><path d="M1.5 4.5L3.5 6.5L7.5 2.5" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>}
                             </span>
-                            {v}
+                            <span className="truncate">{v}</span>
                           </button>
                         )
-                      })
+                      })}</div>
                   }
                 </div>
                 {showNull && <div className="px-4 pb-3 pt-1 border-t border-gray-100"><NullToggle /></div>}
@@ -7131,8 +7140,8 @@ function DateFilterModal({ rule, onChange, onClose, strip, timelineMetricKeys }:
           {/* ── Relative ── */}
           {mode === "relative" && (
             <>
-              <GranSidebar activeKey={gran} onSelect={(g) => onChange({ dateGranularity: g, dateRelativeOpt: "", dateRelativeN: 1 })} />
               <div className="flex-1 flex flex-col overflow-y-auto p-4 gap-1">
+                <div className="mb-2"><GranSelect activeKey={gran} onSelect={(g) => onChange({ dateGranularity: g, dateRelativeOpt: "", dateRelativeN: 1 })} /></div>
                 {relativeOpts.map(opt => {
                   const active = rule.dateRelativeOpt === opt
                   const needsN = isNInput(opt)
@@ -8169,7 +8178,7 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
     if (!isDateField) return ""
     const mode = rule.dateMode ?? "actual"
     if (mode === "actual") {
-      if (selectedValues.length === 0) return rule.dateGranularity || ""
+      if (selectedValues.length === 0) return filterGranLabel(rule.dateGranularity || "")
       return selectedValues.length === 1 ? selectedValues[0] : `${selectedValues.length} selected`
     }
     if (mode === "range") {
@@ -8628,7 +8637,7 @@ function ViewFilterSettings({ rule, options, anchorRef, flat, onChange, onClose 
                   onChange={(e) => onChange({ dateGranularity: e.target.value, values: [], vfOfferedValues: [] })}
                   className={`${selectCls} mb-1.5`}
                 >
-                  {DATE_GRANULARITY.map((g) => <option key={g.label} value={g.label}>{g.label}</option>)}
+                  {FILTER_GRANULARITIES.map((g) => <option key={g.key} value={g.key}>{g.label}</option>)}
                 </select>
               )}
               <div className="flex items-center gap-4 bg-gray-50 rounded-md px-2.5 py-2">
