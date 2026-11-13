@@ -6321,6 +6321,12 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
   const isTimelineMetric = zone === "values" && TIMELINE_METRICS_SET.has(name)
   // A Values chip keeps its aggregation (Sum, Count, …) inside the gear menu, not as a badge.
   const aggInGear = zone === "values" && options !== null && !!onFieldFormatChange
+  // Rows/Columns chips do the same with their grouping (date grain, each value vs ranges).
+  const groupInGear = (zone === "rows" || zone === "columns" || zone === "tabGroupBy")
+    && (options !== null || isDateDimension) && !!onFieldFormatChange
+  const settingsInGear = aggInGear || groupInGear
+  const grainOptions = DATE_GRANULARITY.filter((opt) => name !== TIMELINE_KEY || TIMELINE_GRANULARITIES.includes(opt.label))
+  const NUMERIC_GROUP_LABEL: Record<string, string> = { Dimension: "Each value", Range: "Ranges" }
 
   const currentFilter: MetricFilter = timelineFilter ?? { period: "", customFrom: "", customTo: "" }
   const currentRangeConfig: RangeConfig = rangeConfig ?? { mode: "equal", bucketSize: 0, customBounds: [] }
@@ -6389,7 +6395,7 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
       )}
 
       {/* Modifier badge (Sum ∨, Count ∨, etc.) */}
-      {hasBadge && modifier && !aggInGear && (
+      {hasBadge && modifier && !settingsInGear && (
         <button
           ref={modifierBtnRef}
           onClick={() => { setShowDropdown((p) => !p); setShowRangeSettings(false) }}
@@ -6439,9 +6445,9 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
         <button
           ref={formatBtnRef}
           onClick={(e) => { e.stopPropagation(); setShowFormatMenu((p) => !p) }}
-          title={aggInGear ? `${modifier ?? "Aggregation"} · format` : "Format field"}
+          title={settingsInGear ? `${modifier ?? "Settings"} · format` : "Format field"}
           className={`transition-colors shrink-0 p-0.5 rounded hover:bg-gray-100
-            ${aggInGear ? (showFormatMenu ? "text-indigo-600" : "text-gray-400 hover:text-gray-600") : "text-gray-300 hover:text-gray-600 opacity-0 group-hover:opacity-100 focus:opacity-100"}`}
+            ${settingsInGear ? (showFormatMenu ? "text-indigo-600" : "text-gray-400 hover:text-gray-600") : "text-gray-300 hover:text-gray-600 opacity-0 group-hover:opacity-100 focus:opacity-100"}`}
         >
           <Ic.Gear size={12} />
         </button>
@@ -6475,7 +6481,41 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
                 </SettingsSelect>
               </div>
             )}
-            {aggInGear && <p className={SETTINGS_SECTION}>Display</p>}
+            {groupInGear && (
+              <div className="mb-3 pb-3 border-b border-gray-100">
+                <p className={SETTINGS_SECTION}>Group</p>
+                {isDateDimension ? (
+                  <>
+                    <label className={SETTINGS_LABEL}>Date grain</label>
+                    <SettingsSelect value={modifier ?? grainOptions[0].label} onChange={onModifierChange} ariaLabel="Date grain">
+                      {grainOptions.map((g) => <option key={g.label} value={g.label}>{g.label}</option>)}
+                    </SettingsSelect>
+                    <p className="text-[11px] text-gray-400 mt-1">
+                      {grainOptions.find((g) => g.label === modifier)?.example}
+                    </p>
+                  </>
+                ) : options && (
+                  <>
+                    <label className={SETTINGS_LABEL}>Group values by</label>
+                    <SettingsSelect value={modifier ?? options[0]} onChange={onModifierChange} ariaLabel="Group values by">
+                      {options.map((opt) => <option key={opt} value={opt}>{NUMERIC_GROUP_LABEL[opt] ?? opt}</option>)}
+                    </SettingsSelect>
+                    {modifier === "Range" && onRangeConfigChange && (
+                      <div className="mt-2.5">
+                        <RangeConfigPicker
+                          config={currentRangeConfig}
+                          bounds={numericFieldBounds(name)}
+                          type={fieldType}
+                          onChange={(patch) => onRangeConfigChange({ ...currentRangeConfig, ...patch })}
+                          embedded
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+            {settingsInGear && <p className={SETTINGS_SECTION}>Display</p>}
             <FieldFormatFields
               item={{ id, field: name }}
               defaultAlign={defaultAlign}
