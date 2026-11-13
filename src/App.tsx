@@ -5203,6 +5203,30 @@ function ReportSettingsPanel({ fields, reportView, onReportViewChange, showTotal
 // settings panel's per-field list (wrapped in FieldFormatRow, below) and the matching
 // gear-icon popover on the field's own chip, so both surfaces stay pixel-identical and can
 // never drift apart.
+// Shared look for the small settings menus: one label style, one dropdown style.
+const SETTINGS_LABEL = "text-[11px] text-gray-500 block mb-1"
+function SettingsSelect({ value, onChange, children, ariaLabel }: {
+  value: string
+  onChange: (v: string) => void
+  children: React.ReactNode
+  ariaLabel?: string
+}) {
+  return (
+    <div className="relative">
+      <select
+        value={value}
+        aria-label={ariaLabel}
+        onChange={(e) => onChange(e.target.value)}
+        className="appearance-none w-full border border-gray-200 rounded-md pl-2 pr-7 py-1.5 text-[13px] text-gray-800 bg-white cursor-pointer focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100"
+      >
+        {children}
+      </select>
+      <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-gray-400"><Ic.ChevDown size={11} /></span>
+    </div>
+  )
+}
+const SETTINGS_SECTION = "text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2"
+
 function FieldFormatFields({ item, defaultAlign, format, onChange }: {
   item: PivotItem
   defaultAlign: "left" | "right"
@@ -5224,16 +5248,19 @@ function FieldFormatFields({ item, defaultAlign, format, onChange }: {
     </button>
   )
   return (
-    <>
-      <input
-        type="text"
-        value={format.displayName}
-        placeholder={fieldDisplayName(item.field)}
-        onChange={(e) => onChange({ displayName: e.target.value })}
-        className="w-full border border-gray-200 rounded-md px-2 py-1.5 text-[13px] text-gray-800 focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100"
-      />
-      <div className="mt-2">
-        <label className="text-[10px] text-gray-400 block mb-0.5">Alignment</label>
+    <div className="flex flex-col gap-2.5">
+      <div>
+        <label className={SETTINGS_LABEL}>Display name</label>
+        <input
+          type="text"
+          value={format.displayName}
+          placeholder={fieldDisplayName(item.field)}
+          onChange={(e) => onChange({ displayName: e.target.value })}
+          className="w-full border border-gray-200 rounded-md px-2 py-1.5 text-[13px] text-gray-800 focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100"
+        />
+      </div>
+      <div>
+        <label className={SETTINGS_LABEL}>Alignment</label>
         <div className="flex items-center rounded-md border border-gray-200 p-0.5 bg-white w-fit">
           {alignBtn("left", <Ic.AlignLeft size={13} />)}
           {alignBtn("center", <Ic.AlignCenter size={13} />)}
@@ -5241,45 +5268,37 @@ function FieldFormatFields({ item, defaultAlign, format, onChange }: {
         </div>
       </div>
       {numeric && (
-        <div className="mt-2 flex flex-col gap-2">
+        <div className="grid grid-cols-2 gap-2">
           <div>
-            <label className="text-[10px] text-gray-400 block mb-0.5">Decimals</label>
-            <select
+            <label className={SETTINGS_LABEL}>Decimals</label>
+            <SettingsSelect
               value={format.decimals === null ? "auto" : String(format.decimals)}
-              onChange={(e) => onChange({ decimals: e.target.value === "auto" ? null : Number(e.target.value) })}
-              className="w-full border border-gray-200 rounded-md px-1.5 py-1 text-[12px] text-gray-700 bg-white focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100"
+              onChange={(v) => onChange({ decimals: v === "auto" ? null : Number(v) })}
             >
               <option value="auto">Auto</option>
               <option value="0">0</option>
               <option value="1">1</option>
               <option value="2">2</option>
               <option value="3">3</option>
-            </select>
+            </SettingsSelect>
           </div>
-          {/* Units gets its own full-width row rather than sharing one with Decimals — several
-              of these labels (the two tiered-auto combos, the locale-auto option) run long
-              enough that a half-width box clips them illegibly. */}
           <div>
-            <label className="text-[10px] text-gray-400 block mb-0.5">Units</label>
-            <select
-              value={format.units}
-              onChange={(e) => onChange({ units: e.target.value as FieldFormat["units"] })}
-              className="w-full border border-gray-200 rounded-md px-1.5 py-1 text-[12px] text-gray-700 bg-white focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100"
-            >
+            <label className={SETTINGS_LABEL}>Units</label>
+            <SettingsSelect value={format.units} onChange={(v) => onChange({ units: v as FieldFormat["units"] })}>
               <option value="none">None</option>
-              <option value="K">(Thousands) K</option>
-              <option value="L">(Lakhs) L</option>
-              <option value="M">(Millions) M</option>
-              <option value="C">(Crores) C</option>
-              <option value="B">(Billions) B</option>
-              <option value="autoIN">(Thousands) K - (Lakhs) L - (Crores) C</option>
-              <option value="auto">(Thousands) K - (Millions) M - (Billions) B</option>
-              <option value="autoLocale">Auto (User Locale Specific)</option>
-            </select>
+              <option value="K">Thousands (K)</option>
+              <option value="L">Lakhs (L)</option>
+              <option value="M">Millions (M)</option>
+              <option value="C">Crores (C)</option>
+              <option value="B">Billions (B)</option>
+              <option value="auto">Auto (K, M, B)</option>
+              <option value="autoIN">Auto (K, L, C)</option>
+              <option value="autoLocale">Auto (viewer's locale)</option>
+            </SettingsSelect>
           </div>
         </div>
       )}
-    </>
+    </div>
   )
 }
 
@@ -6300,6 +6319,8 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
     zone === "values" || (zone === "tabColumns" && isNumericType(fieldType)) ? "right" : "left"
   const hasBadge = options !== null || isDateDimension
   const isTimelineMetric = zone === "values" && TIMELINE_METRICS_SET.has(name)
+  // A Values chip keeps its aggregation (Sum, Count, …) inside the gear menu, not as a badge.
+  const aggInGear = zone === "values" && options !== null && !!onFieldFormatChange
 
   const currentFilter: MetricFilter = timelineFilter ?? { period: "", customFrom: "", customTo: "" }
   const currentRangeConfig: RangeConfig = rangeConfig ?? { mode: "equal", bucketSize: 0, customBounds: [] }
@@ -6368,7 +6389,7 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
       )}
 
       {/* Modifier badge (Sum ∨, Count ∨, etc.) */}
-      {hasBadge && modifier && (
+      {hasBadge && modifier && !aggInGear && (
         <button
           ref={modifierBtnRef}
           onClick={() => { setShowDropdown((p) => !p); setShowRangeSettings(false) }}
@@ -6418,8 +6439,9 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
         <button
           ref={formatBtnRef}
           onClick={(e) => { e.stopPropagation(); setShowFormatMenu((p) => !p) }}
-          title="Format field"
-          className="text-gray-300 hover:text-gray-600 transition-colors shrink-0 p-0.5 rounded hover:bg-gray-100 opacity-0 group-hover:opacity-100 focus:opacity-100"
+          title={aggInGear ? `${modifier ?? "Aggregation"} · format` : "Format field"}
+          className={`transition-colors shrink-0 p-0.5 rounded hover:bg-gray-100
+            ${aggInGear ? (showFormatMenu ? "text-indigo-600" : "text-gray-400 hover:text-gray-600") : "text-gray-300 hover:text-gray-600 opacity-0 group-hover:opacity-100 focus:opacity-100"}`}
         >
           <Ic.Gear size={12} />
         </button>
@@ -6435,13 +6457,32 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
       {/* Format popover — portalled below the gear icon */}
       {showFormatMenu && onFieldFormatChange && (
         <ChipPortalMenu anchorRef={formatBtnRef} onClose={() => setShowFormatMenu(false)}>
-          <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-xl p-2.5 w-72">
+          <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-xl w-72 overflow-hidden">
+            <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 bg-gray-50">
+              <Ic.Gear size={12} />
+              <span className="text-[12px] font-semibold text-gray-800 flex-1 truncate">{zone === "values" ? "Value settings" : "Field settings"}</span>
+              <button onClick={() => setShowFormatMenu(false)} aria-label="Close" className="text-gray-400 hover:text-gray-700 transition-colors">
+                <Ic.X size={12} />
+              </button>
+            </div>
+            <div className="p-3">
+            {aggInGear && options && (
+              <div className="mb-3 pb-3 border-b border-gray-100">
+                <p className={SETTINGS_SECTION}>Calculate</p>
+                <label className={SETTINGS_LABEL}>Aggregation</label>
+                <SettingsSelect value={modifier ?? options[0]} onChange={onModifierChange} ariaLabel="Aggregation">
+                  {options.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+                </SettingsSelect>
+              </div>
+            )}
+            {aggInGear && <p className={SETTINGS_SECTION}>Display</p>}
             <FieldFormatFields
               item={{ id, field: name }}
               defaultAlign={defaultAlign}
               format={fieldFormat ?? DEFAULT_FIELD_FORMAT}
               onChange={onFieldFormatChange}
             />
+            </div>
           </div>
         </ChipPortalMenu>
       )}
@@ -6615,23 +6656,22 @@ type ViewFilterComponent =
   | "singleList" | "singleDropdown" | "multiList" | "multiDropdown" | "multiCustomList"
   | "sliderDouble" | "multiSelectBox"
 
+// View filters are always dropdowns (decided 2026-11-13); the list and custom-list styles are
+// retired, and a saved rule that still names one is read as its dropdown counterpart.
 const VF_CATEGORICAL_COMPONENTS: { key: ViewFilterComponent; label: string }[] = [
-  { key: "singleList", label: "Single Value (list)" },
-  { key: "singleDropdown", label: "Single Value (dropdown)" },
-  { key: "multiList", label: "Multiple Values (list)" },
-  { key: "multiDropdown", label: "Multiple Values (dropdown)" },
-  { key: "multiCustomList", label: "Multiple Values (custom list)" },
+  { key: "singleDropdown", label: "One value" },
+  { key: "multiDropdown", label: "Multiple values" },
 ]
 const VF_NUMERIC_COMPONENTS: { key: ViewFilterComponent; label: string }[] = [
-  { key: "sliderDouble", label: "Slider-Double" },
-  { key: "multiSelectBox", label: "Multi Select Box" },
+  { key: "sliderDouble", label: "Range slider" },
+  { key: "multiSelectBox", label: "Dropdown of values" },
 ]
 // A date's values are period labels, so it reuses the same select/list widgets under the
 // reference's "…Select Box" naming. Which periods those are comes from the granularity
 // dropdown; whether the viewer picks periods at all comes from dateMode (see VF_DATE_PERIODS).
 const VF_DATE_COMPONENTS: { key: ViewFilterComponent; label: string }[] = [
-  { key: "singleDropdown", label: "Single Select Box" },
-  { key: "multiList", label: "Multi Select Box" },
+  { key: "singleDropdown", label: "One period" },
+  { key: "multiDropdown", label: "Multiple periods" },
 ]
 
 // A date filter's "period type" — the app's existing dateMode, surfaced under the reference's
@@ -6650,8 +6690,11 @@ function viewFilterComponents(type: FieldType): { key: ViewFilterComponent; labe
 
 // The component actually in force: the builder's explicit pick, else the type's default.
 function resolveViewFilterComponent(rule: FilterRule): ViewFilterComponent {
-  if (rule.vfComponent) return rule.vfComponent
-  return isNumericType(rule.type) ? "sliderDouble" : "multiList"
+  const c = rule.vfComponent
+  if (c === "singleList") return "singleDropdown"
+  if (c === "multiList" || c === "multiCustomList") return "multiDropdown"
+  if (c) return c
+  return isNumericType(rule.type) ? "sliderDouble" : "multiDropdown"
 }
 
 // Categorical (text/person) "Wildcard" tab match types — one condition row per entry,
@@ -6939,6 +6982,103 @@ function RangeSlider({ min, max, value, value2, onChange }: {
   )
 }
 
+// ── Inline calendar for the date filter's Range tab ──
+const pad2 = (n: number) => String(n).padStart(2, "0")
+const toISODay = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+const parseISODay = (s: string) => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d) }
+const fmtCalDate = (s: string) => {
+  const d = parseISODay(s)
+  return `${d.getDate()} ${MONTH_SHORT[d.getMonth()]} ${d.getFullYear()}`
+}
+const WEEKDAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+
+/** One month grid (Monday first). After/Before pick one day; Between picks a start then an end,
+    previewing the span on hover. One month at a time; arrows move between months. */
+function RangeCalendar({ mode, from, to, onPick }: {
+  mode: "after" | "before" | "between"
+  from: string
+  to: string
+  onPick: (from: string, to: string) => void
+}) {
+  const anchor = from ? parseISODay(from) : TODAY
+  const [view, setView] = useState(() => new Date(anchor.getFullYear(), anchor.getMonth(), 1))
+  const [hover, setHover] = useState("")
+  const months = [view]
+  const shift = (n: number) => setView(new Date(view.getFullYear(), view.getMonth() + n, 1))
+  const today = toISODay(TODAY)
+
+  // The span to shade: the picked range, or start → hovered day while choosing the end.
+  const spanEnd = mode === "between" ? (to || (from && hover > from ? hover : "")) : ""
+  const pick = (day: string) => {
+    if (mode !== "between") return onPick(day, "")
+    if (!from || to || day < from) return onPick(day, "")
+    onPick(from, day)
+  }
+
+  return (
+    <div className="flex gap-6 select-none" onMouseLeave={() => setHover("")}>
+      {months.map((m, mi) => {
+        const lead = (m.getDay() + 6) % 7
+        const daysIn = new Date(m.getFullYear(), m.getMonth() + 1, 0).getDate()
+        const cells: (string | null)[] = [
+          ...Array.from({ length: lead }, () => null),
+          ...Array.from({ length: daysIn }, (_, i) => toISODay(new Date(m.getFullYear(), m.getMonth(), i + 1))),
+        ]
+        return (
+          <div key={mi} className="w-full">
+            <div className="flex items-center justify-between mb-2 h-7">
+              {mi === 0
+                ? <button onClick={() => shift(-1)} aria-label="Previous month" className="p-1.5 rounded-md text-gray-500 hover:bg-gray-100"><span className="rotate-180 inline-flex"><Ic.ChevRight size={12} /></span></button>
+                : <span className="w-7" />}
+              <span className="text-[13px] font-semibold text-gray-800">{MONTH_NAMES[m.getMonth()]} {m.getFullYear()}</span>
+              {mi === months.length - 1
+                ? <button onClick={() => shift(1)} aria-label="Next month" className="p-1.5 rounded-md text-gray-500 hover:bg-gray-100"><Ic.ChevRight size={12} /></button>
+                : <span className="w-7" />}
+            </div>
+            <div className="grid grid-cols-7">
+              {WEEKDAYS.map((w) => <span key={w} className="h-8 flex items-center justify-center text-[11px] font-medium text-gray-400">{w}</span>)}
+              {cells.map((day, i) => {
+                if (!day) return <span key={`b${i}`} className="h-9" />
+                const isStart = day === from
+                const isEnd = mode === "between" && day === spanEnd
+                const inSpan = mode === "between" && !!from && !!spanEnd && day > from && day < spanEnd
+                // After/Before: shade the side of the picked day that the filter keeps.
+                const inSide = !!from && ((mode === "after" && day > from) || (mode === "before" && day < from))
+                const picked = isStart || isEnd
+                // The shaded band runs edge to edge; on a picked day it starts or stops at the
+                // day's centre so the band joins the highlighted chip.
+                const band = inSpan || inSide ? "bg-indigo-50"
+                  : mode === "between" && isStart && spanEnd && spanEnd !== from ? "bg-gradient-to-r from-transparent from-50% to-indigo-50 to-50%"
+                  : mode === "between" && isEnd && !isStart ? "bg-gradient-to-r from-indigo-50 from-50% to-transparent to-50%"
+                  : mode === "after" && isStart ? "bg-gradient-to-r from-transparent from-50% to-indigo-50 to-50%"
+                  : mode === "before" && isStart ? "bg-gradient-to-r from-indigo-50 from-50% to-transparent to-50%"
+                  : ""
+                return (
+                  <button
+                    key={day}
+                    onClick={() => pick(day)}
+                    onMouseEnter={() => setHover(day)}
+                    className={`group h-9 flex items-center justify-center ${band}`}
+                  >
+                    <span className={`w-9 h-9 flex items-center justify-center rounded-lg text-[13px] transition-colors
+                      ${picked ? "bg-indigo-600 text-white font-semibold"
+                        : inSpan || inSide ? "text-indigo-700 group-hover:bg-indigo-100"
+                        : "text-gray-700 group-hover:bg-gray-100"}
+                      ${!picked && day === today ? "ring-1 ring-inset ring-indigo-300" : ""}`}
+                    >
+                      {Number(day.slice(8))}
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 function DateFilterModal({ rule, onChange, onClose, strip, timelineMetricKeys }: {
   rule: FilterRule
   onChange: (patch: Partial<FilterRule>) => void
@@ -7103,35 +7243,36 @@ function DateFilterModal({ rule, onChange, onClose, strip, timelineMetricKeys }:
 
           {/* ── Range ── */}
           {mode === "range" && (
-            <div className="flex-1 p-5 flex flex-col gap-5">
-              {/* Op buttons */}
-              <div>
-                <p className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Filter type</p>
-                <div className="flex gap-2">
-                  {(["after", "before", "between"] as const).map(op => (
-                    <button key={op} onClick={() => onChange({ dateRangeOp: op, dateFrom: "", dateTo: "" })}
-                      className={`px-4 py-1.5 rounded-lg border text-[13px] font-medium transition-colors capitalize
-                        ${rangeOp === op ? "bg-indigo-600 text-white border-indigo-600" : "border-gray-200 text-gray-600 hover:border-indigo-300 hover:text-indigo-600"}`}
-                    >{op}</button>
-                  ))}
+            <div className="flex-1 px-5 py-4 flex flex-col gap-3 overflow-y-auto">
+              <div className="flex items-center gap-3">
+                <div className="relative w-40 shrink-0">
+                  <select
+                    value={rangeOp}
+                    onChange={(e) => onChange({ dateRangeOp: e.target.value as "after" | "before" | "between", dateFrom: "", dateTo: "" })}
+                    aria-label="Filter type"
+                    className="appearance-none w-full border border-gray-200 rounded-lg pl-3 pr-8 py-1.5 text-[13px] font-medium text-gray-700 bg-white cursor-pointer focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100"
+                  >
+                    <option value="after">After</option>
+                    <option value="before">Before</option>
+                    <option value="between">Between</option>
+                  </select>
+                  <span className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400"><Ic.ChevDown /></span>
                 </div>
+                <span className="text-[13px] text-gray-500 truncate">
+                  {rangeOp === "between"
+                    ? (rule.dateFrom
+                        ? <><span className="text-gray-800 font-medium">{fmtCalDate(rule.dateFrom)}</span> – {rule.dateTo ? <span className="text-gray-800 font-medium">{fmtCalDate(rule.dateTo)}</span> : "pick an end date"}</>
+                        : "Pick a start date")
+                    : (rule.dateFrom ? <span className="text-gray-800 font-medium">{fmtCalDate(rule.dateFrom)}</span> : "Pick a date")}
+                </span>
               </div>
 
-              {/* Date input(s) */}
-              <div className="flex gap-4">
-                <div className="flex-1">
-                  <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider block mb-1.5">
-                    {rangeOp === "after" ? "After date" : rangeOp === "before" ? "Before date" : "From"}
-                  </label>
-                  <input type="date" value={rule.dateFrom ?? ""} onChange={e => onChange({ dateFrom: e.target.value })} className={inputCls} />
-                </div>
-                {rangeOp === "between" && (
-                  <div className="flex-1">
-                    <label className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider block mb-1.5">To</label>
-                    <input type="date" value={rule.dateTo ?? ""} onChange={e => onChange({ dateTo: e.target.value })} className={inputCls} />
-                  </div>
-                )}
-              </div>
+              <RangeCalendar
+                mode={rangeOp}
+                from={rule.dateFrom ?? ""}
+                to={rule.dateTo ?? ""}
+                onPick={(from, to) => onChange({ dateFrom: from, dateTo: to })}
+              />
 
               <NullToggle />
             </div>
@@ -8568,7 +8709,7 @@ function ViewFilterSettings({ rule, options, anchorRef, flat, onChange, onClose 
           {/* Component type — a date pairs a period-type picker with the widget picker, since
               "which periods" and "how they're presented" are separate choices. */}
           <div>
-            <label className="text-[11px] text-gray-500 block mb-1">Choose component type</label>
+            <label className="text-[11px] text-gray-500 block mb-1">{isNumericField ? "Viewers filter with" : "Viewers can pick"}</label>
             {isDateField && (
               <select
                 value={rule.dateMode ?? "actual"}
@@ -8607,7 +8748,6 @@ function ViewFilterSettings({ rule, options, anchorRef, flat, onChange, onClose 
               ))}
             </select>
             )}
-            <p className="text-[10px] text-gray-400 mt-1">This component will be used to display the filter.</p>
           </div>
 
           {/* Aggregate — only meaningful when there are groups to aggregate over */}
@@ -8933,7 +9073,7 @@ function ViewFilterCard({ rule, baseRules, source, fields, aggregations, rangeCo
         </select>
       </div>
     )
-  } else if (component === "multiDropdown") {
+  } else if (component === "multiDropdown" || component === "multiSelectBox") {
     body = (
       <div className="px-2.5 py-2">
         <button
