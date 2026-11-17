@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useLayoutEffect, useMemo, Fragment } from "react"
+import { useState, useRef, useEffect, useLayoutEffect, useMemo, Fragment, createContext, useContext } from "react"
 import { createPortal } from "react-dom"
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -1178,16 +1178,234 @@ function fieldKeyModule(key: string): string {
 }
 
 function fieldDisplayName(key: string): string {
+  if (isFormulaKey(key)) return formulaOf(key)?.name ?? "Deleted formula"
   const i = key.indexOf("::")
   return i === -1 ? key : key.slice(i + 2)
 }
 
 function getFieldType(key: string): FieldType {
   if (key === TIMELINE_KEY) return "date"
+  if (isFormulaKey(key)) return "number"
   const mod = MODULES.find((m) => m.name === fieldKeyModule(key))
   const field = mod?.fields.find((f) => f.name === fieldDisplayName(key))
   return field?.type ?? "text"
 }
+
+// ── Formula fields (today's feature, carried over unchanged) ─────────────────────
+// A formula is saved for the account against a source, like today: every report on that source
+// lists it. It references up to 26 number or date fields as the letters A–Z and holds one
+// expression over them. In a pivot it is worked out per cell from its fields' totals, and totals
+// are the formula over the totalled fields (sum(A)/sum(B)). In a table it is worked out per record.
+const FORMULA_PREFIX = "Formula::"
+interface FormulaRef { letter: string; field: string }
+interface FormulaDef {
+  id: string
+  name: string
+  source: string
+  refs: FormulaRef[]
+  expression: string
+  excludeWeekends: boolean
+}
+const FORMULAS_KEY = "customReportsV2.formulaFields"
+let FORMULAS: FormulaDef[] = (() => {
+  try { const raw = localStorage.getItem(FORMULAS_KEY); return raw ? JSON.parse(raw) : [] } catch { return [] }
+})()
+const formulaListeners = new Set<() => void>()
+function setFormulas(next: FormulaDef[]) {
+  FORMULAS = next
+  try { localStorage.setItem(FORMULAS_KEY, JSON.stringify(next)) } catch { /* private mode */ }
+  formulaListeners.forEach((l) => l())
+}
+/** Re-renders the caller whenever a formula is created, edited or deleted. */
+function useFormulas(): FormulaDef[] {
+  const [, bump] = useState(0)
+  useEffect(() => {
+    const l = () => bump((n) => n + 1)
+    formulaListeners.add(l)
+    return () => { formulaListeners.delete(l) }
+  }, [])
+  return FORMULAS
+}
+function isFormulaKey(key: string): boolean { return key.startsWith(FORMULA_PREFIX) }
+function formulaKeyOf(def: FormulaDef): string { return FORMULA_PREFIX + def.id }
+function formulaOf(key: string): FormulaDef | undefined {
+  return isFormulaKey(key) ? FORMULAS.find((f) => FORMULA_PREFIX + f.id === key) : undefined
+}
+const FORMULA_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("")
+
+// The expression language today's engine accepts: numbers, the letters, + − * /, comparisons,
+// parentheses, and IF, ISNULL, ISNUMBER, ISBLANK, NULLVALUE, BLANKVALUE, TODAY. Date minus date
+// gives days. Anything null makes the result null, and dividing by zero gives null (a blank cell).
+type FVal = number | boolean | { day: number } | null
+const DAY_MS = 86400000
+const toDay = (v: any): { day: number } | null => {
+  if (v == null || v === "") return null
+  const d = v instanceof Date ? v : new Date(v)
+  return Number.isNaN(d.getTime()) ? null : { day: Math.floor((d.getTime() - d.getTimezoneOffset() * 60000) / DAY_MS) }
+}
+function businessDaysBetween(fromDay: number, toDay_: number): number {
+  const sign = toDay_ >= fromDay ? 1 : -1
+  let n = 0
+  for (let d = Math.min(fromDay, toDay_); d < Math.max(fromDay, toDay_); d++) {
+    const wd = new Date(d * DAY_MS).getUTCDay()
+    if (wd !== 0 && wd !== 6) n++
+  }
+  return n * sign
+}
+
+interface FormulaAst { k: string; v?: any; a?: FormulaAst; b?: FormulaAst; args?: FormulaAst[]; op?: string }
+function parseFormula(src: string): FormulaAst {
+  const toks: string[] = []
+  const re = /\s*(\d+\.?\d*|\.\d+|[A-Za-z_][A-Za-z_]*|<>|<=|>=|[-+*/(),<>=%])/y
+  let i = 0
+  const text = src.trim()
+  while (i < text.length) {
+    re.lastIndex = i
+    const m = re.exec(text)
+    if (!m) throw new Error("bad token")
+    toks.push(m[1].toUpperCase())
+    i = re.lastIndex
+    while (i < text.length && /\s/.test(text[i])) i++
+  }
+  let p = 0
+  const peek = () => toks[p]
+  const eat = (t?: string) => { const x = toks[p]; if (t && x !== t) throw new Error(`expected ${t}`); p++; return x }
+  const primary = (): FormulaAst => {
+    const t = peek()
+    if (t == null) throw new Error("unexpected end")
+    if (t === "(") { eat("("); const e = comparison(); eat(")"); return e }
+    if (t === "-") { eat(); return { k: "neg", a: primary() } }
+    if (/^[\d.]/.test(t)) { eat(); return { k: "num", v: Number(t) } }
+    if (/^[A-Z_]+$/.test(t)) {
+      eat()
+      if (peek() === "(") {
+        eat("(")
+        const args: FormulaAst[] = []
+        if (peek() !== ")") { args.push(comparison()); while (peek() === ",") { eat(","); args.push(comparison()) } }
+        eat(")")
+        return { k: "fn", v: t, args }
+      }
+      if (t === "NULL") return { k: "null" }
+      if (t.length !== 1) throw new Error("unknown name")
+      return { k: "ref", v: t }
+    }
+    throw new Error("unexpected token")
+  }
+  const term = (): FormulaAst => {
+    let a = primary()
+    while (peek() === "*" || peek() === "/") { const op = eat(); a = { k: "bin", op, a, b: primary() } }
+    return a
+  }
+  const additive = (): FormulaAst => {
+    let a = term()
+    while (peek() === "+" || peek() === "-") { const op = eat(); a = { k: "bin", op, a, b: term() } }
+    return a
+  }
+  const comparison = (): FormulaAst => {
+    const a = additive()
+    const op = peek()
+    if (op && ["=", "<>", "<", ">", "<=", ">="].includes(op)) { eat(); return { k: "bin", op, a, b: additive() } }
+    return a
+  }
+  const ast = comparison()
+  if (p !== toks.length) throw new Error("trailing tokens")
+  return ast
+}
+
+function evalFormula(ast: FormulaAst, env: Record<string, FVal>, excludeWeekends: boolean): FVal {
+  const ev = (n: FormulaAst): FVal => evalFormula(n, env, excludeWeekends)
+  const isDay = (v: FVal): v is { day: number } => typeof v === "object" && v !== null
+  const num = (v: FVal): number | null => v == null ? null : typeof v === "boolean" ? (v ? 1 : 0) : isDay(v) ? v.day : v
+  switch (ast.k) {
+    case "num": return ast.v
+    case "null": return null
+    case "ref": return env[ast.v] ?? null
+    case "neg": { const v = num(ev(ast.a!)); return v == null ? null : -v }
+    case "fn": {
+      const args = ast.args ?? []
+      switch (ast.v) {
+        case "IF": { const c = ev(args[0]); return c ? ev(args[1]) : args[2] ? ev(args[2]) : null }
+        case "ISNULL": case "ISBLANK": return ev(args[0]) == null
+        case "ISNUMBER": { const v = ev(args[0]); return typeof v === "number" }
+        case "NULLVALUE": case "BLANKVALUE": { const v = ev(args[0]); return v == null ? ev(args[1]) : v }
+        case "TODAY": return toDay(TODAY)
+        default: throw new Error("unknown function")
+      }
+    }
+    case "bin": {
+      const a = ev(ast.a!), b = ev(ast.b!)
+      if (a == null || b == null) return null
+      if (ast.op === "-" && isDay(a) && isDay(b)) {
+        return excludeWeekends ? businessDaysBetween(b.day, a.day) : a.day - b.day
+      }
+      const x = num(a)!, y = num(b)!
+      switch (ast.op) {
+        case "+": return isDay(a) || isDay(b) ? { day: x + y } : x + y
+        case "-": return isDay(a) ? { day: x - y } : x - y
+        case "*": return x * y
+        case "/": return y === 0 ? null : x / y
+        case "=": return x === y
+        case "<>": return x !== y
+        case "<": return x < y
+        case ">": return x > y
+        case "<=": return x <= y
+        case ">=": return x >= y
+      }
+    }
+  }
+  return null
+}
+
+/** Today's save-time checks. Any failure gets the same generic error the product shows. */
+function formulaIsValid(expression: string, refs: FormulaRef[]): boolean {
+  const expr = expression.trim()
+  if (!/^[a-zA-Z0-9\s+\-*/(),<>=._%]+$/.test(expr)) return false
+  if (/^[+*/<>=,]/.test(expr)) return false
+  let ast: FormulaAst
+  try { ast = parseFormula(expr) } catch { return false }
+  const types = new Map(refs.map((r) => [r.letter, getFieldType(r.field)]))
+  let ok = true
+  // Returns "date" | "number" for the node, and flags what today's validator rejects:
+  // an unknown letter, multiplying or dividing a date, adding two dates, a date on its own.
+  const kind = (n: FormulaAst): "date" | "number" => {
+    switch (n.k) {
+      case "ref": {
+        if (!types.has(n.v)) { ok = false; return "number" }
+        return types.get(n.v) === "date" ? "date" : "number"
+      }
+      case "fn": {
+        if (!["IF", "ISNULL", "ISBLANK", "ISNUMBER", "NULLVALUE", "BLANKVALUE", "TODAY"].includes(n.v)) ok = false
+        const ks = (n.args ?? []).map(kind)
+        if (n.v === "TODAY") return "date"
+        if (n.v === "IF") return ks[1] ?? "number"
+        if (n.v === "NULLVALUE" || n.v === "BLANKVALUE") return ks[0] ?? "number"
+        return "number"
+      }
+      case "neg": return kind(n.a!)
+      case "bin": {
+        const a = kind(n.a!), b = kind(n.b!)
+        if ((n.op === "*" || n.op === "/") && (a === "date" || b === "date")) ok = false
+        if (n.op === "+" && a === "date" && b === "date") ok = false
+        if (n.op === "-" && a === "date" && b === "date") return "number"
+        return a === "date" || b === "date" ? "date" : "number"
+      }
+    }
+    return "number"
+  }
+  if (kind(ast) === "date") return false
+  return ok
+}
+
+function formulaNumber(def: FormulaDef, env: Record<string, FVal>): number {
+  try {
+    const v = evalFormula(parseFormula(def.expression), env, def.excludeWeekends)
+    if (v == null) return NaN
+    if (typeof v === "boolean") return v ? 1 : 0
+    if (typeof v === "object") return v.day
+    return Number.isFinite(v) ? v : NaN
+  } catch { return NaN }
+}
+const formulaHasDates = (def: FormulaDef) => def.refs.some((r) => getFieldType(r.field) === "date")
 
 const MULTI_FIELDS = new Set<string>()
 // Filled once MODULES exists — read through isMultiField, never before render.
@@ -2440,6 +2658,13 @@ function withinWindow(v: any, window: DateWindow): boolean {
 // Resolves a "Module::Field" key against a row at any grain — own field, ancestor
 // dimension, or rollup-collection — using the FK ids every generated row carries.
 function resolveFieldForRow(grainModule: string, row: Row, targetKey: string, dateWindow: DateWindow | null, role?: string): any {
+  if (isFormulaKey(targetKey)) {
+    // A table row is one record: the formula over that record's own values (children totalled).
+    const def = formulaOf(targetKey)
+    if (!def) return undefined
+    const n = formulaNumber(def, formulaEnvForRow(def, grainModule, row))
+    return Number.isNaN(n) ? undefined : Math.round(n * 100) / 100
+  }
   const targetModule = fieldKeyModule(targetKey)
   const targetField = fieldDisplayName(targetKey)
   if (targetModule === grainModule) {
@@ -2490,6 +2715,63 @@ function resolveGroupCurrency(buckets: Row[][], grainModule: string): string | n
 // The grain implied purely by which fields are in play. This is what the chips ask about, so
 // it must not itself depend on the roles they have chosen — otherwise picking a role could
 // change which roles are on offer.
+// A formula in Values stands in for the fields it is made of when the report decides its records
+// and checks splits. Each letter becomes a stand-in value whose id is "<formula chip id>#<letter>".
+function expandFormulaValues(fields: PivotFields): PivotFields {
+  if (!fields.values.some((v) => isFormulaKey(v.field))) return fields
+  return {
+    ...fields,
+    values: fields.values.flatMap((v) => {
+      if (!isFormulaKey(v.field)) return [v]
+      const def = formulaOf(v.field)
+      return def ? def.refs.map((r) => ({ id: `${v.id}#${r.letter}`, field: r.field })) : []
+    }),
+  }
+}
+const FORMULA_VALUES_ONLY = "Formula fields can only go in Values"
+
+// Which record of a module a report row stands for — used to count a per-record date formula once.
+function ownerIdAt(grainModule: string, row: Row, mod: string): any {
+  if (mod === grainModule) return row.id
+  const dimKey = DIMENSION_ID_KEY[mod]
+  if (dimKey) return row[dimKey]
+  const fk = ROLLUP_FK[mod]
+  if (fk) return MODULE_OWN_ID_KEY[grainModule] === fk ? row.id : row[fk]
+  return row.id
+}
+function formulaEnvForRow(def: FormulaDef, grainModule: string, row: Row): Record<string, FVal> {
+  const env: Record<string, FVal> = {}
+  def.refs.forEach((r) => {
+    const raw = resolveFieldForRow(grainModule, row, r.field, null)
+    if (getFieldType(r.field) === "date") env[r.letter] = toDay(raw)
+    else { const n = Number(raw); env[r.letter] = raw == null || raw === "" || Number.isNaN(n) ? null : n }
+  })
+  return env
+}
+/** A formula over a set of report rows: each letter's field totalled over them, then the formula
+    (so a total is sum(A)/sum(B)). A formula on dates is worked out per record and then summed. */
+function formulaOverRows(def: FormulaDef, rows: Row[], grainModule: string): number {
+  if (formulaHasDates(def)) {
+    const seen = new Set<string>()
+    let any = false, sum = 0
+    rows.forEach((row) => {
+      const key = def.refs.map((r) => String(ownerIdAt(grainModule, row, fieldKeyModule(r.field)))).join("|")
+      if (seen.has(key)) return
+      seen.add(key)
+      const n = formulaNumber(def, formulaEnvForRow(def, grainModule, row))
+      if (!Number.isNaN(n)) { any = true; sum += n }
+    })
+    return any ? Math.round(sum * 100) / 100 : NaN
+  }
+  const env: Record<string, FVal> = {}
+  def.refs.forEach((r) => {
+    env[r.letter] = rows.length === 0 ? null
+      : aggregateBucket(rows, grainModule, { id: `${def.id}#${r.letter}`, field: r.field }, "Sum", getFieldType(r.field))
+  })
+  const n = formulaNumber(def, env)
+  return Number.isNaN(n) ? NaN : Math.round(n * 100) / 100
+}
+
 function pickGrain(source: string, fields: PivotFields, filterRules: FilterRule[], extra?: Set<string>): string {
   // A form submission belongs to one task, project, account and submitter, so everything a
   // template report reaches is a lookup from the submission: the records stay the submissions.
@@ -2502,7 +2784,7 @@ function pickGrain(source: string, fields: PivotFields, filterRules: FilterRule[
   // totalled from their own records, one level up — at the record of either table, every
   // record of the other would be brought in again. Nothing splits by either table's own fields
   // here; if something did, the report would have to be at that table's records.
-  const valueMods = [...new Set(fields.values.map((item) => fieldKeyModule(item.field)))]
+  const valueMods = [...new Set(expandFormulaValues(fields).values.map((item) => fieldKeyModule(item.field)))]
   const siblings = valueMods.filter((m) => reachable.has(m) && ROLLUP_FK[m] && !used.has(m))
   const parentOf = (m: string) => Object.keys(MODULE_OWN_ID_KEY).find((k) => MODULE_OWN_ID_KEY[k] === ROLLUP_FK[m])
   if (siblings.length >= 2) {
@@ -2584,7 +2866,11 @@ function splitConflicts(
   const rows = MODULE_ROWS[grain] ?? []
   const splits = [...fields.rows, ...fields.columns].filter((s) => s.field !== TIMELINE_KEY)
   const out: SplitConflict[] = []
-  for (const v of fields.values) {
+  // A formula splits like the fields it is made of: it can go under a row only if every one of
+  // its letters can, and the message names the formula.
+  for (const v of expandFormulaValues(fields).values) {
+    const ownerId = v.id.split("#")[0]
+    const shownKey = fields.values.find((it) => it.id === ownerId)?.field ?? v.field
     const m = fieldKeyModule(v.field)
     if (m === grain || !isNumericType(getFieldType(v.field))) continue
     // Which record of the number's table each report row stands for: a looked-up parent's id,
@@ -2612,10 +2898,10 @@ function splitConflicts(
         if (prev === undefined) { seen.set(id, label); return false }
         return prev !== label
       })
-      if (clash) {
+      if (clash && !out.some((c) => c.valueId === ownerId && c.splitId === s.id)) {
         out.push({
-          valueId: v.id, splitId: s.id,
-          message: `${splitValueName(v.field)} can't be split by ${fieldDisplayName(s.field)}: one ${noun} has several`,
+          valueId: ownerId, splitId: s.id,
+          message: `${isFormulaKey(shownKey) ? fieldDisplayName(shownKey) : splitValueName(v.field)} can't be split by ${fieldDisplayName(s.field)}: one ${noun} has several`,
         })
       }
     }
@@ -2631,6 +2917,7 @@ function pivotDropBlockReason(
   zone: PivotZoneKey, field: string, id?: string,
 ): string | null {
   if (field === TIMELINE_KEY) return null
+  if (isFormulaKey(field) && zone !== "values") return FORMULA_VALUES_ONLY
   const itemId = id ?? PENDING_ITEM_ID
   const without = (arr: PivotItem[]) => arr.filter((it) => it.id !== itemId)
   const next: PivotFields = { columns: without(fields.columns), rows: without(fields.rows), values: without(fields.values) }
@@ -3762,6 +4049,10 @@ function computeReportData(
     if (!item) return 0
     // NaN renders blank, and the totals below skip it.
     if (!shown(ri, ci, vi)) return NaN
+    if (isFormulaKey(item.field)) {
+      const def = formulaOf(item.field)
+      return def ? formulaOverRows(def, bucketRows(ri, ci), grainModule) : NaN
+    }
     const { type, agg } = aggOf(item)
     const rows = bucketRows(ri, ci)
     if ((tlActive || tlRowActive) && follows(item)) {
@@ -3801,12 +4092,21 @@ function computeReportData(
   const NON_ADDITIVE = ["Distinct Count", "Average", "Min", "Max"]
   const distinctTotals = (vi: number) => !tlActive && !tlRowActive
     && (splitsRecords || (!!fields.values[vi] && NON_ADDITIVE.includes(aggOf(fields.values[vi]).agg)))
+  // A formula's total is the formula over its fields' totals, never the sum of its cells.
+  const formulaTotal = (cells: [number, number][], vi: number): number => {
+    const def = formulaOf(fields.values[vi].field)
+    if (!def) return NaN
+    return formulaOverRows(def, [...new Set(cells.flatMap(([ri, ci]) => bucketRows(ri, ci)))], grainModule)
+  }
+  const isFormulaAt = (vi: number) => !!fields.values[vi] && isFormulaKey(fields.values[vi].field)
   const groupCell = (leaves: number[], ci: number, vi: number): number =>
-    distinctTotals(vi)
+    isFormulaAt(vi) ? formulaTotal(leaves.map((ri) => [ri, ci]), vi)
+    : distinctTotals(vi)
       ? distinctTotal(leaves.map((ri) => [ri, ci]), vi)
       : sumShown(leaves.map((ri) => cellNum(ri, ci, vi)))
   const groupTotal = (leaves: number[], vi: number): number =>
-    distinctTotals(vi)
+    isFormulaAt(vi) ? formulaTotal(leaves.flatMap((ri) => allCols.map((ci): [number, number] => [ri, ci])), vi)
+    : distinctTotals(vi)
       ? distinctTotal(leaves.flatMap((ri) => allCols.map((ci): [number, number] => [ri, ci])), vi)
       : sumShown(leaves.flatMap((ri) => allCols.map((ci) => cellNum(ri, ci, vi))))
   const rowTotal = (ri: number, vi: number): number => groupTotal([ri], vi)
@@ -4999,6 +5299,8 @@ function Toolbar({ source, setSource, fields, reportView, onReportViewChange, sh
           </button>
         </div>
 
+        {reportMode === "create" && <HighlightToolbarButton />}
+
         {/* Show/hide totals (grand total + subtotals) — also in the settings panel */}
         <button
           title={showTotals ? "Hide totals" : "Show totals"}
@@ -5346,6 +5648,733 @@ function FieldFormatListItem({ item, zone, format, onChange }: {
 
 // ── Field browser (left panel) ─────────────────────────────────────────────────
 
+// ── Formula fields & conditional highlighting: shared host ───────────────────────
+// Both features are today's, brought over unchanged — same wording, same rules, same saved shape.
+// The builders render a ReportExtrasHost, which owns the two drawers and the toasts; shelves,
+// chips, the field list, the toolbar and the table reach it through this context.
+
+type HighlightCondition = "GREATER_THAN" | "LESSER_THAN" | "EQUALS"
+interface HighlightRule {
+  ruleId: string
+  /** The field the rule colours — every chip of that field shares its rules, as today. */
+  fieldName: string
+  fieldLabel: string
+  highlightingType: "SINGLE_COLOR" | "MULTI_COLOR"
+  conditionType?: HighlightCondition
+  threshold?: string
+  color?: string
+  multiColorType?: "CUSTOM" | "SMART"
+  min?: number
+  max?: number
+  paletteType?: string
+}
+
+const HL_COLORS: Record<string, { bg: string; white?: boolean }> = {
+  Green20: { bg: "#D1FAE5" }, Green30: { bg: "#A7F3D0" }, Green40: { bg: "#34D399", white: true }, Green50: { bg: "#059669", white: true },
+  Yellow20: { bg: "#FEF3C7" }, Yellow30: { bg: "#FDE68A" }, Yellow40: { bg: "#F59E0B", white: true }, Yellow50: { bg: "#D97706", white: true },
+  Red20: { bg: "#FEE2E2" }, Red30: { bg: "#FCA5A5" }, Red40: { bg: "#EF4444", white: true }, Red50: { bg: "#B91C1C", white: true },
+}
+const HL_SINGLE_SWATCHES = ["Green40", "Green20", "Yellow30", "Yellow50", "Red20", "Red40"]
+const HL_PALETTES: { id: string; group: "Multi color" | "Single color"; colors: string[] }[] = [
+  { id: "MULTI", group: "Multi color", colors: ["Green40", "Green20", "Yellow30", "Yellow40", "Red20", "Red40"] },
+  { id: "GREEN", group: "Single color", colors: ["Green20", "Green30", "Green40", "Green50"] },
+  { id: "YELLOW", group: "Single color", colors: ["Yellow20", "Yellow30", "Yellow40", "Yellow50"] },
+  { id: "RED", group: "Single color", colors: ["Red20", "Red30", "Red40", "Red50"] },
+]
+const HL_CONDITION_LABEL: Record<HighlightCondition, string> = {
+  GREATER_THAN: "Greater than", LESSER_THAN: "Lesser than", EQUALS: "Equals to",
+}
+
+function hlRuleText(r: HighlightRule): string {
+  if (r.highlightingType === "MULTI_COLOR") return r.multiColorType === "SMART" ? "Smart highlight" : `Min ${r.min} - Max ${r.max}`
+  if (r.conditionType === "GREATER_THAN") return `is greater than ${r.threshold}`
+  if (r.conditionType === "LESSER_THAN") return `less than ${r.threshold}`
+  return `equals ${r.threshold}`
+}
+
+/** The colour a cell gets: the first of its field's rules that matches, in the drawer's order.
+    The value is rounded the way it is shown before it is compared. */
+function hlColorFor(rules: HighlightRule[], fieldKey: string, n: number): { bg: string; white?: boolean } | null {
+  if (!Number.isFinite(n)) return null
+  const v = Math.round(n * 100) / 100
+  for (const r of rules) {
+    if (r.fieldName !== fieldKey) continue
+    if (r.highlightingType === "SINGLE_COLOR") {
+      const t = Number(r.threshold)
+      if (Number.isNaN(t)) continue
+      const hit = r.conditionType === "GREATER_THAN" ? v > t : r.conditionType === "LESSER_THAN" ? v < t : v === t
+      if (hit && r.color && HL_COLORS[r.color]) return HL_COLORS[r.color]
+    } else {
+      const pal = HL_PALETTES.find((p) => p.id === r.paletteType)
+      if (!pal || r.min == null || r.max == null || r.max <= r.min) continue
+      if (v < r.min || v > r.max) continue
+      const k = pal.colors.length
+      const band = Math.min(k - 1, Math.floor(((v - r.min) / (r.max - r.min)) * k))
+      return HL_COLORS[pal.colors[band]]
+    }
+  }
+  return null
+}
+
+interface ReportExtrasCtx {
+  highlightRules: HighlightRule[]
+  /** Opens the highlighting drawer — on a field's rules when one is given. */
+  openHighlight: (fieldKey?: string) => void
+  /** Opens the formula editor: a new formula, or an existing one to edit. */
+  openFormula: (editing?: FormulaDef) => void
+  deleteFormula: (def: FormulaDef) => void
+  /** The shelf that carries the "+ Formula" button: Values in a pivot, Columns in a table. */
+  formulaZone: ZoneKey | null
+  /** Which fields can be highlighted (the report's number values / number columns). */
+  canHighlight: boolean
+}
+const ReportExtras = createContext<ReportExtrasCtx>({
+  highlightRules: [], openHighlight: () => {}, openFormula: () => {}, deleteFormula: () => {}, formulaZone: null, canHighlight: false,
+})
+
+/** The cell style a highlight rule gives a value, or nothing. */
+function useHighlightStyle() {
+  const { highlightRules } = useContext(ReportExtras)
+  return (fieldKey: string, n: number): React.CSSProperties | undefined => {
+    const c = hlColorFor(highlightRules, fieldKey, n)
+    return c ? { backgroundColor: c.bg, color: c.white ? "#fff" : undefined } : undefined
+  }
+}
+
+function BrushIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M18.4 2.6a2 2 0 0 1 2.9 2.9L12 14.8 9.2 12z" />
+      <path d="M9.2 12c-2.2 0-3.7 1.6-3.9 3.6-.2 1.6-1 2.7-2.3 3.4 1.2.9 3 1.4 4.8 1.4 3.1 0 5.4-2.3 5.4-5.2z" />
+    </svg>
+  )
+}
+function FxIcon({ size = 13 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 20c1.5 0 2.2-1 2.6-3l1.8-10c.4-2 1.1-3 2.6-3" /><path d="M8 10h7" /><path d="M15 13l5 6" /><path d="M20 13l-5 6" />
+    </svg>
+  )
+}
+
+/** Shows `text` at the pointer while hovering — the instant tooltip a disabled control carries. */
+function HoverTip({ text, children, className }: { text: string | null; children: React.ReactNode; className?: string }) {
+  const [at, setAt] = useState<{ x: number; y: number } | null>(null)
+  return (
+    <span
+      className={className ?? "inline-flex"}
+      onMouseMove={(e) => text && setAt({ x: e.clientX, y: e.clientY })}
+      onMouseLeave={() => setAt(null)}
+    >
+      {children}
+      {text && at && <CursorTooltip text={text} at={at} />}
+    </span>
+  )
+}
+
+// ── Toasts ──
+interface ToastMsg { id: number; kind: "success" | "error"; title: string; message: string }
+function ToastStack({ toasts, onDismiss }: { toasts: ToastMsg[]; onDismiss: (id: number) => void }) {
+  return createPortal(
+    <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[400] flex flex-col gap-2 items-center">
+      {toasts.map((t) => (
+        <div key={t.id} role="status" className="flex items-start gap-2.5 bg-white border border-gray-200 rounded-lg shadow-xl px-3.5 py-2.5 w-[360px] animate-chip-in">
+          <span className={`mt-0.5 w-4 h-4 rounded-full flex items-center justify-center shrink-0 text-white ${t.kind === "success" ? "bg-emerald-500" : "bg-red-500"}`}>
+            {t.kind === "success" ? <Ic.Check /> : <span className="text-[10px] font-bold">!</span>}
+          </span>
+          <div className="flex-1 min-w-0">
+            <p className="text-[13px] font-semibold text-gray-900">{t.title}</p>
+            <p className="text-[12px] text-gray-500 mt-0.5">{t.message}</p>
+          </div>
+          <button onClick={() => onDismiss(t.id)} className="text-gray-300 hover:text-gray-600"><Ic.X size={11} /></button>
+        </div>
+      ))}
+    </div>,
+    document.body,
+  )
+}
+
+// ── Formula editor (today's drawer) ──
+const LETTER_COLORS = ["#6366F1", "#0EA5E9", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6", "#EC4899", "#14B8A6"]
+
+/** The number and date fields a formula on this source can use. Today a formula can reach the
+    source's own fields and the tables beneath it (totalled per record); tables above it are
+    listed but greyed out. */
+function formulaFieldGroups(source: string): { module: string; compatible: boolean; fields: Field[] }[] {
+  const srcRank = MODULE_RANK[source] ?? 0
+  return (SOURCE_MODULES[source] ?? [source])
+    .map((name) => MODULES.find((m) => m.name === name))
+    .filter((m): m is Module => !!m)
+    .map((m) => ({
+      module: m.name,
+      compatible: m.name === source || (MODULE_RANK[m.name] ?? 0) > srcRank,
+      fields: m.fields.filter((f) => isNumericType(f.type) || f.type === "date"),
+    }))
+    .filter((g) => g.fields.length > 0)
+}
+
+function FormulaFieldDrawer({ source, editing, onClose, onSaved, toast }: {
+  source: string
+  editing: FormulaDef | null
+  onClose: () => void
+  onSaved: (def: FormulaDef, created: boolean) => void
+  toast: (t: Omit<ToastMsg, "id">) => void
+}) {
+  const [name, setName] = useState(editing?.name ?? "")
+  const [expression, setExpression] = useState(editing?.expression ?? "")
+  const [refs, setRefs] = useState<FormulaRef[]>(editing?.refs ?? [])
+  const [excludeWeekends, setExcludeWeekends] = useState(editing?.excludeWeekends ?? false)
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [pickerSearch, setPickerSearch] = useState("")
+  const [incompatTip, setIncompatTip] = useState<{ x: number; y: number } | null>(null)
+  const addBtnRef = useRef<HTMLButtonElement>(null)
+  const groups = formulaFieldGroups(source)
+  const hasDate = refs.some((r) => getFieldType(r.field) === "date")
+
+  const addRef = (field: string) => {
+    setRefs((prev) => {
+      if (prev.length + 1 > 26) return prev
+      const used = new Set(prev.map((r) => r.letter))
+      const letter = FORMULA_LETTERS.find((l) => !used.has(l))!
+      return [...prev, { letter, field }]
+    })
+  }
+
+  const missing = !name.trim() && !expression.trim() ? "Field name and formula are required"
+    : !name.trim() ? "Field name is required"
+    : !expression.trim() ? "Formula is required" : null
+
+  const submit = () => {
+    if (missing) return
+    const expr = expression.trim().toUpperCase()
+    if (!formulaIsValid(expr, refs)) {
+      toast({
+        kind: "error", title: "Something went wrong!",
+        message: editing ? "An error occurred while updating the formula field. Please try again." : "An error occurred while creating the formula field. Please try again.",
+      })
+      return
+    }
+    const def: FormulaDef = {
+      id: editing?.id ?? `f${Date.now().toString(36)}`,
+      name: name.trim(), source, refs, expression: expr, excludeWeekends: hasDate && excludeWeekends,
+    }
+    setFormulas(editing ? FORMULAS.map((f) => (f.id === def.id ? def : f)) : [...FORMULAS, def])
+    toast({
+      kind: "success",
+      title: editing ? "Formula field updated!" : "Formula field created!",
+      message: `'${def.name}' field has been ${editing ? "updated" : "created"} successfully.`,
+    })
+    onSaved(def, !editing)
+  }
+
+  const labelCls = "text-[12px] font-medium text-gray-700 block mb-1.5"
+  const q = pickerSearch.trim().toLowerCase()
+
+  return createPortal(
+    <div className="fixed inset-0 z-[200] flex justify-end">
+      <div className="absolute inset-0 bg-black/30" onClick={onClose} />
+      <div className="relative bg-white h-full w-[1110px] max-w-[96vw] shadow-2xl flex flex-col">
+        <div className="flex items-center px-6 py-4 border-b border-gray-200">
+          <span className="text-[16px] font-semibold text-gray-900 flex-1">{editing ? "Edit formula field" : "New formula field"}</span>
+          <button onClick={onClose} aria-label="Close" className="text-gray-400 hover:text-gray-700 p-1 rounded hover:bg-gray-100"><Ic.X size={14} /></button>
+        </div>
+
+        <div className="flex flex-1 min-h-0">
+          {/* Left: the fields the formula uses */}
+          <div className="w-[400px] shrink-0 border-r border-gray-200 p-6 flex flex-col gap-5 overflow-y-auto bg-gray-50/50">
+            <div>
+              <label className={labelCls}>Show fields related to</label>
+              <SettingsSelect value={source} onChange={() => {}} ariaLabel="Show fields related to">
+                <option value={source}>{source}</option>
+              </SettingsSelect>
+              <p className="text-[11px] text-gray-400 mt-1.5">Formula created will also be a {source} field</p>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center">
+                <span className="text-[12px] font-medium text-gray-700 flex-1">Fields used in formula</span>
+                <button
+                  ref={addBtnRef}
+                  onClick={() => setPickerOpen((p) => !p)}
+                  className="flex items-center gap-1 text-[12px] font-medium text-indigo-600 hover:text-indigo-800"
+                >
+                  <span className="text-[14px] leading-none">+</span> Add field
+                </button>
+              </div>
+              {pickerOpen && (
+                <ChipPortalMenu anchorRef={addBtnRef} onClose={() => { setPickerOpen(false); setPickerSearch("") }}>
+                  <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl w-72 overflow-hidden">
+                    <div className="px-2.5 py-2 border-b border-gray-100">
+                      <input
+                        autoFocus value={pickerSearch} onChange={(e) => setPickerSearch(e.target.value)} placeholder="Search…"
+                        className="w-full bg-gray-50 rounded-md px-2.5 py-1.5 text-[13px] focus:outline-none"
+                      />
+                    </div>
+                    <div className="max-h-72 overflow-y-auto py-1">
+                      {groups.map((g) => {
+                        const list = g.fields.filter((f) => !q || f.name.toLowerCase().includes(q) || g.module.toLowerCase().includes(q))
+                        if (list.length === 0) return null
+                        return (
+                          <div key={g.module}>
+                            <p className="px-3 pt-2 pb-1 text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{g.module}</p>
+                            {list.map((f) => {
+                              const key = makeFieldKey(g.module, f.name)
+                              const used = refs.some((r) => r.field === key)
+                              return g.compatible ? (
+                                <button
+                                  key={key}
+                                  onClick={() => !used && addRef(key)}
+                                  className={`flex items-center gap-2 w-full px-3 py-1.5 text-[13px] text-left ${used ? "text-gray-400" : "text-gray-700 hover:bg-indigo-50"}`}
+                                >
+                                  {fieldTypeIcon(f.type)}<span className="flex-1 truncate">{f.name}</span>{used && <Ic.Check />}
+                                </button>
+                              ) : (
+                                <div
+                                  key={key}
+                                  onMouseMove={(e) => setIncompatTip({ x: e.clientX, y: e.clientY })}
+                                  onMouseLeave={() => setIncompatTip(null)}
+                                  className="flex items-center gap-2 px-3 py-1.5 text-[13px] text-gray-300 cursor-not-allowed"
+                                >
+                                  {fieldTypeIcon(f.type)}<span className="flex-1 truncate">{f.name}</span>
+                                </div>
+                              )
+                            })}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                  {incompatTip && <CursorTooltip text="Field is not compatible with the source" at={incompatTip} />}
+                </ChipPortalMenu>
+              )}
+
+              {refs.map((r, i) => {
+                const type = getFieldType(r.field)
+                return (
+                  <div key={r.letter} className="group flex items-center gap-2.5 bg-white border border-gray-200 rounded-lg px-3 py-2">
+                    <span className="w-6 h-6 rounded-full text-white text-[12px] font-bold flex items-center justify-center shrink-0"
+                      style={{ backgroundColor: LETTER_COLORS[i % LETTER_COLORS.length] }}>{r.letter}</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-[13px] text-gray-800 truncate">{fieldDisplayName(r.field)}</p>
+                      <p className="text-[11px] text-gray-400 truncate">{fieldKeyModule(r.field)}</p>
+                    </div>
+                    <select disabled className="border border-gray-200 rounded-md px-1.5 py-1 text-[12px] text-gray-400 bg-gray-50 w-20">
+                      <option>{type === "date" ? "None" : "Sum"}</option>
+                    </select>
+                    <button
+                      onClick={() => setRefs((prev) => prev.filter((x) => x.letter !== r.letter))}
+                      aria-label="Remove field"
+                      className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-gray-600 transition-opacity"
+                    ><Ic.X size={11} /></button>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* Right: name and expression */}
+          <div className="flex-1 p-6 flex flex-col gap-5 overflow-y-auto">
+            <p className="text-[15px] font-semibold text-gray-900">{editing ? "Edit your formula" : "Build your formula"}</p>
+            <div>
+              <label className={labelCls}>Field name <span className="text-red-500">*</span></label>
+              <input
+                value={name} onChange={(e) => setName(e.target.value)} placeholder="Untitled formula"
+                className="w-full border border-gray-200 rounded-md px-3 py-2 text-[13px] focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100"
+              />
+            </div>
+            <div>
+              <label className={labelCls}>Formula <span className="text-red-500">*</span></label>
+              <textarea
+                rows={5} value={expression} onChange={(e) => setExpression(e.target.value)} placeholder="Eg: (A/B)*100"
+                className="w-full border border-gray-200 rounded-md px-3 py-2 text-[13px] resize-y focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100"
+              />
+            </div>
+            {hasDate && (
+              <div>
+                <p className="text-[12px] font-medium text-gray-700 mb-1.5">Advanced</p>
+                <label className="flex items-center gap-2 text-[13px] text-gray-700 cursor-pointer select-none">
+                  <input type="checkbox" checked={excludeWeekends} onChange={(e) => setExcludeWeekends(e.target.checked)} className="w-3.5 h-3.5 accent-indigo-600" />
+                  Skip weekends when calculating duration between dates
+                </label>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 px-6 py-3.5 border-t border-gray-200">
+          <button onClick={onClose} className="px-4 py-1.5 rounded-md text-[13px] text-gray-600 hover:bg-gray-100">Cancel</button>
+          <HoverTip text={missing}>
+            <button
+              onClick={submit}
+              disabled={!!missing}
+              className="px-4 py-1.5 rounded-md text-[13px] font-medium bg-indigo-600 text-white hover:bg-indigo-700 disabled:bg-indigo-300 disabled:cursor-not-allowed"
+            >{editing ? "Update" : "Create"}</button>
+          </HoverTip>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+// ── Conditional highlighting (today's drawer) ──
+function PaletteStrip({ colors }: { colors: string[] }) {
+  return (
+    <span className="inline-flex rounded overflow-hidden border border-gray-200 shrink-0">
+      {colors.map((c) => <span key={c} className="w-4 h-3.5" style={{ backgroundColor: HL_COLORS[c].bg }} />)}
+    </span>
+  )
+}
+
+function HighlightDrawer({ targets, rules, onRulesChange, initialField, onClose }: {
+  /** The number fields this report can highlight, by field key. */
+  targets: { field: string; label: string }[]
+  rules: HighlightRule[]
+  onRulesChange: (rules: HighlightRule[]) => void
+  initialField?: string
+  onClose: () => void
+}) {
+  type Draft = Omit<HighlightRule, "ruleId"> & { ruleId?: string }
+  const blank = (field?: string): Draft => {
+    const f = field ?? targets[0]?.field ?? ""
+    return {
+      fieldName: f, fieldLabel: targets.find((t) => t.field === f)?.label ?? "",
+      highlightingType: "SINGLE_COLOR", conditionType: "GREATER_THAN", threshold: "", color: undefined,
+      multiColorType: "CUSTOM", min: undefined, max: undefined, paletteType: undefined,
+    }
+  }
+  const [draft, setDraft] = useState<Draft | null>(() =>
+    initialField && !rules.some((r) => r.fieldName === initialField) ? blank(initialField) : null)
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+  const [dragId, setDragId] = useState<string | null>(null)
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const paletteBtnRef = useRef<HTMLButtonElement>(null)
+
+  const groups = [...new Set(rules.map((r) => r.fieldName))]
+  const title = draft ? (draft.ruleId ? "Edit rule" : "Add a rule") : rules.length > 0 ? "Highlight rules" : "Conditional highlighting"
+
+  const multiError = draft?.highlightingType === "MULTI_COLOR" && draft.min != null && draft.max != null && !(draft.max > draft.min)
+    ? "Max value must be greater than min value" : null
+  const draftValid = !!draft && !!draft.fieldName && (draft.highlightingType === "SINGLE_COLOR"
+    ? draft.threshold !== "" && !Number.isNaN(Number(draft.threshold)) && !!draft.color
+    : draft.min != null && draft.max != null && !multiError && !!draft.paletteType)
+
+  const save = () => {
+    if (!draft || !draftValid) return
+    const rule: HighlightRule = { ...draft, ruleId: draft.ruleId ?? `r${Date.now().toString(36)}` }
+    onRulesChange(draft.ruleId ? rules.map((r) => (r.ruleId === rule.ruleId ? rule : r)) : [...rules, rule])
+    setDraft(null)
+  }
+  const reorder = (overId: string) => {
+    if (!dragId || dragId === overId) return
+    const from = rules.findIndex((r) => r.ruleId === dragId), to = rules.findIndex((r) => r.ruleId === overId)
+    if (from < 0 || to < 0 || rules[from].fieldName !== rules[to].fieldName) return
+    const next = [...rules]
+    const [moved] = next.splice(from, 1)
+    next.splice(to, 0, moved)
+    onRulesChange(next)
+  }
+
+  const labelCls = "text-[12px] font-medium text-gray-700 block mb-1.5"
+  const inputCls = "w-full border border-gray-200 rounded-md px-2.5 py-1.5 text-[13px] focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-100"
+  const fieldLabelOf = (key: string) => targets.find((t) => t.field === key)?.label ?? rules.find((r) => r.fieldName === key)?.fieldLabel ?? fieldDisplayName(key)
+  const btn = "px-4 py-1.5 rounded-md text-[13px]"
+
+  return createPortal(
+    <div className="fixed inset-0 z-[200] flex justify-end">
+      <div className="absolute inset-0 bg-black/20" onClick={onClose} />
+      <div className="relative bg-white h-full w-[360px] shadow-2xl flex flex-col">
+        <div className="flex items-center gap-2 px-4 py-3.5 border-b border-gray-200">
+          <span className="text-gray-500"><BrushIcon /></span>
+          <span className="text-[14px] font-semibold text-gray-900 flex-1">{title}</span>
+          <button onClick={onClose} aria-label="Close" className="text-gray-400 hover:text-gray-700 p-1 rounded hover:bg-gray-100"><Ic.X size={12} /></button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto">
+          {draft ? (
+            <div className="p-4 flex flex-col gap-4">
+              <div>
+                <label className={labelCls}>Select a field to conditionally highlight</label>
+                <SettingsSelect value={draft.fieldName} onChange={(v) => setDraft({ ...draft, fieldName: v, fieldLabel: fieldLabelOf(v) })} ariaLabel="Field">
+                  {targets.map((t) => <option key={t.field} value={t.field}>{t.label}</option>)}
+                </SettingsSelect>
+              </div>
+              <div className="flex rounded-md border border-gray-200 p-0.5 bg-gray-50">
+                {(["SINGLE_COLOR", "MULTI_COLOR"] as const).map((t) => (
+                  <button key={t} onClick={() => setDraft({ ...draft, highlightingType: t })}
+                    className={`flex-1 py-1.5 rounded text-[13px] font-medium transition-colors
+                      ${draft.highlightingType === t ? "bg-white text-indigo-600 shadow-sm" : "text-gray-500 hover:text-gray-700"}`}>
+                    {t === "SINGLE_COLOR" ? "Single color" : "Multi color"}
+                  </button>
+                ))}
+              </div>
+
+              {draft.highlightingType === "SINGLE_COLOR" ? (
+                <>
+                  <div>
+                    <label className={labelCls}>Highlight when {fieldLabelOf(draft.fieldName)} is</label>
+                    <div className="flex gap-2">
+                      <div className="w-36 shrink-0">
+                        <SettingsSelect value={draft.conditionType ?? "GREATER_THAN"} onChange={(v) => setDraft({ ...draft, conditionType: v as HighlightCondition })} ariaLabel="Condition">
+                          {(Object.keys(HL_CONDITION_LABEL) as HighlightCondition[]).map((c) => <option key={c} value={c}>{HL_CONDITION_LABEL[c]}</option>)}
+                        </SettingsSelect>
+                      </div>
+                      <input type="number" value={draft.threshold ?? ""} placeholder="Enter number" onChange={(e) => setDraft({ ...draft, threshold: e.target.value })} className={inputCls} />
+                    </div>
+                  </div>
+                  <div>
+                    <label className={labelCls}>Highlight color</label>
+                    <div className="flex gap-2">
+                      {HL_SINGLE_SWATCHES.map((c) => (
+                        <button key={c} onClick={() => setDraft({ ...draft, color: c })} aria-label={c}
+                          className={`w-8 h-8 rounded-md border transition-shadow ${draft.color === c ? "ring-2 ring-indigo-500 ring-offset-1 border-transparent" : "border-gray-200 hover:shadow"}`}
+                          style={{ backgroundColor: HL_COLORS[c].bg }} />
+                      ))}
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div>
+                    <label className={labelCls}>How should the cells be highlighted?</label>
+                    <div className="flex items-start gap-2.5 border border-indigo-300 bg-indigo-50/50 rounded-md px-3 py-2.5">
+                      <span className="mt-0.5 w-3.5 h-3.5 rounded-full border-2 border-indigo-600 flex items-center justify-center shrink-0"><span className="w-1.5 h-1.5 rounded-full bg-indigo-600" /></span>
+                      <span>
+                        <span className="block text-[13px] font-medium text-gray-800">Custom</span>
+                        <span className="block text-[12px] text-gray-500">Specify the min and max values manually</span>
+                      </span>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className={labelCls}>Min</label>
+                      <input type="number" value={draft.min ?? ""} onChange={(e) => setDraft({ ...draft, min: e.target.value === "" ? undefined : Number(e.target.value) })} className={inputCls} />
+                    </div>
+                    <div>
+                      <label className={labelCls}>Max</label>
+                      <input type="number" value={draft.max ?? ""} onChange={(e) => setDraft({ ...draft, max: e.target.value === "" ? undefined : Number(e.target.value) })} className={inputCls} />
+                    </div>
+                  </div>
+                  {multiError && <p className="text-[12px] text-red-500 -mt-2">{multiError}</p>}
+                  <div>
+                    <label className={labelCls}>Pick a palette</label>
+                    <button ref={paletteBtnRef} onClick={() => setPaletteOpen((p) => !p)}
+                      className="w-full flex items-center gap-2 border border-gray-200 rounded-md px-2.5 py-1.5 bg-white text-[13px] text-gray-500">
+                      <span className="flex-1 text-left">{draft.paletteType ? <PaletteStrip colors={HL_PALETTES.find((p) => p.id === draft.paletteType)!.colors} /> : "Select"}</span>
+                      <Ic.ChevDown size={11} />
+                    </button>
+                    {paletteOpen && (
+                      <ChipPortalMenu anchorRef={paletteBtnRef} onClose={() => setPaletteOpen(false)}>
+                        <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl w-[326px] py-1">
+                          {(["Multi color", "Single color"] as const).map((g) => (
+                            <div key={g}>
+                              <p className="px-3 pt-2 pb-1 text-[10px] font-semibold text-gray-400 uppercase tracking-wider">{g}</p>
+                              {HL_PALETTES.filter((p) => p.group === g).map((p) => (
+                                <button key={p.id} onClick={() => { setDraft({ ...draft, paletteType: p.id }); setPaletteOpen(false) }}
+                                  className={`flex items-center gap-2 w-full px-3 py-1.5 hover:bg-indigo-50 ${draft.paletteType === p.id ? "bg-indigo-50" : ""}`}>
+                                  <PaletteStrip colors={p.colors} />
+                                </button>
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      </ChipPortalMenu>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          ) : rules.length === 0 ? (
+            <div className="flex flex-col items-center text-center px-8 pt-16 gap-3">
+              <span className="w-12 h-12 rounded-full bg-indigo-50 text-indigo-500 flex items-center justify-center"><BrushIcon size={20} /></span>
+              <p className="text-[14px] font-semibold text-gray-800">You don't have any conditional highlighting set</p>
+              <p className="text-[12px] text-gray-500 leading-relaxed">Use conditional highlighting to easily identify projects that are below target margins or resources that exceed 90% allocations</p>
+              <button onClick={() => setDraft(blank(initialField))} className={`${btn} mt-1 font-medium bg-indigo-600 text-white hover:bg-indigo-700`}>Add a rule</button>
+            </div>
+          ) : (
+            <div className="py-2">
+              {groups.map((g) => (
+                <div key={g}>
+                  <button onClick={() => setCollapsed((p) => ({ ...p, [g]: !p[g] }))} className="flex items-center gap-1.5 w-full px-4 py-2 hover:bg-gray-50">
+                    <span className="text-gray-400 inline-block" style={{ transform: collapsed[g] ? "rotate(-90deg)" : undefined }}><Ic.ChevDown size={11} /></span>
+                    <span className="text-[13px] font-semibold text-gray-700 flex-1 text-left truncate">{fieldLabelOf(g)}</span>
+                  </button>
+                  {!collapsed[g] && rules.filter((r) => r.fieldName === g).map((r) => (
+                    <div
+                      key={r.ruleId}
+                      draggable
+                      onDragStart={() => setDragId(r.ruleId)}
+                      onDragOver={(e) => { e.preventDefault(); reorder(r.ruleId) }}
+                      onDragEnd={() => setDragId(null)}
+                      className={`group flex items-center gap-2 mx-3 mb-1 pl-2 pr-1.5 py-1.5 rounded-md border bg-white cursor-grab
+                        ${dragId === r.ruleId ? "border-indigo-300 opacity-60" : "border-gray-200"}`}
+                    >
+                      <span className="text-gray-300"><Ic.GripVertical /></span>
+                      {r.highlightingType === "SINGLE_COLOR"
+                        ? <span className="w-4 h-4 rounded shrink-0 border border-gray-200" style={{ backgroundColor: HL_COLORS[r.color ?? ""]?.bg }} />
+                        : <PaletteStrip colors={(HL_PALETTES.find((p) => p.id === r.paletteType)?.colors ?? []).slice(0, 4)} />}
+                      <span className="text-[12px] text-gray-700 flex-1 truncate">{hlRuleText(r)}</span>
+                      <button onClick={() => setDraft({ ...r })} aria-label="Edit rule" className="opacity-0 group-hover:opacity-100 p-1 text-gray-400 hover:text-gray-700"><Ic.Pencil size={12} /></button>
+                      <button onClick={() => onRulesChange(rules.filter((x) => x.ruleId !== r.ruleId))} aria-label="Delete rule" className="opacity-0 group-hover:opacity-100 p-1 text-gray-400 hover:text-red-500"><Ic.Trash size={12} /></button>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {(draft || rules.length > 0) && (
+          <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-gray-200">
+            {draft ? (
+              <>
+                <button onClick={() => setDraft(null)} className={`${btn} text-gray-600 hover:bg-gray-100`}>Back</button>
+                <button onClick={save} disabled={!draftValid}
+                  className={`${btn} font-medium bg-indigo-600 text-white hover:bg-indigo-700 disabled:bg-indigo-300 disabled:cursor-not-allowed`}>
+                  {draft.ruleId ? "Edit rule" : "Create"}
+                </button>
+              </>
+            ) : (
+              <>
+                <button onClick={onClose} className={`${btn} text-gray-600 hover:bg-gray-100`}>Cancel</button>
+                <button onClick={() => setDraft(blank())} className={`${btn} font-medium bg-indigo-600 text-white hover:bg-indigo-700`}>Add a rule</button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+/** Owns the formula editor, the highlighting drawer and toasts for one builder. */
+function ReportExtrasHost({ source, formulaZone, targets, highlightRules, onHighlightRulesChange, onFormulaCreated, onFormulaDeleted, children }: {
+  source: string
+  formulaZone: ZoneKey
+  targets: { field: string; label: string }[]
+  highlightRules: HighlightRule[]
+  onHighlightRulesChange: (rules: HighlightRule[]) => void
+  onFormulaCreated: (key: string) => void
+  onFormulaDeleted: (key: string) => void
+  children: React.ReactNode
+}) {
+  const [formulaDrawer, setFormulaDrawer] = useState<{ editing: FormulaDef | null } | null>(null)
+  const [highlight, setHighlight] = useState<{ field?: string } | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<FormulaDef | null>(null)
+  const [toasts, setToasts] = useState<ToastMsg[]>([])
+  const toast = (t: Omit<ToastMsg, "id">) => {
+    const id = Date.now() + Math.random()
+    setToasts((prev) => [...prev, { ...t, id }])
+    setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 4000)
+  }
+  const ctx: ReportExtrasCtx = {
+    highlightRules,
+    openHighlight: (field) => setHighlight({ field }),
+    openFormula: (editing) => setFormulaDrawer({ editing: editing ?? null }),
+    deleteFormula: (def) => setPendingDelete(def),
+    formulaZone,
+    canHighlight: targets.length > 0,
+  }
+  return (
+    <ReportExtras.Provider value={ctx}>
+      {children}
+      {formulaDrawer && (
+        <FormulaFieldDrawer
+          source={source}
+          editing={formulaDrawer.editing}
+          onClose={() => setFormulaDrawer(null)}
+          toast={toast}
+          onSaved={(def, created) => { setFormulaDrawer(null); if (created) onFormulaCreated(formulaKeyOf(def)) }}
+        />
+      )}
+      {highlight && (
+        <HighlightDrawer
+          targets={targets}
+          rules={highlightRules}
+          onRulesChange={onHighlightRulesChange}
+          initialField={highlight.field}
+          onClose={() => setHighlight(null)}
+        />
+      )}
+      {pendingDelete && createPortal(
+        <div className="fixed inset-0 z-[250] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/30" onClick={() => setPendingDelete(null)} />
+          <div className="relative bg-white rounded-xl shadow-2xl w-[420px] p-5">
+            <p className="text-[15px] font-semibold text-gray-900">Delete Field</p>
+            <p className="text-[13px] text-gray-600 mt-2 leading-relaxed">All the details belongs to this field will be deleted and cannot be recovered. Are you sure you want to delete this field?</p>
+            <div className="flex justify-end gap-2 mt-5">
+              <button onClick={() => setPendingDelete(null)} className="px-4 py-1.5 rounded-md text-[13px] text-gray-600 hover:bg-gray-100">Cancel</button>
+              <button
+                onClick={() => {
+                  const key = formulaKeyOf(pendingDelete)
+                  setFormulas(FORMULAS.filter((f) => f.id !== pendingDelete.id))
+                  onFormulaDeleted(key)
+                  setPendingDelete(null)
+                }}
+                className="px-4 py-1.5 rounded-md text-[13px] font-medium bg-red-600 text-white hover:bg-red-700"
+              >Delete</button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
+      <ToastStack toasts={toasts} onDismiss={(id) => setToasts((prev) => prev.filter((x) => x.id !== id))} />
+    </ReportExtras.Provider>
+  )
+}
+
+/** The toolbar's "Conditional highlighting" button — build mode only, as today. */
+function HighlightToolbarButton() {
+  const { canHighlight, highlightRules, openHighlight } = useContext(ReportExtras)
+  return (
+    <HoverTip text={canHighlight ? null : "Atleast one number field is required."}>
+      <button
+        title={canHighlight ? "Conditional highlighting" : undefined}
+        aria-label="Conditional highlighting"
+        disabled={!canHighlight}
+        onClick={() => openHighlight()}
+        className={`relative flex items-center justify-center w-7 h-7 rounded-md transition-colors
+          ${!canHighlight ? "text-gray-300 cursor-not-allowed" : highlightRules.length > 0 ? "bg-indigo-100 text-indigo-600" : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"}`}
+      >
+        <BrushIcon />
+      </button>
+    </HoverTip>
+  )
+}
+
+/** The brush beside a highlighted column's header; hovering lists that field's rules. */
+function HighlightHeaderMark({ field }: { field: string }) {
+  const { highlightRules } = useContext(ReportExtras)
+  const mine = highlightRules.filter((r) => r.fieldName === field)
+  const [at, setAt] = useState<DOMRect | null>(null)
+  if (mine.length === 0) return null
+  return (
+    <span
+      className="inline-flex align-middle ml-1 text-indigo-400"
+      onMouseEnter={(e) => setAt((e.currentTarget as HTMLElement).getBoundingClientRect())}
+      onMouseLeave={() => setAt(null)}
+    >
+      <BrushIcon size={11} />
+      {at && createPortal(
+        <div style={{ position: "fixed", left: Math.min(at.left, window.innerWidth - 240), top: at.bottom + 6 }}
+          className="z-[300] bg-gray-900 text-white rounded-md shadow-lg px-2.5 py-2 w-56 pointer-events-none">
+          <p className="text-[11px] font-semibold mb-1">Highlight rules</p>
+          {mine.map((r) => (
+            <p key={r.ruleId} className="flex items-center gap-1.5 text-[11px] font-normal py-0.5">
+              {r.highlightingType === "SINGLE_COLOR"
+                ? <span className="w-3 h-3 rounded-sm shrink-0" style={{ backgroundColor: HL_COLORS[r.color ?? ""]?.bg }} />
+                : <PaletteStrip colors={(HL_PALETTES.find((p) => p.id === r.paletteType)?.colors ?? []).slice(0, 4)} />}
+              {hlRuleText(r)}
+            </p>
+          ))}
+        </div>,
+        document.body,
+      )}
+    </span>
+  )
+}
+
 function FieldBrowser({
   fields,
   source,
@@ -5369,6 +6398,9 @@ function FieldBrowser({
 }) {
   const [search, setSearch] = useState("")
   const [tlTipAt, setTlTipAt] = useState<{ x: number; y: number } | null>(null)
+  const extras = useContext(ReportExtras)
+  const allFormulas = useFormulas()
+  const [formulasCollapsed, setFormulasCollapsed] = useState(false)
   // Only the source module starts expanded — everything else joined in is collapsed
   // until the user opens it, so switching source doesn't dump the whole catalog open.
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => {
@@ -5681,6 +6713,55 @@ function FieldBrowser({
               </div>
             )
           })()}
+          {/* Formula fields saved for this source — today's "Formula Fields" group. They are
+              numbers worked out from other fields, so they only ever go in Values. */}
+          {(() => {
+            const list = allFormulas.filter((f) => f.source === source
+              && (!query || f.name.toLowerCase().includes(query) || "formula".includes(query)))
+            if (list.length === 0 || showInvolved && !list.some((f) => added.has(formulaKeyOf(f)))) return null
+            return (
+              <div>
+                <button onClick={() => setFormulasCollapsed((p) => !p)} className="flex items-center gap-1.5 w-full px-3 py-2 hover:bg-gray-50 transition-colors">
+                  <span className="text-gray-400" style={{ transform: formulasCollapsed ? "rotate(-90deg)" : "rotate(0deg)", display: "inline-block" }}>
+                    <Ic.ChevDown />
+                  </span>
+                  <span className="text-gray-500"><FxIcon size={14} /></span>
+                  <span className="text-[13px] font-medium text-gray-700 flex-1 text-left">Formula fields</span>
+                  <span className="text-[11px] text-gray-400 tabular-nums">{list.length}</span>
+                </button>
+                {!formulasCollapsed && list.map((f) => {
+                  const key = formulaKeyOf(f)
+                  const isAdded = added.has(key)
+                  return (
+                    <div
+                      key={key}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData("application/field", JSON.stringify({ field: key, type: "number" }))
+                        e.dataTransfer.effectAllowed = "copy"
+                        onDragStart(key, "number")
+                      }}
+                      onDragEnd={onDragEnd}
+                      onClick={() => {
+                        const placed = [...fields.values, ...fields.columns].find((it) => it.field === key)
+                        if (placed) onRemove(fields.values.includes(placed) ? "values" : "columns", placed.id)
+                        else onAdd("values", key, "number")
+                      }}
+                      className="flex items-center gap-2 pl-8 pr-2 py-1.5 cursor-grab active:cursor-grabbing hover:bg-indigo-50 transition-colors group select-none"
+                    >
+                      <span className="shrink-0 text-emerald-500"><FxIcon /></span>
+                      <span className="text-[13px] flex-1 truncate text-gray-700">{f.name}</span>
+                      <button onClick={(e) => { e.stopPropagation(); extras.openFormula(f) }} title="Edit formula field"
+                        className="opacity-0 group-hover:opacity-100 p-0.5 text-gray-400 hover:text-gray-700 shrink-0"><Ic.Pencil size={12} /></button>
+                      <button onClick={(e) => { e.stopPropagation(); extras.deleteFormula(f) }} title="Delete formula field"
+                        className="opacity-0 group-hover:opacity-100 p-0.5 text-gray-400 hover:text-red-500 shrink-0"><Ic.Trash size={12} /></button>
+                      {isAdded && <span className="text-indigo-500 shrink-0"><Ic.Check /></span>}
+                    </div>
+                  )
+                })}
+              </div>
+            )
+          })()}
           {processedModules.length === 0 ? (
             <p className="text-[12px] text-gray-400 text-center px-4 py-8 leading-relaxed">
               {showInvolved ? "No fields in use yet" : "No fields match your filters"}
@@ -5861,6 +6942,7 @@ function DropZone<Z extends ZoneKey>({
   const [over, setOver] = useState(false)
   const [insertAt, setInsertAt] = useState<number | null>(null)
   const [blocked, setBlocked] = useState<{ text: string; at: { x: number; y: number } } | null>(null)
+  const extras = useContext(ReportExtras)
 
   // A cancelled drag never fires dragleave on the zone, so clear the "no" on any drag ending.
   useEffect(() => {
@@ -5962,6 +7044,16 @@ function DropZone<Z extends ZoneKey>({
           <span className="text-[10px] bg-gray-200/70 text-gray-600 rounded-full px-1.5 py-px font-medium">
             {chips.length}
           </span>
+        )}
+        {extras.formulaZone === zone && (
+          <button
+            onClick={() => extras.openFormula()}
+            title="New formula field"
+            className="ml-auto flex items-center gap-1 text-[11px] font-medium text-indigo-600 border border-indigo-200 bg-white
+              rounded-md px-1.5 py-0.5 hover:bg-indigo-50 transition-colors"
+          >
+            <FxIcon size={11} /> Formula
+          </button>
         )}
       </div>
 
@@ -6311,7 +7403,12 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
   const dateBtnRef = useRef<HTMLButtonElement>(null)
   const formatBtnRef = useRef<HTMLButtonElement>(null)
   const fieldType = getFieldType(name)
-  const options = modifierOptions(zone, fieldType)
+  const isFormula = isFormulaKey(name)
+  // A formula decides its own maths, so it has no aggregation to pick.
+  const options = isFormula ? null : modifierOptions(zone, fieldType)
+  const extras = useContext(ReportExtras)
+  const highlightable = (zone === "values" || zone === "tabColumns") && isNumericType(fieldType) && extras.formulaZone !== null
+  const ruleCount = extras.highlightRules.filter((r) => r.fieldName === name).length
   const isDateDimension = (zone === "columns" || zone === "rows" || zone === "tabGroupBy") && fieldType === "date"
   // A flat table has no Values shelf, so a tabular column's default alignment follows the field
   // type instead: measures right, everything else left.
@@ -6352,7 +7449,8 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
       {/* Field name — flex-1 so it takes up space but yields to right-side controls.
           Title shows the owning module too, since the same short name (e.g. "Status")
           can exist on more than one module in the real schema. */}
-      <span className="truncate flex-1 min-w-0" title={name.replace("::", ": ")}>{fieldDisplayName(name)}</span>
+      {isFormula && <span className="shrink-0 text-emerald-500" title="Formula field"><FxIcon size={12} /></span>}
+      <span className="truncate flex-1 min-w-0" title={isFormula ? fieldDisplayName(name) : name.replace("::", ": ")}>{fieldDisplayName(name)}</span>
 
       {/* Relationship role — shown only when this field's module can be reached more than one
           way, so the 99 unambiguous relationships stay uncluttered. Always visible once it
@@ -6515,7 +7613,21 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
                 )}
               </div>
             )}
-            {settingsInGear && <p className={SETTINGS_SECTION}>Display</p>}
+            {highlightable && (
+              <div className="mb-3 pb-3 border-b border-gray-100">
+                <p className={SETTINGS_SECTION}>Highlight</p>
+                <button
+                  onClick={() => { setShowFormatMenu(false); extras.openHighlight(name) }}
+                  className="w-full flex items-center gap-2 border border-gray-200 rounded-md px-2 py-1.5 text-[13px] text-gray-700 hover:bg-gray-50"
+                >
+                  <span className="text-gray-400"><BrushIcon size={13} /></span>
+                  <span className="flex-1 text-left">Highlight rules</span>
+                  <span className="text-[11px] text-gray-400">{ruleCount > 0 ? ruleCount : "None"}</span>
+                  <Ic.ChevRight size={10} />
+                </button>
+              </div>
+            )}
+            {(settingsInGear || highlightable) && <p className={SETTINGS_SECTION}>Display</p>}
             <FieldFormatFields
               item={{ id, field: name }}
               defaultAlign={defaultAlign}
@@ -8142,6 +9254,31 @@ function NumericFilterModal({ rule, allRules, source, fields, aggregations, rang
 
 // The report's own base filters — the builder's locked-in data scope, create-mode only (the
 // call site gates it). View filters, which viewers can tweak, live in ViewFilterPane instead.
+// Formula fields only make sense as a number in Values (or a table column), so filter areas
+// refuse them while dragging — greyed with the reason at the pointer, like a blocked split.
+function useFormulaDropRefusal(flat?: boolean) {
+  const [at, setAt] = useState<{ x: number; y: number } | null>(null)
+  useEffect(() => {
+    const clear = () => setAt(null)
+    document.addEventListener("dragend", clear)
+    document.addEventListener("drop", clear)
+    return () => { document.removeEventListener("dragend", clear); document.removeEventListener("drop", clear) }
+  }, [])
+  const text = flat ? "Formula fields can only go in Columns" : FORMULA_VALUES_ONLY
+  const refuse = (e: React.DragEvent): boolean => {
+    if (!activeDrag || !isFormulaKey(activeDrag.field)) return false
+    e.dataTransfer.dropEffect = "none"
+    setAt({ x: e.clientX, y: e.clientY })
+    return true
+  }
+  return {
+    refuse,
+    blocked: !!at,
+    clear: () => setAt(null),
+    tip: at ? <CursorTooltip text={text} at={at} /> : null,
+  }
+}
+
 function FilterBar({
   rules, dragging, source, fields, aggregations, rangeConfigs, onDrop, onRemove, onRuleChange, justDropped, flat,
 }: {
@@ -8160,25 +9297,28 @@ function FilterBar({
   flat?: boolean
 }) {
   const [over, setOver] = useState(false)
+  const refusal = useFormulaDropRefusal(flat)
 
-  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setOver(true) }
+  const handleDragOver = (e: React.DragEvent) => { if (refusal.refuse(e)) return; e.preventDefault(); setOver(true) }
   const handleDragLeave = (e: React.DragEvent) => {
-    if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) setOver(false)
+    if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) { setOver(false); refusal.clear() }
   }
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault(); setOver(false)
     try {
       const data = JSON.parse(e.dataTransfer.getData("application/field")) as { field: string; type: FieldType }
+      if (isFormulaKey(data.field)) return
       onDrop(data.field, data.type)
     } catch {}
   }
 
-  const highlight = over || (dragging && rules.length === 0)
+  const highlight = !refusal.blocked && (over || (dragging && rules.length === 0 && !(activeDrag && isFormulaKey(activeDrag.field))))
 
   return (
     <div className={`print-hide relative z-10 flex items-center gap-2 px-4 py-2 border-b border-gray-200 min-h-[44px] shadow-sm transition-colors
-      ${highlight ? "bg-amber-50" : "bg-white"}`}
+      ${highlight ? "bg-amber-50" : "bg-white"} ${refusal.blocked ? "opacity-60 cursor-not-allowed" : ""}`}
     >
+      {refusal.tip}
       {/* Drop target area — filters */}
       <div
         onDragOver={handleDragOver}
@@ -9251,25 +10391,27 @@ function ViewFilterPane({
   flat?: boolean
 }) {
   const [over, setOver] = useState(false)
+  const refusal = useFormulaDropRefusal(flat)
   const isCreate = reportMode === "create"
 
   // A viewer with no exposed filters gets no pane at all — an empty rail is pure noise. In
   // create mode it always renders, since it has to be there to drop onto.
   if (!isCreate && rules.length === 0) return null
 
-  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setOver(true) }
+  const handleDragOver = (e: React.DragEvent) => { if (refusal.refuse(e)) return; e.preventDefault(); setOver(true) }
   const handleDragLeave = (e: React.DragEvent) => {
-    if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) setOver(false)
+    if (!(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node)) { setOver(false); refusal.clear() }
   }
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault(); setOver(false)
     try {
       const data = JSON.parse(e.dataTransfer.getData("application/field")) as { field: string; type: FieldType }
+      if (isFormulaKey(data.field)) return
       onDrop(data.field, data.type)
     } catch {}
   }
 
-  const highlight = isCreate && (over || (dragging && rules.length === 0))
+  const highlight = isCreate && !refusal.blocked && (over || (dragging && rules.length === 0 && !(activeDrag && isFormulaKey(activeDrag.field))))
   // Grain must account for every rule the report actually applies, but the value list itself is
   // narrowed by the BASE rules only — stable, and no cascade between sibling view filters.
   const grainRules = baseRules.length > 0 ? [...baseRules, ...rules] : rules
@@ -9280,8 +10422,9 @@ function ViewFilterPane({
       onDragLeave={isCreate ? handleDragLeave : undefined}
       onDrop={isCreate ? handleDrop : undefined}
       className={`w-[280px] shrink-0 flex flex-col border-l border-gray-200 overflow-hidden transition-colors
-        ${highlight ? "bg-amber-50" : "bg-white"}`}
+        ${highlight ? "bg-amber-50" : "bg-white"} ${refusal.blocked ? "opacity-60 cursor-not-allowed" : ""}`}
     >
+      {refusal.tip}
       {/* Builder-only heading: it names the drop target and counts what's in it. A viewer just
           sees filter cards, so the label is noise — each card already names its own field. */}
       {isCreate && (
@@ -9337,8 +10480,9 @@ function ViewFilterPane({
 // reused unchanged — it is generic over its zone key and agnostic about what the chips mean.
 function TabularZoneBar({
   fields, dragging, grainModule, lookupPaths, aggregations, rangeConfigs, fieldFormats,
-  onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onRangeConfigChange, onFieldFormatChange,
+  onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onRangeConfigChange, onFieldFormatChange, blockReason,
 }: {
+  blockReason?: (zone: TabularZoneKey, field: string, id?: string) => string | null
   fields: TabularFields
   dragging: boolean
   grainModule: string
@@ -9387,6 +10531,7 @@ function TabularZoneBar({
           onTimelineChange={noop}
           onRangeConfigChange={onRangeConfigChange}
           onFieldFormatChange={onFieldFormatChange}
+          blockReason={blockReason}
         />
       ))}
     </div>
@@ -9414,6 +10559,7 @@ function TabularCanvas({
   groupSortDir: "asc" | "desc"
   onGroupSortToggle: () => void
 }) {
+  const hl = useHighlightStyle()
   const isEmpty = fields.columns.length === 0 && fields.groupBy.length === 0
 
   if (isEmpty) {
@@ -9464,6 +10610,7 @@ function TabularCanvas({
           {fieldTypeIcon(type, 11)}
           <span>{fieldItemLabel(item, fieldFormats)}</span>
           <ModuleTag field={item.field} show={showModuleTag} />
+          {!group && <HighlightHeaderMark field={item.field} />}
           {group && (
             <button
               onClick={onGroupSortToggle}
@@ -9536,6 +10683,7 @@ function TabularCanvas({
                     <td
                       key={item.id}
                       data-v={rawNum ?? undefined}
+                      style={rawNum != null && isNumericType(type) ? hl(item.field, rawNum) : undefined}
                       className={`${tdCls} text-gray-700 ${alignClass(fieldFormats[item.id], isNumericType(type) ? "right" : "left")} ${isNumericType(type) ? "tabular-nums" : ""}`}
                     >
                       {cell.text}
@@ -9583,6 +10731,7 @@ function TabularToolbar({
       {reportMode === "create" && <SourcePicker source={source} setSource={setSource} />}
 
       <div className="flex items-center gap-1 ml-auto">
+        {reportMode === "create" && <HighlightToolbarButton />}
         <button
           title="Report settings"
           onClick={() => setShowSettings(true)}
@@ -9726,6 +10875,7 @@ interface SavedTabularReport {
   showRowNumbers: boolean
   groupSortDir: "asc" | "desc"
   lookupPaths: Record<string, string>
+  highlightRules?: HighlightRule[]
 }
 
 function loadSavedTabular(): Partial<SavedTabularReport> | null {
@@ -9760,6 +10910,17 @@ function TabularBuilder() {
   const [showProjectCurrency, setShowProjectCurrency] = useState(saved?.showProjectCurrency ?? false)
   const [showRowNumbers, setShowRowNumbers] = useState(saved?.showRowNumbers ?? true)
   const [groupSortDir, setGroupSortDir] = useState<"asc" | "desc">(saved?.groupSortDir ?? "asc")
+  const [highlightRules, setHighlightRules] = useState<HighlightRule[]>(saved?.highlightRules ?? [])
+  useFormulas()
+  const columnNumberKeys = [...new Set(fields.columns.map((v) => v.field).filter((k) => isNumericType(getFieldType(k)) && (!isFormulaKey(k) || !!formulaOf(k))))]
+  const columnKeysSig = columnNumberKeys.join("|")
+  useEffect(() => {
+    setHighlightRules((prev) => {
+      const next = prev.filter((r) => columnNumberKeys.includes(r.fieldName))
+      return next.length === prev.length ? prev : next
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [columnKeysSig])
 
   const [dragging, setDragging] = useState(false)
   const [justSaved, setJustSaved] = useState(false)
@@ -9778,7 +10939,7 @@ function TabularBuilder() {
   // never drift out of sync with what Save actually writes.
   const payloadJson = JSON.stringify({
     source, fields, aggregations, filterRules, viewFilterRules, rangeConfigs, fieldFormats,
-    showModuleTag, showProjectCurrency, showRowNumbers, groupSortDir, lookupPaths,
+    showModuleTag, showProjectCurrency, showRowNumbers, groupSortDir, lookupPaths, highlightRules,
   } satisfies SavedTabularReport)
   // A restored report starts clean; one that has never been saved starts dirty. This initialiser
   // runs on the first render, where payloadJson is built from exactly the restored state.
@@ -9823,6 +10984,8 @@ function TabularBuilder() {
     // A flat list has one row per record, so there is nothing to split by period. The Timeline
     // still works here as a filter.
     if (field === TIMELINE_KEY) return
+    // A formula is a number worked out per record — a column, never a group.
+    if (isFormulaKey(field) && zone === "tabGroupBy") return
     // One appearance per field. Both shelves feed the same flat row, so a second copy would
     // repeat a value rather than add information — refuse and say where the first copy is.
     const inGroupBy = fields.groupBy.some((it) => it.field === field)
@@ -9858,6 +11021,7 @@ function TabularBuilder() {
   }
   const moveField = (from: TabularZoneKey, to: TabularZoneKey, id: string) => {
     const fk = listKey(from), tk = listKey(to)
+    if (to === "tabGroupBy" && fields[fk].some((it) => it.id === id && isFormulaKey(it.field))) return
     setFields((prev) => {
       const item = prev[fk].find((it) => it.id === id)
       if (!item) return prev
@@ -9902,11 +11066,23 @@ function TabularBuilder() {
     setViewFilterRules([])
     setRangeConfigs({})
     setFieldFormats({})
+    setHighlightRules([])
     setPendingSource(null)
   }
 
   return (
-    <>
+    <ReportExtrasHost
+      source={source}
+      formulaZone="tabColumns"
+      targets={columnNumberKeys.map((k) => ({ field: k, label: fieldDisplayName(k) }))}
+      highlightRules={highlightRules}
+      onHighlightRulesChange={setHighlightRules}
+      onFormulaCreated={(key) => addField("tabColumns", key, "number")}
+      onFormulaDeleted={(key) => {
+        setFields((prev) => ({ ...prev, columns: prev.columns.filter((v) => v.field !== key) }))
+        setHighlightRules((prev) => prev.filter((r) => r.fieldName !== key))
+      }}
+    >
       {usedAlert && (
         <FieldAlreadyUsedAlert name={usedAlert.name} zone={usedAlert.zone} onClose={() => setUsedAlert(null)} />
       )}
@@ -9975,8 +11151,8 @@ function TabularBuilder() {
             onAdd={(zone, field, type) => addField(zoneOf(zone), field, type)}
             onRemove={(zone, id) => removeField(zoneOf(zone), id)}
             onDupAlert={(name) => setDupAlert(name)}
-            onDragStart={() => setDragging(true)}
-            onDragEnd={() => setDragging(false)}
+            onDragStart={(field) => { startDrag(field); setDragging(true) }}
+            onDragEnd={() => { endDrag(); setDragging(false) }}
           />
         )}
         <div className="flex flex-col flex-1 min-w-0">
@@ -9998,6 +11174,7 @@ function TabularBuilder() {
               onRangeConfigChange={(id, cfg) => setRangeConfigs((prev) => ({ ...prev, [id]: cfg }))}
               onFieldFormatChange={(id, patch) =>
                 setFieldFormats((prev) => ({ ...prev, [id]: { ...DEFAULT_FIELD_FORMAT, ...prev[id], ...patch } }))}
+              blockReason={(zone, field) => (isFormulaKey(field) && zone === "tabGroupBy" ? "Formula fields can only go in Columns" : null)}
             />
           )}
           {reportMode === "create" && (
@@ -10050,7 +11227,7 @@ function TabularBuilder() {
           </div>
         </div>
       </div>
-    </>
+    </ReportExtrasHost>
   )
 }
 
@@ -10814,6 +11991,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
   // Collapsed compact-tree node keys — declared unconditionally (before the early
   // return below) since hooks can't be called conditionally.
   const [collapsedNodes, setCollapsedNodes] = useState<Set<string>>(new Set())
+  const hl = useHighlightStyle()
   const toggleCollapsed = (key: string) => setCollapsedNodes((prev) => {
     const next = new Set(prev)
     if (next.has(key)) next.delete(key)
@@ -10959,16 +12137,16 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                   ? colValues.flatMap((_, ci) =>
                       colItemsAt(ci).map(({ item, vi }) => (
                         <th key={`${ci}-${vi}`} className={`${thCls} bg-gray-50 ${alignClass(fieldFormats[item.id], "right")} min-w-[110px]`}>
-                          <span className="text-[10px] text-gray-400 font-normal mr-1">{aggregations[item.id]}</span>
-                          <span className="text-emerald-600">{fieldItemLabel(item, fieldFormats)}</span>
+                          <span className="text-[10px] text-gray-400 font-normal mr-1">{isFormulaKey(item.field) ? "" : aggregations[item.id]}</span>
+                          <span className="text-emerald-600">{fieldItemLabel(item, fieldFormats)}</span><HighlightHeaderMark field={item.field} />
                           <ModuleTag field={item.field} show={showModuleTag} />
                         </th>
                       ))
                     )
                   : fields.values.map((item, vi) => (
                       <th key={vi} className={`${thCls} bg-indigo-50 ${alignClass(fieldFormats[item.id], "right")} min-w-[130px]`}>
-                        <span className="text-[10px] text-indigo-300 font-normal mr-1">{aggregations[item.id]}</span>
-                        <span className="text-indigo-600">{fieldItemLabel(item, fieldFormats)}</span>
+                        <span className="text-[10px] text-indigo-300 font-normal mr-1">{isFormulaKey(item.field) ? "" : aggregations[item.id]}</span>
+                        <span className="text-indigo-600">{fieldItemLabel(item, fieldFormats)}</span><HighlightHeaderMark field={item.field} />
                         <ModuleTag field={item.field} show={showModuleTag} />
                       </th>
                     ))
@@ -11017,19 +12195,19 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                         {hasColumns
                           ? colValues.flatMap((_, ci) =>
                               colItemsAt(ci).map(({ item, vi }) => (
-                                <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} tabular-nums ${valueCls}`}>
+                                <td style={hl(item.field, aggValue(node, ci, vi))} key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} tabular-nums ${valueCls}`}>
                                   {numCellValue(aggValue(node, ci, vi), fieldFormats[item.id])}{currencySuffix(item, nodeBuckets(node, ci))}
                                 </td>
                               ))
                             )
                           : fields.values.map((item, vi) => (
-                              <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} tabular-nums ${valueCls}`}>
+                              <td style={hl(item.field, aggValue(node, 0, vi))} key={vi} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} tabular-nums ${valueCls}`}>
                                 {numCellValue(aggValue(node, 0, vi), fieldFormats[item.id])}{currencySuffix(item, nodeBuckets(node, 0))}
                               </td>
                             ))
                         }
                         {showColTotal && fields.values.map((item, vi) => (
-                          <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} font-semibold tabular-nums bg-gray-50`}>
+                          <td style={hl(item.field, nodeRowTotal(node, vi))} key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} font-semibold tabular-nums bg-gray-50`}>
                             {numCellValue(nodeRowTotal(node, vi), fieldFormats[item.id])}{currencySuffix(item, nodeTotalBuckets(node))}
                           </td>
                         ))}
@@ -11122,16 +12300,16 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
               ? colValues.flatMap((_, ci) =>
                   colItemsAt(ci).map(({ item, vi }) => (
                     <th key={`${ci}-${vi}`} className={`${thCls} bg-gray-50 ${alignClass(fieldFormats[item.id], "right")} min-w-[110px]`}>
-                      <span className="text-[10px] text-gray-400 font-normal mr-1">{aggregations[item.id]}</span>
-                      <span className="text-emerald-600">{fieldItemLabel(item, fieldFormats)}</span>
+                      <span className="text-[10px] text-gray-400 font-normal mr-1">{isFormulaKey(item.field) ? "" : aggregations[item.id]}</span>
+                      <span className="text-emerald-600">{fieldItemLabel(item, fieldFormats)}</span><HighlightHeaderMark field={item.field} />
                       <ModuleTag field={item.field} show={showModuleTag} />
                     </th>
                   ))
                 )
               : fields.values.map((item, vi) => (
                   <th key={vi} className={`${thCls} bg-indigo-50 ${alignClass(fieldFormats[item.id], "right")} min-w-[130px]`}>
-                    <span className="text-[10px] text-indigo-300 font-normal mr-1">{aggregations[item.id]}</span>
-                    <span className="text-indigo-600">{fieldItemLabel(item, fieldFormats)}</span>
+                    <span className="text-[10px] text-indigo-300 font-normal mr-1">{isFormulaKey(item.field) ? "" : aggregations[item.id]}</span>
+                    <span className="text-indigo-600">{fieldItemLabel(item, fieldFormats)}</span><HighlightHeaderMark field={item.field} />
                     <ModuleTag field={item.field} show={showModuleTag} />
                   </th>
                 ))
@@ -11198,19 +12376,19 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                   {hasColumns
                     ? colValues.flatMap((_, ci) =>
                         colItemsAt(ci).map(({ item, vi }) => (
-                          <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
+                          <td style={hl(item.field, cellNum(ri, ci, vi))} key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
                             {numCellValue(cellNum(ri, ci, vi), fieldFormats[item.id])}{currencySuffix(item, [bucketRows(ri, ci)])}
                           </td>
                         ))
                       )
                     : fields.values.map((item, vi) => (
-                        <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
+                        <td style={hl(item.field, cellNum(ri, 0, vi))} key={vi} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
                           {numCellValue(cellNum(ri, 0, vi), fieldFormats[item.id])}{currencySuffix(item, [bucketRows(ri, 0)])}
                         </td>
                       ))
                   }
                   {showColTotal && rowTotals.map((t, vi) => (
-                    <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} font-semibold text-gray-800 tabular-nums bg-gray-50`}>
+                    <td style={hl(fields.values[vi].field, t)} key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[fields.values[vi].id], "right")} font-semibold text-gray-800 tabular-nums bg-gray-50`}>
                       {numCellValue(t, fieldFormats[fields.values[vi].id])}{currencySuffix(fields.values[vi], colValues.map((_, ci) => bucketRows(ri, ci)))}
                     </td>
                   ))}
@@ -11229,7 +12407,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                             const subtotal = groupCell(groupIndices, ci, vi)
                             const buckets = groupIndices.map((absRi) => bucketRows(absRi, ci))
                             return (
-                              <td key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
+                              <td style={hl(item.field, subtotal)} key={`${ci}-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
                                 {numCellValue(subtotal, fieldFormats[item.id])}{currencySuffix(item, buckets)}
                               </td>
                             )
@@ -11240,7 +12418,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                           const subtotal = groupCell(groupIndices, 0, vi)
                           const buckets = groupIndices.map((absRi) => bucketRows(absRi, 0))
                           return (
-                            <td key={vi} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
+                            <td style={hl(item.field, subtotal)} key={vi} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-700 tabular-nums`}>
                               {numCellValue(subtotal, fieldFormats[item.id])}{currencySuffix(item, buckets)}
                             </td>
                           )
@@ -11251,7 +12429,7 @@ function ReportCanvas({ source, fields, aggregations, filterRules, viewFilterRul
                       const subtotal = groupTotal(groupIndices, vi)
                       const buckets = groupIndices.flatMap((absRi) => colValues.map((_, ci) => bucketRows(absRi, ci)))
                       return (
-                        <td key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums bg-gray-100`}>
+                        <td style={hl(item.field, subtotal)} key={`gt-${vi}`} className={`${tdCls} ${alignClass(fieldFormats[item.id], "right")} text-gray-800 tabular-nums bg-gray-100`}>
                           {numCellValue(subtotal, fieldFormats[item.id])}{currencySuffix(item, buckets)}
                         </td>
                       )
@@ -11319,6 +12497,7 @@ interface SavedReport {
   showTotals: boolean
   showModuleTag: boolean
   showProjectCurrency: boolean
+  highlightRules?: HighlightRule[]
 }
 
 const SAVED_REPORT_KEY = "customReportsV2.savedReport"
@@ -11365,6 +12544,18 @@ export default function App() {
   const [showModuleTag, setShowModuleTag] = useState(savedReport?.showModuleTag ?? false)
   const [showProjectCurrency, setShowProjectCurrency] = useState(savedReport?.showProjectCurrency ?? false)
   const [justSaved, setJustSaved] = useState(false)
+  const [highlightRules, setHighlightRules] = useState<HighlightRule[]>(savedReport?.highlightRules ?? [])
+  useFormulas()
+  // Rules belong to a field in Values; once that field leaves Values its rules go with it.
+  const valueNumberKeys = [...new Set(fields.values.map((v) => v.field).filter((k) => isNumericType(getFieldType(k)) && (!isFormulaKey(k) || !!formulaOf(k))))]
+  const valueKeysSig = valueNumberKeys.join("|")
+  useEffect(() => {
+    setHighlightRules((prev) => {
+      const next = prev.filter((r) => valueNumberKeys.includes(r.fieldName))
+      return next.length === prev.length ? prev : next
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [valueKeysSig])
 
   // Save CTA — persists the report definition to localStorage (this app has no backend) so a
   // reload restores it instead of losing everything. Toggling View/Edit is unrelated to this;
@@ -11374,7 +12565,7 @@ export default function App() {
   const payloadJson = JSON.stringify({
     source, fields, aggregations, lookupPaths, filterRules, viewFilterRules,
     reportTimelineFilters, rangeConfigs, fieldFormats,
-    reportView, showTotals, showModuleTag, showProjectCurrency,
+    reportView, showTotals, showModuleTag, showProjectCurrency, highlightRules,
   } satisfies SavedReport)
   const [savedSnapshot, setSavedSnapshot] = useState<string | null>(savedReport ? payloadJson : null)
   const savedViews = useSavedViews(SAVED_VIEWS_KEY, reportMode, viewFilterRules, setViewFilterRules)
@@ -11503,6 +12694,7 @@ export default function App() {
     setReportTimelineFilters({})
     setRangeConfigs({})
     setFieldFormats({})
+    setHighlightRules([])
     setPendingSource(null)
   }
 
@@ -11534,7 +12726,8 @@ export default function App() {
     setFields((prev) => ({ ...prev, [zone]: [...prev[zone], { id, field }] }))
     setAggregations((prev) => {
       let defaultMod: string | undefined
-      if (zone === "values") defaultMod = isNumericType(type) ? "Sum" : "Count"
+      if (isFormulaKey(field)) defaultMod = undefined
+      else if (zone === "values") defaultMod = isNumericType(type) ? "Sum" : "Count"
       else if (field === TIMELINE_KEY) defaultMod = "Month & Year"
       else if (zone === "columns" || zone === "rows") {
         if (isNumericType(type)) defaultMod = "Dimension"
@@ -11628,7 +12821,18 @@ export default function App() {
         ) : appMode === "tabular" ? (
           <TabularBuilder />
         ) : (
-          <>
+          <ReportExtrasHost
+            source={source}
+            formulaZone="values"
+            targets={valueNumberKeys.map((k) => ({ field: k, label: fieldDisplayName(k) }))}
+            highlightRules={highlightRules}
+            onHighlightRulesChange={setHighlightRules}
+            onFormulaCreated={(key) => handleAdd("values", key, "number")}
+            onFormulaDeleted={(key) => {
+              setFields((prev) => ({ ...prev, values: prev.values.filter((v) => v.field !== key) }))
+              setHighlightRules((prev) => prev.filter((r) => r.fieldName !== key))
+            }}
+          >
             <PageHeader
         reportMode={reportMode} onReportModeChange={setReportMode} onSave={handleSave}
         justSaved={justSaved} dirty={dirty}
@@ -11749,7 +12953,7 @@ export default function App() {
                 </div>
               </div>
             </div>
-          </>
+          </ReportExtrasHost>
         )}
       </div>
     </div>
