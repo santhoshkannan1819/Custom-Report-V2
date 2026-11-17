@@ -6375,6 +6375,33 @@ function HighlightHeaderMark({ field }: { field: string }) {
   )
 }
 
+// The Build panel — Columns, Rows, Values, Filters and View filters stacked in one column between
+// the field list and the report, so the report gets the full height. Collapsible, like the design.
+function BuildPanel({ children }: { children: React.ReactNode }) {
+  const [collapsed, setCollapsed] = useState(false)
+  if (collapsed) {
+    return (
+      <aside className="w-10 shrink-0 border-r border-gray-200 bg-white flex flex-col items-center pt-3 print-hide">
+        <button onClick={() => setCollapsed(false)} title="Show build panel" className="p-1 rounded text-gray-400 hover:text-gray-700 hover:bg-gray-100">
+          <span className="inline-block rotate-180"><Ic.ChevRight size={11} /></span><span className="inline-block rotate-180 -ml-1"><Ic.ChevRight size={11} /></span>
+        </button>
+        <span className="mt-3 text-[11px] font-bold uppercase tracking-widest text-gray-500 [writing-mode:vertical-rl] rotate-180">Build</span>
+      </aside>
+    )
+  }
+  return (
+    <aside className="w-[264px] shrink-0 border-r border-gray-200 bg-white flex flex-col overflow-hidden print-hide">
+      <div className="flex items-center px-3.5 pt-3 pb-2 border-b border-gray-100 shrink-0">
+        <span className="text-[11px] font-bold text-gray-600 uppercase tracking-widest flex-1">Build</span>
+        <button onClick={() => setCollapsed(true)} title="Hide build panel" className="p-1 rounded text-gray-400 hover:text-gray-700 hover:bg-gray-100 flex">
+          <span className="inline-block rotate-180"><Ic.ChevRight size={11} /></span><span className="inline-block rotate-180 -ml-1"><Ic.ChevRight size={11} /></span>
+        </button>
+      </div>
+      <div className="flex-1 min-h-0 overflow-y-auto p-3 flex flex-col gap-2.5">{children}</div>
+    </aside>
+  )
+}
+
 function FieldBrowser({
   fields,
   source,
@@ -6876,9 +6903,9 @@ function DropZoneBar(props: DropZoneBarProps) {
   ]
 
   return (
-    <div className="relative flex gap-3 border-b border-gray-200 bg-white px-3 py-3 h-[192px] shrink-0 print-hide">
+    <div className="relative flex flex-col gap-2.5 print-hide">
       {notice && (
-        <div role="status" className="absolute left-1/2 top-2 z-20 -translate-x-1/2 whitespace-nowrap rounded-md bg-gray-900 px-2.5 py-1 text-[11px] text-white shadow-lg">
+        <div role="status" className="absolute left-0 right-0 top-0 z-20 rounded-md bg-gray-900 px-2.5 py-1.5 text-[11px] leading-snug text-white shadow-lg">
           {notice}
         </div>
       )}
@@ -7024,7 +7051,7 @@ function DropZone<Z extends ZoneKey>({
       onDragOver={handleZoneDragOver}
       onDragLeave={handleZoneDragLeave}
       onDrop={handleZoneDrop}
-      className={`flex-1 min-w-0 rounded-lg flex flex-col transition-all
+      className={`w-full rounded-lg flex flex-col transition-all
         ${blocked
           ? "border-2 border-dashed border-gray-300 bg-gray-100 opacity-60 cursor-not-allowed"
           : highlight
@@ -7058,7 +7085,7 @@ function DropZone<Z extends ZoneKey>({
       </div>
 
       {/* Chips — 1 per row, scrolls internally instead of growing the shelf */}
-      <div className="flex-1 min-h-0 overflow-y-auto px-3 pb-2.5 flex flex-col gap-1.5">
+      <div className="px-3 pb-2.5 flex flex-col gap-1.5">
         {isEmpty ? (
           <span className={`text-[12px] transition-colors ${highlight ? "text-indigo-400" : "text-gray-300"}`}>
             {highlight ? "Release to add" : "Drop fields here"}
@@ -9328,8 +9355,11 @@ function FilterBar({
   const highlight = !refusal.blocked && (over || (dragging && rules.length === 0 && !(activeDrag && isFormulaKey(activeDrag.field))))
 
   return (
-    <div className={`print-hide relative z-10 flex items-center gap-2 px-4 py-2 border-b border-gray-200 min-h-[44px] shadow-sm transition-colors
-      ${highlight ? "bg-amber-50" : "bg-white"} ${refusal.blocked ? "opacity-60 cursor-not-allowed" : ""}`}
+    <div className={`print-hide relative rounded-lg transition-colors
+      ${refusal.blocked ? "border-2 border-dashed border-gray-300 bg-gray-100 opacity-60 cursor-not-allowed"
+        : highlight ? "border-2 border-dashed border-amber-300 bg-amber-50"
+        : rules.length === 0 ? "border-2 border-dashed border-gray-200 bg-gray-50/60"
+        : "border border-gray-200 bg-gray-50/60 shadow-sm"}`}
     >
       {refusal.tip}
       {/* Drop target area — filters */}
@@ -9337,19 +9367,22 @@ function FilterBar({
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
-        className="flex items-center gap-2 flex-wrap flex-1 min-w-0 self-stretch"
+        className="flex items-center gap-1.5 flex-wrap px-3 pt-2.5 pb-2.5"
       >
-        <div className="flex items-center gap-1.5 shrink-0 self-center">
+        <div className="w-full flex items-center gap-1.5">
           <span className={`text-[11px] font-bold uppercase tracking-wider transition-colors
             ${highlight ? "text-amber-500" : "text-gray-600"}`}>
             Filters
           </span>
-          {rules.length === 0 && (
-            <span className={`text-[12px] transition-colors ${highlight ? "text-amber-400" : "text-gray-300"}`}>
-              — drop a field to filter
-            </span>
+          {rules.length > 0 && (
+            <span className="text-[10px] bg-gray-200/70 text-gray-600 rounded-full px-1.5 py-px font-medium">{rules.length}</span>
           )}
         </div>
+        {rules.length === 0 && (
+          <span className={`text-[12px] transition-colors ${highlight ? "text-amber-400" : "text-gray-300"}`}>
+            {highlight ? "Release to add" : "Drop fields here"}
+          </span>
+        )}
 
         {rules.map((rule) => (
           <FilterChip
@@ -10434,14 +10467,18 @@ function ViewFilterPane({
       onDragOver={isCreate ? handleDragOver : undefined}
       onDragLeave={isCreate ? handleDragLeave : undefined}
       onDrop={isCreate ? handleDrop : undefined}
-      className={`w-[280px] shrink-0 flex flex-col border-l border-gray-200 overflow-hidden transition-colors
-        ${highlight ? "bg-amber-50" : "bg-white"} ${refusal.blocked ? "opacity-60 cursor-not-allowed" : ""}`}
+      className={isCreate
+        // While building it is one of the stacked sections in the Build panel.
+        ? `w-full rounded-lg flex flex-col transition-colors ${refusal.blocked ? "border-2 border-dashed border-gray-300 bg-gray-100 opacity-60 cursor-not-allowed"
+            : highlight ? "border-2 border-dashed border-amber-300 bg-amber-50"
+            : rules.length === 0 ? "border-2 border-dashed border-gray-200 bg-gray-50/60" : "border border-gray-200 bg-gray-50/60 shadow-sm"}`
+        : `w-[280px] shrink-0 flex flex-col border-l border-gray-200 overflow-hidden transition-colors bg-white`}
     >
       {refusal.tip}
       {/* Builder-only heading: it names the drop target and counts what's in it. A viewer just
           sees filter cards, so the label is noise — each card already names its own field. */}
       {isCreate && (
-        <div className="flex items-center gap-1.5 px-4 pt-3.5 pb-2 shrink-0">
+        <div className="flex items-center gap-1.5 px-3 pt-2.5 pb-1.5 shrink-0">
           <span className={`text-[11px] font-bold uppercase tracking-wider transition-colors
             ${highlight ? "text-amber-500" : "text-gray-600"}`}>
             View filters
@@ -10454,7 +10491,7 @@ function ViewFilterPane({
         </div>
       )}
 
-      <div className={`flex-1 min-h-0 overflow-y-auto px-4 pb-4 flex flex-col gap-1.5 items-start ${isCreate ? "" : "pt-3.5"}`}>
+      <div className={isCreate ? "px-3 pb-2.5 flex flex-col gap-1.5 items-stretch" : "flex-1 min-h-0 overflow-y-auto px-4 pb-4 pt-3.5 flex flex-col gap-1.5 items-start"}>
         {rules.length === 0 ? (
           <>
             <span className={`text-[12px] leading-relaxed transition-colors ${highlight ? "text-amber-500" : "text-gray-400"}`}>
@@ -10520,7 +10557,7 @@ function TabularZoneBar({
   ]
   const noop = () => {}
   return (
-    <div className="flex gap-3 border-b border-gray-200 bg-white px-3 py-3 h-[192px] shrink-0 print-hide">
+    <div className="flex flex-col gap-2.5 print-hide">
       {zones.map(({ key, label, chips }) => (
         <DropZone
           key={key}
@@ -11168,8 +11205,8 @@ function TabularBuilder() {
             onDragEnd={() => { endDrag(); setDragging(false) }}
           />
         )}
-        <div className="flex flex-col flex-1 min-w-0">
-          {reportMode === "create" && (
+        {reportMode === "create" && (
+          <BuildPanel>
             <TabularZoneBar
               fields={fields}
               dragging={dragging}
@@ -11189,8 +11226,6 @@ function TabularBuilder() {
                 setFieldFormats((prev) => ({ ...prev, [id]: { ...DEFAULT_FIELD_FORMAT, ...prev[id], ...patch } }))}
               blockReason={(zone, field) => (isFormulaKey(field) && zone === "tabGroupBy" ? "Formula fields can only go in Columns" : null)}
             />
-          )}
-          {reportMode === "create" && (
             <FilterBar
               rules={filterRules}
               dragging={dragging}
@@ -11204,23 +11239,6 @@ function TabularBuilder() {
                 setFilterRules((prev) => prev.map((r) => (r.field === field ? { ...r, ...patch } : r)))}
               justDropped={justDroppedFilter}
               flat
-            />
-          )}
-          <div className="flex flex-1 overflow-hidden">
-            <TabularCanvas
-              source={source}
-              fields={fields}
-              lookupPaths={lookupPaths}
-              aggregations={aggregations}
-              filterRules={filterRules}
-              viewFilterRules={viewFilterRules}
-              rangeConfigs={rangeConfigs}
-              fieldFormats={fieldFormats}
-              showModuleTag={showModuleTag}
-              showProjectCurrency={showProjectCurrency}
-              showRowNumbers={showRowNumbers}
-              groupSortDir={groupSortDir}
-              onGroupSortToggle={() => setGroupSortDir((d) => (d === "asc" ? "desc" : "asc"))}
             />
             <ViewFilterPane
               rules={viewFilterRules}
@@ -11237,6 +11255,42 @@ function TabularBuilder() {
               reportMode={reportMode}
               flat
             />
+          </BuildPanel>
+        )}
+        <div className="flex flex-col flex-1 min-w-0">
+          <div className="flex flex-1 overflow-hidden">
+            <TabularCanvas
+              source={source}
+              fields={fields}
+              lookupPaths={lookupPaths}
+              aggregations={aggregations}
+              filterRules={filterRules}
+              viewFilterRules={viewFilterRules}
+              rangeConfigs={rangeConfigs}
+              fieldFormats={fieldFormats}
+              showModuleTag={showModuleTag}
+              showProjectCurrency={showProjectCurrency}
+              showRowNumbers={showRowNumbers}
+              groupSortDir={groupSortDir}
+              onGroupSortToggle={() => setGroupSortDir((d) => (d === "asc" ? "desc" : "asc"))}
+            />
+            {reportMode === "view" && (
+              <ViewFilterPane
+                rules={viewFilterRules}
+                baseRules={filterRules}
+                dragging={dragging}
+                source={source}
+                fields={pivotShape}
+                aggregations={aggregations}
+                rangeConfigs={rangeConfigs}
+                onDrop={handleViewFilterDrop}
+                onRemove={(field) => setViewFilterRules((prev) => prev.filter((r) => r.field !== field))}
+                onRuleChange={(field, patch) =>
+                  setViewFilterRules((prev) => prev.map((r) => (r.field === field ? { ...r, ...patch } : r)))}
+                reportMode={reportMode}
+                flat
+              />
+            )}
           </div>
         </div>
       </div>
@@ -12892,8 +12946,8 @@ export default function App() {
                   onDragEnd={() => { endDrag(); setDragging(false); setDragType(null) }}
                 />
               )}
-              <div className="flex flex-col flex-1 min-w-0">
-                {reportMode === "create" && (
+              {reportMode === "create" && (
+                <BuildPanel>
                   <DropZoneBar
                     fields={fields}
                     dragging={dragging}
@@ -12916,8 +12970,6 @@ export default function App() {
                     blockReason={dropBlockReason}
                     notice={splitNotice}
                   />
-                )}
-                {reportMode === "create" && (
                   <FilterBar
                     rules={filterRules}
                     dragging={dragging}
@@ -12930,7 +12982,22 @@ export default function App() {
                     onRuleChange={handleFilterChange}
                     justDropped={justDroppedFilter}
                   />
-                )}
+                  <ViewFilterPane
+                    rules={viewFilterRules}
+                    baseRules={filterRules}
+                    dragging={dragging}
+                    source={source}
+                    fields={fields}
+                    aggregations={aggregations}
+                    rangeConfigs={rangeConfigs}
+                    onDrop={handleViewFilterDrop}
+                    onRemove={handleViewFilterRemove}
+                    onRuleChange={handleViewFilterChange}
+                    reportMode={reportMode}
+                  />
+                </BuildPanel>
+              )}
+              <div className="flex flex-col flex-1 min-w-0">
                 {/* Canvas + View filters share a row BELOW the shelves, so Columns/Rows/Values
                     and the Filters bar run the full width to the right edge — the view filter
                     rail is a companion to the report, not to the whole builder. */}
@@ -12950,19 +13017,21 @@ export default function App() {
                     showModuleTag={showModuleTag}
                     showProjectCurrency={showProjectCurrency}
                   />
-                  <ViewFilterPane
-                    rules={viewFilterRules}
-                    baseRules={filterRules}
-                    dragging={dragging}
-                    source={source}
-                    fields={fields}
-                    aggregations={aggregations}
-                    rangeConfigs={rangeConfigs}
-                    onDrop={handleViewFilterDrop}
-                    onRemove={handleViewFilterRemove}
-                    onRuleChange={handleViewFilterChange}
-                    reportMode={reportMode}
-                  />
+                  {reportMode === "view" && (
+                    <ViewFilterPane
+                      rules={viewFilterRules}
+                      baseRules={filterRules}
+                      dragging={dragging}
+                      source={source}
+                      fields={fields}
+                      aggregations={aggregations}
+                      rangeConfigs={rangeConfigs}
+                      onDrop={handleViewFilterDrop}
+                      onRemove={handleViewFilterRemove}
+                      onRuleChange={handleViewFilterChange}
+                      reportMode={reportMode}
+                    />
+                  )}
                 </div>
               </div>
             </div>
