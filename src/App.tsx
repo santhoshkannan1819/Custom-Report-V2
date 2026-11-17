@@ -7613,6 +7613,19 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
                 )}
               </div>
             )}
+            {isFormula && formulaOf(name) && (
+              <div className="mb-3 pb-3 border-b border-gray-100">
+                <p className={SETTINGS_SECTION}>Formula</p>
+                <button
+                  onClick={() => { setShowFormatMenu(false); extras.openFormula(formulaOf(name)) }}
+                  className="w-full flex items-center gap-2 border border-gray-200 rounded-md px-2 py-1.5 text-[13px] text-gray-700 hover:bg-gray-50"
+                >
+                  <span className="text-gray-400"><FxIcon size={13} /></span>
+                  <span className="flex-1 text-left">Edit formula field</span>
+                  <Ic.ChevRight size={10} />
+                </button>
+              </div>
+            )}
             {highlightable && (
               <div className="mb-3 pb-3 border-b border-gray-100">
                 <p className={SETTINGS_SECTION}>Highlight</p>
@@ -7627,7 +7640,7 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
                 </button>
               </div>
             )}
-            {(settingsInGear || highlightable) && <p className={SETTINGS_SECTION}>Display</p>}
+            {(settingsInGear || highlightable || isFormula) && <p className={SETTINGS_SECTION}>Display</p>}
             <FieldFormatFields
               item={{ id, field: name }}
               defaultAlign={defaultAlign}
