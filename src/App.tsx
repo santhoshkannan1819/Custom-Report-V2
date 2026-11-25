@@ -334,6 +334,7 @@ const MODULES: Module[] = [
       { name: "ARR", type: "money" },
       { name: "Billing type", type: "text" },
       { name: "Project owner", type: "person" },
+      { name: "Created by", type: "person" },
       { name: "Budget consumed %", type: "percent" },
       { name: "Estimate to completion (ETC)", type: "money" },
       { name: "Estimate at completion (EAC)", type: "money" },
@@ -426,6 +427,7 @@ const MODULES: Module[] = [
     canBeSource: true,
     fields: [
       { name: "Activity Name", type: "text" },
+      { name: "Team member", type: "person" },
       { name: "Tracked Hours", type: "hours" },
       { name: "Billable Hours", type: "hours" },
       { name: "Billable", type: "boolean" },
@@ -609,6 +611,7 @@ const MODULES: Module[] = [
     canBeSource: true,
     fields: [
       { name: "Amount", type: "money" },
+      { name: "Expense owner", type: "person" },
       { name: "Billable Amount", type: "money" },
       { name: "Currency", type: "text" },
       { name: "Expense status", type: "text" },
@@ -695,6 +698,7 @@ const MODULES: Module[] = [
       { name: "Due date", type: "date" },
       { name: "Start date", type: "date" },
       { name: "Start date actual", type: "date" },
+      { name: "Updated by", type: "person" },
     ],
   },
   {
@@ -1455,7 +1459,6 @@ const JOIN_EDGES: JoinEdge[] = [
   { from: "Task", to: "Phase", label: "Phase" },
   { from: "Task", to: "Budget", label: "Project Financials Budgets" },
   { from: "Task", to: "Project", label: "Project" },
-  { from: "Task", to: "People", label: "Responsible" },
   { from: "Task", to: "Team", label: "Teams" },
 
   { from: "Time tracking", to: "Account", label: "Company" },
@@ -1587,20 +1590,117 @@ const MODULE_RELATIONSHIP_PATHS: Record<string, string[]> = (() => {
   return map
 })()
 
+// ── Team member roles ─────────────────────────────────────────────────────────────
+// Every way a record points at a team member, per module. A Team member field picks one of the
+// roles of the report's source module. The person each role names is read from the module's own
+// person column (by name) or from an id the record carries.
+interface PersonRole {
+  /** Stored on the chip / filter. Unique across modules. */
+  id: string
+  module: string
+  label: string
+  idKey?: string
+  nameKey?: string
+  /** A list of ids: one record, several people. */
+  idsKey?: string
+  /** One record can name several people (the role can repeat a record's numbers). */
+  many?: boolean
+  /** Created by / Updated by: listed, but never the default. */
+  audit?: boolean
+}
+const PERSON_ROLE_LIST: PersonRole[] = ([
+  { module: "Task", label: "Assignees", idKey: "userId", many: true },
+  { module: "Task", label: "Created by", nameKey: "Created by", audit: true },
+  { module: "Phase", label: "Updated by", nameKey: "Updated by", audit: true },
+  { module: "Project", label: "Project owner", idKey: "ownerId" },
+  { module: "Project", label: "Project members", idsKey: "teamIds", many: true },
+  { module: "Project", label: "Created by", idKey: "createdById", audit: true },
+  { module: "Account", label: "Company owner", nameKey: "Company owner" },
+  { module: "Time tracking", label: "Team member", idKey: "userId" },
+  { module: "Time tracking", label: "Submitted by", nameKey: "Submitted by" },
+  { module: "Time tracking", label: "Approved by", nameKey: "Approved by" },
+  { module: "Time tracking", label: "Rejected by", nameKey: "Rejected by" },
+  { module: "Time tracking", label: "Created by", nameKey: "Created by", audit: true },
+  { module: "Expense", label: "Expense owner", idKey: "userId" },
+  { module: "Assignee effort", label: "Team member", idKey: "userId" },
+  { module: "Assignee effort", label: "Created by", nameKey: "Created by", audit: true },
+  { module: "Assignee effort", label: "Last updated by", nameKey: "Last updated by", audit: true },
+  { module: "Allocations", label: "Team member", idKey: "userId" },
+  { module: "Actual financials", label: "Team member", idKey: "userId" },
+  { module: "Estimated financials", label: "Team member", idKey: "userId" },
+  { module: "Capacity", label: "Team member", idKey: "userId" },
+  { module: "Leave & holiday", label: "Team member", idKey: "userId" },
+  { module: "Project members", label: "Team member", idKey: "userId" },
+  { module: "Epic", label: "Epic owner", nameKey: "Epic owner" },
+  { module: "Epic", label: "Epic squad", nameKey: "Epic squad", many: true },
+  { module: "Sprint", label: "Sprint owner", nameKey: "Sprint owner" },
+  { module: "Sprint", label: "Sprint squad", nameKey: "Sprint squad", many: true },
+  { module: "Forms", label: "Submitted by", nameKey: "Submitted By" },
+  { module: "Forms", label: "Last edited by", nameKey: "Last edited by", audit: true },
+] as Omit<PersonRole, "id">[]).map((r) => ({ ...r, id: `${r.module} · ${r.label}` }))
+const PERSON_ROLES: Record<string, PersonRole> = Object.fromEntries(PERSON_ROLE_LIST.map((r) => [r.id, r]))
+
+// Reports saved before roles were grouped by module stored the bare relationship name.
+const LEGACY_ROLE_IDS: Record<string, string> = {
+  "Assignees": "Task · Assignees",
+  "Project owner": "Project · Project owner",
+  "Project creator": "Project · Created by",
+  "Project member": "Project · Project members",
+  "Expense Owner": "Expense · Expense owner",
+}
+const normalizeRoleId = (id?: string) => (id ? LEGACY_ROLE_IDS[id] ?? id : id)
+
+// A role's name on a chip or filter. Every role on offer belongs to the report's source, so the
+// module needn't be repeated.
+function roleDisplayName(id: string): string {
+  return PERSON_ROLES[id]?.label ?? id
+}
+
+
+// The Team member roles on offer: every role of the report's SOURCE module, and only those — a
+// task report reads people as the task names them. Offered once the source's record can be read
+// from the grain (the grain is the source, or carries a key to it).
+function personRoleOptions(grainModule: string, source?: string): string[] {
+  const mod = source ?? grainModule
+  if (mod !== grainModule) {
+    const sample = (MODULE_ROWS[grainModule] ?? [])[0]
+    if (!sample || !DIMENSION_ID_KEY[mod] || sample[DIMENSION_ID_KEY[mod]] === undefined) return []
+  }
+  return PERSON_ROLE_LIST.filter((r) => r.module === mod).map((r) => r.id)
+}
+
 // The relationship paths that could take you from the report's grain to this field's module.
-// Zero or one means there is nothing to choose and the chip shows no role at all — only the
-// genuinely ambiguous pairs (6 of 105 today) ever surface a picker.
-function availableLookupPaths(grainModule: string, fieldKey: string): string[] {
+// Zero or one means there is nothing to choose and the chip shows no role at all. A Team member
+// field lists every role, grouped by module (see personRoleOptions).
+function availableLookupPaths(grainModule: string, fieldKey: string, source?: string): string[] {
   const mod = fieldKeyModule(fieldKey)
   if (!mod || mod === grainModule) return []
+  if (mod === "People") return personRoleOptions(grainModule, source)
   return MODULE_RELATIONSHIP_PATHS[modulePairKey(grainModule, mod)] ?? []
 }
 
-// The role a chip is actually resolving through: its explicit choice, else the primary path.
-function effectiveLookupPath(grainModule: string, fieldKey: string, chosen?: string): string | undefined {
-  const paths = availableLookupPaths(grainModule, fieldKey)
+// The role used when the author hasn't picked one: the source's first role (owner / assignee /
+// the person the record is for), never Created by or Updated by.
+function defaultLookupPath(paths: string[]): string | undefined {
+  return paths.find((p) => !PERSON_ROLES[p]?.audit) ?? paths[0]
+}
+
+// The role a chip is actually resolving through: its explicit choice, else the default. A single
+// Team member role is still returned (there is no choice to show, but it decides who is read).
+function effectiveLookupPath(grainModule: string, fieldKey: string, chosen?: string, source?: string): string | undefined {
+  const paths = availableLookupPaths(grainModule, fieldKey, source)
+  const c = normalizeRoleId(chosen)
+  if (paths.length === 1 && PERSON_ROLES[paths[0]]) return paths[0]
   if (paths.length < 2) return undefined
-  return chosen && paths.includes(chosen) ? chosen : paths[0]
+  return c && paths.includes(c) ? c : defaultLookupPath(paths)
+}
+
+// A chip whose chosen role is no longer on offer (its module left the report) — it has fallen
+// back to the default, and the author is told so.
+function lookupFellBack(grainModule: string, fieldKey: string, chosen?: string, source?: string): boolean {
+  const c = normalizeRoleId(chosen)
+  if (!c || !PERSON_ROLES[c]) return false
+  return !availableLookupPaths(grainModule, fieldKey, source).includes(c)
 }
 
 interface LookupRelationship {
@@ -1842,10 +1942,9 @@ const TASKS: Row[] = PROJECTS.flatMap((project) => {
     const id = nextId("task")
     const phase = pick(phases)
     const assignee = pick(team)
-    // A second, deliberately different person so "Assignees" and "Responsible" are not the
-    // same lookup wearing two names — without this the role picker would be decorative.
+    // Kept only so the random sample data stays the same as before Responsible was removed.
     const others = team.filter((p) => p.id !== assignee.id)
-    const responsible = others.length > 0 ? pick(others) : assignee
+    if (others.length > 0) pick(others)
     const status = pickWeighted<string>([["Completed", 4], ["In progress", 3], ["To do", 2], ["Blocked", 1]])
     const effort = randInt(4, 80)
     const start = randDate(phase["Start date"], phase["Due date"])
@@ -1855,7 +1954,6 @@ const TASKS: Row[] = PROJECTS.flatMap((project) => {
     return {
       id, taskId: id, projectId: project.id, phaseId: phase.id, accountId: project.accountId,
       userId: assignee.id, roleId: assignee.roleId,
-      responsibleUserId: responsible.id,
       "Task name": pick(TASK_SUBJECTS),
       "Project phase": phase["Project phase"],
       "Effort": effort,
@@ -2377,6 +2475,12 @@ TASKS.forEach((t) => {
   t["Created at"] = addDays(t["Start date"], -aInt(3, 20))
 })
 
+// Person columns that only restate who a record already points at — no draws, so nothing shifts.
+PROJECTS.forEach((p) => { p["Created by"] = PEOPLE_BY_ID[p.createdById]?.["Team member name"] ?? null })
+PHASES.forEach((ph) => { ph["Updated by"] = PROJECTS_BY_ID[ph.projectId]?.["Project owner"] ?? null })
+TIME_ENTRIES.forEach((e) => { e["Team member"] = PEOPLE_BY_ID[e.userId]?.["Team member name"] ?? null })
+EXPENSE.forEach((e) => { e["Expense owner"] = PEOPLE_BY_ID[e.userId]?.["Team member name"] ?? null })
+
 ACTUAL_FINANCIALS.forEach((r) => {
   const entries = (TIME_BY_TASK[r.taskId] ?? []).filter((e) => {
     const d: Date = e["Created date"], m: Date = r["Recognised date"]
@@ -2559,34 +2663,36 @@ const DIMENSION_ID_KEY: Record<string, string> = {
 // decides which foreign key on the grain row gets followed. A pair with no entry here resolves
 // the same way whichever role is picked — the relationship exists in the schema but the mock
 // data carries only one key for it.
-const ROLE_FK: Record<string, string> = {
-  "Task|People|Assignees": "userId",
-  "Task|People|Responsible": "responsibleUserId",
-  "Project|People|Project owner": "ownerId",
-  "Project|People|Project creator": "createdById",
-  "Expense|People|Expense Owner": "userId",
-  // The same two roles again at the junction grain, because choosing "Project member" for one
-  // chip raises the whole report to it — and the other chips must keep resolving as they read.
-  "Project members|People|Project owner": "ownerId",
-  "Project members|People|Project creator": "createdById",
-}
+// Team member roles are resolved through PERSON_ROLES (personsForRow); this map is for the other
+// module pairs that can be reached more than one way.
+const ROLE_FK: Record<string, string> = {}
 
-// The same one-to-many roles read as a LIST of ids, for filters. A filter never needs one row per
-// member — "projects I am on" is a yes/no per project — so it can test every member in place,
-// without raising the grain the way a row or column chip must.
-const ROLE_MULTI_FK: Record<string, string> = {
-  "Project|People|Project member": "teamIds",
-}
-
-// A role that is one-to-many cannot be answered by swapping a key — a project has many
-// members, so there is no single person to put in the cell. Reporting the first one would be
-// arbitrary and silently wrong. Instead the role raises the report's grain to the junction
-// that already models the pairing, giving one row per project-and-member, which is what
-// "group by project member" actually means.
+// A one-to-many role on the report's own record cannot be answered by swapping a key — a project
+// has many members, so there is no single person to put in the cell. The role raises the
+// report's grain to the junction that already models the pairing, giving one row per
+// project-and-member, which is what "group by project member" actually means. The same role
+// reached through a PARENT (a task's project's members) instead puts each record under every
+// person it names, and totals count the record once.
 const ROLE_GRAIN: Record<string, string> = {
-  "Project|People|Project member": "Project members",
+  "Project|People|Project · Project members": "Project members",
 }
 const roleFkKey = (grain: string, target: string, role: string) => `${grain}|${target}|${role}`
+
+const PEOPLE_BY_NAME: Record<string, Row> = Object.fromEntries(PEOPLE.map((p) => [p["Team member name"], p]))
+
+// The person (or people) a record names in this role. An array for a one-to-many role.
+function personsForRow(grainModule: string, row: Row, role: PersonRole): Row | Row[] | undefined {
+  // The junction a one-to-many role raised the report to: each row already is one member.
+  if (ROLE_GRAIN[roleFkKey(role.module, "People", role.id)] === grainModule) return PEOPLE_BY_ID[row.userId]
+  const via = role.module === grainModule
+    ? row
+    : DIMENSION_BY_ID[role.module]?.[row[DIMENSION_ID_KEY[role.module]]]
+  if (!via) return undefined
+  if (role.idsKey) return (Array.isArray(via[role.idsKey]) ? via[role.idsKey] : []).map((id: string) => PEOPLE_BY_ID[id]).filter(Boolean)
+  if (role.idKey) return PEOPLE_BY_ID[via[role.idKey]]
+  if (role.nameKey) return via[role.nameKey] ? PEOPLE_BY_NAME[via[role.nameKey]] : undefined
+  return undefined
+}
 
 const DIMENSION_BY_ID: Record<string, Record<string, Row>> = {
   Account: ACCOUNTS_BY_ID, Role: ROLES_BY_ID, People: PEOPLE_BY_ID, Project: PROJECTS_BY_ID,
@@ -2675,6 +2781,12 @@ function resolveFieldForRow(grainModule: string, row: Row, targetKey: string, da
       if (ownDateField && !withinWindow(row[ownDateField], dateWindow)) return undefined
     }
     return row[targetField]
+  }
+  const personRole = targetModule === "People" ? PERSON_ROLES[normalizeRoleId(role) ?? ""] : undefined
+  if (personRole) {
+    const p = personsForRow(grainModule, row, personRole)
+    if (Array.isArray(p)) return p.map((x) => x[targetField])
+    return p ? p[targetField] : undefined
   }
   const dimKey = (role ? ROLE_FK[roleFkKey(grainModule, targetModule, role)] : undefined)
     ?? DIMENSION_ID_KEY[targetModule]
@@ -2811,11 +2923,11 @@ function pickGrain(source: string, fields: PivotFields, filterRules: FilterRule[
 // matters: choosing "Project member" raises the grain to the junction, and a role re-derived at
 // that point would no longer see the choices the user was actually offered.
 function resolveChipRoles(
-  baseGrain: string, fields: PivotFields, lookupPaths: Record<string, string>,
+  baseGrain: string, fields: PivotFields, lookupPaths: Record<string, string>, source?: string,
 ): Record<string, string> {
   const out: Record<string, string> = {}
   ;[...fields.columns, ...fields.rows, ...fields.values].forEach((item) => {
-    const role = effectiveLookupPath(baseGrain, item.field, lookupPaths[item.id])
+    const role = effectiveLookupPath(baseGrain, item.field, lookupPaths[item.id], source)
     if (role) out[item.id] = role
   })
   return out
@@ -2827,7 +2939,7 @@ function pickGrainWithRoles(
   source: string, fields: PivotFields, filterRules: FilterRule[], lookupPaths: Record<string, string>,
 ): string {
   const base = pickGrain(source, fields, filterRules)
-  const roles = resolveChipRoles(base, fields, lookupPaths)
+  const roles = resolveChipRoles(base, fields, lookupPaths, source)
   const implied = new Set<string>()
   ;[...fields.columns, ...fields.rows, ...fields.values].forEach((item) => {
     const role = roles[item.id]
@@ -2862,7 +2974,7 @@ function splitConflicts(
 ): SplitConflict[] {
   if (isFormTemplateSource(source)) return []
   const grain = pickGrainWithRoles(source, fields, filterRules, lookupPaths)
-  const roles = resolveChipRoles(pickGrain(source, fields, filterRules), fields, lookupPaths)
+  const roles = resolveChipRoles(pickGrain(source, fields, filterRules), fields, lookupPaths, source)
   const rows = MODULE_ROWS[grain] ?? []
   const splits = [...fields.rows, ...fields.columns].filter((s) => s.field !== TIMELINE_KEY)
   const out: SplitConflict[] = []
@@ -2878,7 +2990,14 @@ function splitConflicts(
     let owner: (r: Row) => any
     let noun: string
     const dimKey = (roles[v.id] ? ROLE_FK[roleFkKey(grain, m, roles[v.id])] : undefined) ?? DIMENSION_ID_KEY[m]
-    if (dimKey) {
+    const personRole = m === "People" ? PERSON_ROLES[roles[v.id] ?? ""] : undefined
+    if (personRole) {
+      owner = (r) => {
+        const p = personsForRow(grain, r, personRole)
+        return Array.isArray(p) ? (p.length ? p.map((x) => x.id).join(",") : undefined) : p?.id
+      }
+      noun = "person"
+    } else if (dimKey) {
       owner = (r) => r[dimKey]
       noun = SPLIT_OWNER_NOUN[m] ?? m.toLowerCase()
     } else if (ROLLUP_FK[m]) {
@@ -3276,15 +3395,7 @@ function textRuleMatches(raw: any, rule: FilterRule): boolean {
 // when the role is one-to-many. Reads the rule's role, which withFilterRoles has already settled
 // against the base grain so it means what the user picked whatever grain the report ends up at.
 function filterValuesForRow(grainModule: string, row: Row, rule: FilterRule): any[] {
-  const role = rule.lookupPath
-  const target = fieldKeyModule(rule.field)
-  const multiFk = role ? ROLE_MULTI_FK[roleFkKey(grainModule, target, role)] : undefined
-  if (multiFk) {
-    const ids: any[] = Array.isArray(row[multiFk]) ? row[multiFk] : []
-    const field = fieldDisplayName(rule.field)
-    return ids.map((id) => DIMENSION_BY_ID[target]?.[id]?.[field])
-  }
-  const v = resolveFieldForRow(grainModule, row, rule.field, null, role)
+  const v = resolveFieldForRow(grainModule, row, rule.field, null, rule.lookupPath)
   // A multi-value answer is tested value by value, like the members above; an empty one reads as
   // a single blank so "none of" treats it the way it treats any blank.
   if (Array.isArray(v)) return v.length > 0 ? v : [undefined]
@@ -3304,9 +3415,9 @@ function textRuleMatchesAll(values: any[], rule: FilterRule): boolean {
 // so a filter and a chip on the same field read the same people. Done once, up front, because a
 // chip choosing a one-to-many role can raise the grain, and a role re-derived after that would no
 // longer see the choices the user was offered.
-function withFilterRoles(baseGrain: string, rules: FilterRule[]): FilterRule[] {
+function withFilterRoles(baseGrain: string, rules: FilterRule[], source?: string): FilterRule[] {
   return rules.map((r) => {
-    const role = effectiveLookupPath(baseGrain, r.field, r.lookupPath)
+    const role = effectiveLookupPath(baseGrain, r.field, r.lookupPath, source)
     return role === r.lookupPath ? r : { ...r, lookupPath: role }
   })
 }
@@ -3488,6 +3599,19 @@ function buildLabeler(grainModule: string, sampleRows: Row[], item: PivotItem, a
     return {
       label: (row) => { const raw = resolve(row); return raw == null ? blank : raw ? "Yes" : "No" },
       sortKey: (row) => { const raw = resolve(row); return raw == null ? "" : raw ? "0" : "1" },
+    }
+  }
+  // A one-to-many Team member role (a task's project members): the record goes under every person
+  // it names, and totals count it once.
+  if (PERSON_ROLES[normalizeRoleId(lookupPaths[item.id]) ?? ""]?.idsKey) {
+    const names = (row: Row): string[] => {
+      const raw = resolve(row)
+      return (Array.isArray(raw) ? raw : [raw]).filter((v) => v != null && v !== "").map(String)
+    }
+    return {
+      label: (row) => names(row).join(", ") || blank,
+      sortKey: (row) => names(row)[0] ?? "￿",
+      labels: (row) => { const n = names(row); return n.length ? n.map((x) => ({ label: x, sortKey: x })) : [{ label: blank, sortKey: "￿" }] },
     }
   }
   return {
@@ -3698,7 +3822,7 @@ function previewGroupRows(
 ): { grainModule: string; groups: Row[][] } {
   const grainModule = pickGrain(source, fields, filterRules)
   const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
-  const roledRules = withFilterRoles(grainModule, filterRules)
+  const roledRules = withFilterRoles(grainModule, filterRules, source)
   const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, roledRules))
 
   const rowFields = fields.rows.filter((r) => r.field !== TIMELINE_KEY)
@@ -3764,10 +3888,10 @@ function relevantFieldValues(
   if (type === "boolean") return ["Yes", "No"]
   if (type !== "text" && type !== "person") return null
   const grainModule = pickGrain(source, fields, grainRules)
-  const roledScope = withFilterRoles(grainModule, scopeRules)
+  const roledScope = withFilterRoles(grainModule, scopeRules, source)
   // The offered values must come through the same relationship the filter will test, or the
   // list would show owners while the filter matched members (or show nothing at all).
-  const probe = withFilterRoles(grainModule, [{ field: fieldKey, lookupPath } as FilterRule])[0]
+  const probe = withFilterRoles(grainModule, [{ field: fieldKey, lookupPath } as FilterRule], source)[0]
   const values = new Set<string>()
   ;(MODULE_ROWS[grainModule] ?? []).forEach((row) => {
     if (!rowPassesFilters(grainModule, row, roledScope)) return
@@ -3820,7 +3944,15 @@ function computeReportData(
   const grainModule = pickGrainWithRoles(source, fields, allRules, lookupPaths)
   // From here on "lookupPaths" means each chip's resolved role, not its raw choice.
   const baseGrain = pickGrain(source, fields, allRules)
-  const chipRoles = resolveChipRoles(baseGrain, fields, lookupPaths)
+  const chipRoles = resolveChipRoles(baseGrain, fields, lookupPaths, source)
+  // A chip whose chosen role's module has left the report reads through the default role now.
+  const roleNotices: string[] = []
+  ;[...fields.columns, ...fields.rows, ...fields.values].forEach((item) => {
+    if (!lookupFellBack(baseGrain, item.field, lookupPaths[item.id], source)) return
+    const was = PERSON_ROLES[normalizeRoleId(lookupPaths[item.id])!]
+    const now = chipRoles[item.id]
+    roleNotices.push(`${fieldDisplayName(item.field)} now shows ${now ? roleDisplayName(now) : "the default role"}: a ${source.toLowerCase()} report can't use ${was.module} ${was.label.toLowerCase().replace(new RegExp(`^${was.module.toLowerCase()} `), "")}.`)
+  })
   lookupPaths = chipRoles
 
   // A role that raised the grain repeats every "one"-side measure across the many rows it
@@ -3831,11 +3963,19 @@ function computeReportData(
     const role = Object.values(chipRoles).find((r) => ROLE_GRAIN[roleFkKey(baseGrain, "People", r)])
     if (fanned.length > 0) {
       const names = fanned.map((v) => fieldDisplayName(v.field)).join(", ")
-      fanoutNotice = `${names} is counted once per ${(role ?? "joined row").toLowerCase()}, not once per ${baseGrain.toLowerCase()} — totals are higher than the ${baseGrain.toLowerCase()} totals.`
+      fanoutNotice = `${names} is counted once per ${(role ? roleDisplayName(role) : "joined row").toLowerCase().replace(/s$/, "")}, not once per ${baseGrain.toLowerCase()} — totals are higher than the ${baseGrain.toLowerCase()} totals.`
+    }
+  } else {
+    // A one-to-many role reached through a parent puts each record under every person it names.
+    const many = [...fields.rows, ...fields.columns].map((it) => PERSON_ROLES[chipRoles[it.id] ?? ""]).find((r) => r?.idsKey)
+    const numbers = fields.values.filter((v) => isNumericType(getFieldType(v.field)) && fieldKeyModule(v.field) !== "People")
+    if (many && numbers.length > 0) {
+      const names = numbers.map((v) => fieldDisplayName(v.field)).join(", ")
+      fanoutNotice = `${names} repeats under each of the ${roleDisplayName(many.id).toLowerCase()}, so a ${baseGrain.toLowerCase()} appears under every member. Totals count each ${baseGrain.toLowerCase()} once.`
     }
   }
   const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
-  const roledRules = withFilterRoles(baseGrain, allRules)
+  const roledRules = withFilterRoles(baseGrain, allRules, source)
   const filteredRows = allRows.filter((row) => rowPassesFilters(grainModule, row, roledRules))
 
   // Timeline: a filter (the report's, a viewer's, or both) and/or a Timeline in Rows or Columns.
@@ -3909,7 +4049,7 @@ function computeReportData(
     ? applyGroupLevelFilters(sortedEntries, groupLevelRules, grainModule)
     : sortedEntries
 
-  const notices: string[] = []
+  const notices: string[] = [...roleNotices]
   const notice = (n: string) => { if (!notices.includes(n)) notices.push(n) }
   if ((tlCol || tlRow) && !canSplit) notice("Timeline splits only time-tracked metrics, and none are in Values.")
   // A Timeline split lays out one slot per period. Measures it doesn't split (no date of their own,
@@ -4181,10 +4321,10 @@ function computeTabularData(
   const allRules = viewFilterRules.length > 0 ? [...filterRules, ...viewFilterRules] : filterRules
   const pivotShape = asPivotFields(fields)
   const grainModule = pickGrainWithRoles(source, pivotShape, allRules, lookupPaths)
-  const chipRoles = resolveChipRoles(pickGrain(source, pivotShape, allRules), pivotShape, lookupPaths)
+  const chipRoles = resolveChipRoles(pickGrain(source, pivotShape, allRules), pivotShape, lookupPaths, source)
   lookupPaths = chipRoles
   const allRows: Row[] = MODULE_ROWS[grainModule] ?? []
-  const filtered = filterRowsFlat(grainModule, allRows, withFilterRoles(pickGrain(source, pivotShape, allRules), allRules))
+  const filtered = filterRowsFlat(grainModule, allRows, withFilterRoles(pickGrain(source, pivotShape, allRules), allRules, source))
 
   // The Timeline filter narrows each included time-tracked field to its period — the columns and
   // anything grouped on; every other field, and the list of records itself, is untouched.
@@ -4260,7 +4400,7 @@ function flatFieldNumericValues(
 ): number[] {
   const grainModule = pickGrain(source, fields, grainRules)
   const out: number[] = []
-  filterRowsFlat(grainModule, MODULE_ROWS[grainModule] ?? [], withFilterRoles(grainModule, scopeRules)).forEach((row) => {
+  filterRowsFlat(grainModule, MODULE_ROWS[grainModule] ?? [], withFilterRoles(grainModule, scopeRules, source)).forEach((row) => {
     const n = Number(resolveFieldForRow(grainModule, row, fieldKey, null))
     if (!Number.isNaN(n)) out.push(n)
   })
@@ -6871,6 +7011,7 @@ function FieldBrowser({
 // ── Drop zone bar ──────────────────────────────────────────────────────────────
 
 interface DropZoneBarProps {
+  source?: string
   fields: PivotFields
   dragging: boolean
   dragType: FieldType | null
@@ -6894,7 +7035,7 @@ interface DropZoneBarProps {
 }
 
 function DropZoneBar(props: DropZoneBarProps) {
-  const { fields, dragging, dragType, grainModule, lookupPaths, aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange, blockReason, notice } = props
+  const { source, fields, dragging, dragType, grainModule, lookupPaths, aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange, blockReason, notice } = props
 
   const zones: { key: PivotZoneKey; label: string; suggestValues?: boolean }[] = [
     { key: "columns", label: "Columns" },
@@ -6918,6 +7059,7 @@ function DropZoneBar(props: DropZoneBarProps) {
           dragging={dragging}
           isSuggested={!!suggestValues && !!dragType && isNumericType(dragType)}
           grainModule={grainModule}
+          source={source}
           lookupPaths={lookupPaths}
           onLookupPathChange={onLookupPathChange}
           aggregations={aggregations}
@@ -6943,13 +7085,15 @@ function DropZoneBar(props: DropZoneBarProps) {
 // pivot's handlers index PivotFields, the tabular one's index TabularFields, and neither can be
 // handed the other's zone by mistake.
 function DropZone<Z extends ZoneKey>({
-  zone, label, chips, dragging, isSuggested, grainModule, lookupPaths,
+  zone, label, chips, dragging, isSuggested, grainModule, source, lookupPaths,
   aggregations, timelineFilters, rangeConfigs, fieldFormats, onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange, blockReason,
 }: {
   zone: Z; label: string; chips: PivotItem[]; dragging: boolean
   isSuggested: boolean; aggregations: Record<string, string>
   /** The report's grain — a chip's relationship options depend on where it is resolved from. */
   grainModule: string
+  /** The report's source: a Team member chip offers the roles of this module. */
+  source?: string
   lookupPaths: Record<string, string>
   onLookupPathChange: (id: string, path: string) => void
   timelineFilters: Record<string, MetricFilter>
@@ -7107,7 +7251,7 @@ function DropZone<Z extends ZoneKey>({
                 zone={zone}
                 modifier={aggregations[item.id]}
                 lookupPath={lookupPaths[item.id]}
-                lookupOptions={availableLookupPaths(grainModule, item.field)}
+                lookupOptions={availableLookupPaths(grainModule, item.field, source)}
                 onLookupPathChange={(path) => onLookupPathChange(item.id, path)}
                 timelineFilter={timelineFilters[item.id]}
                 rangeConfig={rangeConfigs[item.id]}
@@ -7405,6 +7549,35 @@ function RangeConfigPicker({ config, bounds, type, onChange, embedded }: {
   )
 }
 
+// The roles a field can be read through: every Team member role of the report's source, in one
+// list. A one-to-many role says so, since it puts one record under several people.
+function RoleMenuList({ title, options, current, onPick }: {
+  title: string; options: string[]; current: string; onPick: (id: string) => void
+}) {
+  return (
+    <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl py-1 w-60 max-h-[360px] overflow-y-auto">
+      <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-3 pt-1.5 pb-1">{title}</p>
+      {options.map((o) => {
+        const r = PERSON_ROLES[o]
+        return (
+          <button
+            key={o}
+            onClick={() => onPick(o)}
+            className={`flex items-center justify-between gap-2 w-full px-3 py-1.5 text-[13px] text-left hover:bg-sky-50 transition-colors
+              ${current === o ? "text-sky-700 font-medium" : "text-gray-700"}`}
+          >
+            <span className="min-w-0">
+              <span className="block truncate">{roleDisplayName(o)}</span>
+              {r?.many && <span className="block text-[11px] text-gray-400 font-normal">Can be several per {r.module.toLowerCase()}</span>}
+            </span>
+            {current === o && <Ic.Check />}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timelineFilter, rangeConfig, fieldFormat, onRemove, onModifierChange, onLookupPathChange, onTimelineChange, onRangeConfigChange, onFieldFormatChange }: {
   id: string; name: string; zone: ZoneKey; modifier?: string
   /** The relationship this chip resolves through, when its module can be reached more than one way. */
@@ -7426,6 +7599,10 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
   const [showFormatMenu, setShowFormatMenu] = useState(false)
   const [showLookupMenu, setShowLookupMenu] = useState(false)
   const lookupBtnRef = useRef<HTMLButtonElement>(null)
+  const chosenRole = normalizeRoleId(lookupPath)
+  const shownRole = lookupOptions && lookupOptions.length > 0
+    ? (chosenRole && lookupOptions.includes(chosenRole) ? chosenRole : defaultLookupPath(lookupOptions))
+    : undefined
   const modifierBtnRef = useRef<HTMLButtonElement>(null)
   const dateBtnRef = useRef<HTMLButtonElement>(null)
   const formatBtnRef = useRef<HTMLButtonElement>(null)
@@ -7488,32 +7665,21 @@ function FieldChip({ id, name, zone, modifier, lookupPath, lookupOptions, timeli
           <button
             ref={lookupBtnRef}
             onClick={(e) => { e.stopPropagation(); setShowLookupMenu((p) => !p) }}
-            title={`Resolved via ${lookupPath ?? lookupOptions[0]} — click to change`}
+            title={`Resolved via ${roleDisplayName(shownRole!)} — click to change`}
             className="flex items-center gap-0.5 text-[11px] font-medium text-sky-700
               bg-sky-50 border border-sky-200 rounded px-1.5 py-px hover:bg-sky-100 transition-colors shrink-0"
           >
-            <span className="max-w-[72px] truncate">{lookupPath ?? lookupOptions[0]}</span>
+            <span className="max-w-[120px] truncate">{roleDisplayName(shownRole!)}</span>
             <Ic.ChevDown size={9} />
           </button>
           {showLookupMenu && (
             <ChipPortalMenu anchorRef={lookupBtnRef} onClose={() => setShowLookupMenu(false)}>
-              <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl py-1 w-56 overflow-hidden">
-                <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-3 pt-1.5 pb-1">
-                  Resolve this field via
-                </p>
-                {lookupOptions.map((opt) => (
-                  <button
-                    key={opt}
-                    onClick={() => { onLookupPathChange?.(opt); setShowLookupMenu(false) }}
-                    className={`flex items-center justify-between w-full px-3 py-1.5 text-[13px] text-left
-                      hover:bg-sky-50 transition-colors
-                      ${(lookupPath ?? lookupOptions[0]) === opt ? "text-sky-700 font-medium" : "text-gray-700"}`}
-                  >
-                    {opt}
-                    {(lookupPath ?? lookupOptions[0]) === opt && <Ic.Check />}
-                  </button>
-                ))}
-              </div>
+              <RoleMenuList
+                title="Resolve this field via"
+                options={lookupOptions}
+                current={shownRole!}
+                onPick={(opt) => { onLookupPathChange?.(opt); setShowLookupMenu(false) }}
+              />
             </ChipPortalMenu>
           )}
         </>
@@ -8574,8 +8740,10 @@ function CursorTooltip({ text, at }: { text: string; at: { x: number; y: number 
 
 // Which relationship a FILTER reads its field through — the filter-side twin of the role pill on
 // a chip. Only rendered where the field can be reached more than one way.
-function FilterRoleStrip({ grainModule, rule, onChange, compact, readOnly }: {
+function FilterRoleStrip({ grainModule, source, rule, onChange, compact, readOnly }: {
   grainModule: string
+  /** The report's source: a Team member filter offers the roles of this module. */
+  source?: string
   rule: FilterRule
   onChange: (patch: Partial<FilterRule>) => void
   /** Tighter padding for the view-filter rail. */
@@ -8586,15 +8754,17 @@ function FilterRoleStrip({ grainModule, rule, onChange, compact, readOnly }: {
 }) {
   const [open, setOpen] = useState(false)
   const btnRef = useRef<HTMLButtonElement>(null)
-  const options = availableLookupPaths(grainModule, rule.field)
+  const options = availableLookupPaths(grainModule, rule.field, source)
   if (options.length < 2) return null
-  const current = rule.lookupPath && options.includes(rule.lookupPath) ? rule.lookupPath : options[0]
-  const isMulti = !!ROLE_MULTI_FK[roleFkKey(grainModule, fieldKeyModule(rule.field), current)]
+  const chosen = normalizeRoleId(rule.lookupPath)
+  const current = chosen && options.includes(chosen) ? chosen : defaultLookupPath(options)!
+  const currentRole = PERSON_ROLES[current]
+  const isMulti = !!currentRole?.idsKey
   const pad = compact ? "px-2.5 py-1 text-[11px]" : "px-5 py-2 text-[12px]"
   if (readOnly) {
     return (
       <div className={`flex items-center gap-1.5 border-b border-gray-100 bg-sky-50/50 text-gray-500 ${pad}`}>
-        via <span className="font-medium text-sky-700">{current}</span>
+        via <span className="font-medium text-sky-700">{roleDisplayName(current)}</span>
       </div>
     )
   }
@@ -8607,29 +8777,22 @@ function FilterRoleStrip({ grainModule, rule, onChange, compact, readOnly }: {
         className="flex items-center gap-1 font-medium text-sky-700 bg-white border border-sky-200 rounded px-2 py-0.5
           hover:bg-sky-50 transition-colors shrink-0"
       >
-        {current}<Ic.ChevDown size={9} />
+        {roleDisplayName(current)}<Ic.ChevDown size={9} />
       </button>
       {/* A one-to-many role tests every person on the record, which is easy to get backwards. */}
       {isMulti && !compact && (
         <span className="text-gray-400 truncate">
-          a {grainModule.toLowerCase()} matches if any {current.toLowerCase().replace(/^.*\s/, "")} does
+          a {grainModule.toLowerCase()} matches if any of the {roleDisplayName(current).toLowerCase()} does
         </span>
       )}
       {open && (
         <ChipPortalMenu anchorRef={btnRef} onClose={() => setOpen(false)}>
-          <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl py-1 w-52 overflow-hidden">
-            {options.map((opt) => (
-              <button
-                key={opt}
-                onClick={() => { onChange({ lookupPath: opt }); setOpen(false) }}
-                className={`flex items-center justify-between w-full px-3 py-1.5 text-[13px] text-left hover:bg-sky-50 transition-colors
-                  ${current === opt ? "text-sky-700 font-medium" : "text-gray-700"}`}
-              >
-                {opt}
-                {current === opt && <Ic.Check />}
-              </button>
-            ))}
-          </div>
+          <RoleMenuList
+            title="Match this filter via"
+            options={options}
+            current={current}
+            onPick={(opt) => { onChange({ lookupPath: opt }); setOpen(false) }}
+          />
         </ChipPortalMenu>
       )}
     </div>
@@ -8784,7 +8947,7 @@ function CategoricalFilterModal({ rule, allRules, source, fields, aggregations, 
           </button>
         </div>
 
-        <FilterRoleStrip grainModule={pickGrain(source, fields, allRules)} rule={rule} onChange={onChange} />
+        <FilterRoleStrip grainModule={pickGrain(source, fields, allRules)} source={source} rule={rule} onChange={onChange} />
 
         {/* Sub-mode — secondary, subdued segmented control */}
         <div className="flex items-center gap-2 px-5 py-2.5 border-b border-gray-100 bg-gray-50/60">
@@ -9657,10 +9820,11 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
             people depending on whether it is read as owner, creator or member. */}
         {(() => {
           const g = pickGrain(source, fields, allRules)
-          const opts = availableLookupPaths(g, rule.field)
+          const opts = availableLookupPaths(g, rule.field, source)
           if (opts.length < 2) return null
-          const role = rule.lookupPath && opts.includes(rule.lookupPath) ? rule.lookupPath : opts[0]
-          return <span className="text-sky-700 font-normal">via {role}</span>
+          const chosen = normalizeRoleId(rule.lookupPath)
+          const role = chosen && opts.includes(chosen) ? chosen : defaultLookupPath(opts)!
+          return <span className="text-sky-700 font-normal">via {roleDisplayName(role)}</span>
         })()}
         {!isDateField && !isCategoricalField && !isNumericField && rule.operator && (
           <span className="text-gray-400 font-normal">{rule.operator}</span>
@@ -10368,6 +10532,7 @@ function ViewFilterCard({ rule, baseRules, source, fields, aggregations, rangeCo
 
       <FilterRoleStrip
         grainModule={pickGrain(source, fields, [...baseRules, rule])}
+        source={source}
         rule={rule}
         onChange={onChange}
         compact
@@ -10529,10 +10694,11 @@ function ViewFilterPane({
 // The tabular equivalent of DropZoneBar: two shelves instead of three. DropZone itself is
 // reused unchanged — it is generic over its zone key and agnostic about what the chips mean.
 function TabularZoneBar({
-  fields, dragging, grainModule, lookupPaths, aggregations, rangeConfigs, fieldFormats,
+  source, fields, dragging, grainModule, lookupPaths, aggregations, rangeConfigs, fieldFormats,
   onDrop, onMove, onReorder, onRemove, onAggChange, onLookupPathChange, onRangeConfigChange, onFieldFormatChange, blockReason,
 }: {
   blockReason?: (zone: TabularZoneKey, field: string, id?: string) => string | null
+  source?: string
   fields: TabularFields
   dragging: boolean
   grainModule: string
@@ -10567,6 +10733,7 @@ function TabularZoneBar({
           dragging={dragging}
           isSuggested={false}
           grainModule={grainModule}
+          source={source}
           lookupPaths={lookupPaths}
           onLookupPathChange={onLookupPathChange}
           aggregations={aggregations}
@@ -11208,6 +11375,7 @@ function TabularBuilder() {
         {reportMode === "create" && (
           <BuildPanel>
             <TabularZoneBar
+              source={source}
               fields={fields}
               dragging={dragging}
               grainModule={grainModule}
@@ -12949,6 +13117,7 @@ export default function App() {
               {reportMode === "create" && (
                 <BuildPanel>
                   <DropZoneBar
+                    source={source}
                     fields={fields}
                     dragging={dragging}
                     dragType={dragType}
