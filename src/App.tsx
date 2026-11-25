@@ -7550,7 +7550,7 @@ function RangeConfigPicker({ config, bounds, type, onChange, embedded }: {
 }
 
 // The roles a field can be read through: every Team member role of the report's source, in one
-// list. A one-to-many role says so, since it puts one record under several people.
+// list.
 function RoleMenuList({ title, options, current, onPick }: {
   title: string; options: string[]; current: string; onPick: (id: string) => void
 }) {
@@ -7558,7 +7558,6 @@ function RoleMenuList({ title, options, current, onPick }: {
     <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl py-1 w-60 max-h-[360px] overflow-y-auto">
       <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-3 pt-1.5 pb-1">{title}</p>
       {options.map((o) => {
-        const r = PERSON_ROLES[o]
         return (
           <button
             key={o}
@@ -7568,7 +7567,6 @@ function RoleMenuList({ title, options, current, onPick }: {
           >
             <span className="min-w-0">
               <span className="block truncate">{roleDisplayName(o)}</span>
-              {r?.many && <span className="block text-[11px] text-gray-400 font-normal">Can be several per {r.module.toLowerCase()}</span>}
             </span>
             {current === o && <Ic.Check />}
           </button>
@@ -9327,6 +9325,8 @@ function NumericFilterModal({ rule, allRules, source, fields, aggregations, rang
           </button>
         </div>
 
+        <FilterRoleStrip grainModule={pickGrain(source, fields, allRules)} source={source} rule={rule} onChange={onChange} />
+
         {/* Sub-mode — secondary, subdued segmented control */}
         <div className="flex items-center gap-2 px-5 py-2.5 border-b border-gray-100 bg-gray-50/60">
           <div className="flex items-center rounded-md border border-gray-200 p-0.5 bg-white flex-1">
@@ -9863,7 +9863,9 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
       {open && isDateField && (
         <DateFilterModal
           rule={rule} onChange={onChange} onClose={() => setOpen(false)}
-          strip={isTimeline ? <TimelineAppliesStrip rule={rule} fields={fields} onChange={onChange} /> : undefined}
+          strip={isTimeline
+            ? <TimelineAppliesStrip rule={rule} fields={fields} onChange={onChange} />
+            : <FilterRoleStrip grainModule={pickGrain(source, fields, allRules)} source={source} rule={rule} onChange={onChange} />}
           timelineMetricKeys={isTimeline ? timelineGovernedKeys(fields, rule) : undefined}
         />
       )}
@@ -9889,6 +9891,7 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
       {/* Boolean inline panel */}
       {open && !isDateField && !isCategoricalField && !isNumericField && (
         <div className="absolute top-full left-0 mt-1 z-50 bg-white border border-gray-200 rounded-xl shadow-2xl w-72 overflow-hidden">
+          <FilterRoleStrip grainModule={pickGrain(source, fields, allRules)} source={source} rule={rule} onChange={onChange} compact />
           <div className="p-4 pb-3">
             {/* Field label */}
             <div className="flex items-center gap-2 mb-3">
