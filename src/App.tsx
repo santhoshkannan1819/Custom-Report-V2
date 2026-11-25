@@ -8004,6 +8004,10 @@ interface FilterRule {
   vfComponent: ViewFilterComponent | ""       // "" = the field type's default component
   vfListMode: "all" | "selected"              // offer every value, or only vfOfferedValues
   vfOfferedValues: string[]                   // the builder's allow-list when vfListMode="selected"
+  /** Range view filters: the dates a viewer may pick between. "any" (default) = no limit. */
+  vfRangeLimit?: "any" | "specified"
+  vfRangeFrom?: string
+  vfRangeTo?: string
 }
 
 // How a view filter draws itself. The first group applies to text/person/boolean/date fields,
@@ -10039,6 +10043,49 @@ function FilterChip({ rule, allRules, source, fields, aggregations, rangeConfigs
   )
 }
 
+// A relative-period picker on one line. "Last N quarters" reads as "Last [6] quarters", with the
+// count typed in place, instead of a dropdown with a separate number box under it.
+function RelativePeriodControl({ options, value, n, onChange, onNChange }: {
+  options: string[]; value: string; n: number
+  onChange: (opt: string) => void; onNChange: (n: number) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  const m = value.match(/^(Last|Next) N (.+)$/)
+  return (
+    <div ref={ref} className="flex items-center w-full border border-gray-200 rounded-md bg-white px-2 py-1 text-[12px] text-gray-700">
+      {m ? (
+        <>
+          <span className="cursor-pointer" onClick={() => setOpen((p) => !p)}>{m[1]}</span>
+          <input
+            type="number" min={1} value={n}
+            onChange={(e) => onNChange(Math.max(1, Number(e.target.value) || 1))}
+            className="w-10 mx-1.5 px-1 py-0.5 text-center text-gray-800 border border-gray-200 rounded focus:outline-none focus:border-indigo-400"
+          />
+          <span className="flex-1 cursor-pointer" onClick={() => setOpen((p) => !p)}>{m[2]}</span>
+        </>
+      ) : (
+        <span className="flex-1 cursor-pointer py-0.5" onClick={() => setOpen((p) => !p)}>{value || "(Any time)"}</span>
+      )}
+      <button onClick={() => setOpen((p) => !p)} className="text-gray-400 hover:text-gray-600 shrink-0 ml-1"><Ic.ChevDown size={10} /></button>
+      {open && (
+        <ChipPortalMenu anchorRef={ref} onClose={() => setOpen(false)}>
+          <div className="mt-1 bg-white border border-gray-200 rounded-lg shadow-2xl py-1 w-52">
+            {["", ...options].map((o) => (
+              <button key={o || "any"} onClick={() => { onChange(o); setOpen(false) }}
+                className={`flex items-center justify-between w-full px-3 py-1.5 text-[12px] text-left hover:bg-indigo-50
+                  ${o === value ? "text-indigo-700 font-medium" : "text-gray-700"}`}>
+                {o ? o.replace(/ N /, " … ") : "(Any time)"}
+                {o === value && <Ic.Check />}
+              </button>
+            ))}
+          </div>
+        </ChipPortalMenu>
+      )}
+    </div>
+  )
+}
+
 // ── View filters pane ──────────────────────────────────────────────────────────
 
 // One view filter, rendered as an always-open inline control rather than a chip that opens a
@@ -10142,6 +10189,53 @@ function ViewFilterSettings({ rule, options, anchorRef, flat, onChange, onClose 
             </select>
             )}
           </div>
+
+          {/* Relative: the granularity decides which relative periods the viewer's list offers
+              (This month, Last N months… or This quarter, Last N quarters…). */}
+          {isDateField && (rule.dateMode ?? "actual") === "relative" && (
+            <div>
+              <label className="text-[11px] text-gray-500 block mb-1">Granularity</label>
+              <select
+                value={rule.dateGranularity || "Month & Year"}
+                onChange={(e) => onChange({ dateGranularity: e.target.value, dateRelativeOpt: "", dateRelativeN: 1 })}
+                className={selectCls}
+              >
+                {FILTER_GRANULARITIES.map((g) => <option key={g.key} value={g.key}>{g.label}</option>)}
+              </select>
+            </div>
+          )}
+
+          {/* Range: the dates a viewer may pick between. */}
+          {isDateField && (rule.dateMode ?? "actual") === "range" && (
+            <div>
+              <label className="text-[11px] text-gray-500 block mb-1.5">Choose values</label>
+              <div className="bg-gray-50 rounded-md px-2.5 py-2 flex flex-col gap-2">
+                <div className="flex items-center gap-4">
+                  {([["any", "Any date range"], ["specified", "Specified date range"]] as const).map(([key, label]) => (
+                    <label key={key} onClick={() => onChange({ vfRangeLimit: key })} className="flex items-center gap-1.5 cursor-pointer select-none">
+                      <span className={`w-3 h-3 rounded-full border-2 shrink-0 flex items-center justify-center
+                        ${(rule.vfRangeLimit ?? "any") === key ? "border-indigo-600" : "border-gray-300"}`}>
+                        {(rule.vfRangeLimit ?? "any") === key && <span className="w-1.5 h-1.5 rounded-full bg-indigo-600" />}
+                      </span>
+                      <span className="text-[11px] text-gray-700">{label}</span>
+                    </label>
+                  ))}
+                </div>
+                {(rule.vfRangeLimit ?? "any") === "specified" && (
+                  <div className="grid grid-cols-[32px_1fr] items-center gap-x-1.5 gap-y-1.5">
+                    <span className="text-[11px] text-gray-500">From</span>
+                    <input type="date" value={rule.vfRangeFrom ?? ""} max={rule.vfRangeTo || undefined}
+                      onChange={(e) => onChange({ vfRangeFrom: e.target.value })}
+                      className={`${selectCls} min-w-0`} />
+                    <span className="text-[11px] text-gray-500">To</span>
+                    <input type="date" value={rule.vfRangeTo ?? ""} min={rule.vfRangeFrom || undefined}
+                      onChange={(e) => onChange({ vfRangeTo: e.target.value })}
+                      className={`${selectCls} min-w-0`} />
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Aggregate — only meaningful when there are groups to aggregate over */}
           {isNumericField && !flat && (
@@ -10399,26 +10493,23 @@ function ViewFilterCard({ rule, baseRules, source, fields, aggregations, rangeCo
     // A relative window is inherently one choice, so it's a single select regardless of the
     // component picker (which the settings popup hides for this period type).
     body = (
-      <div className="px-2.5 py-2 flex flex-col gap-1.5">
-        <select
+      <div className="px-2.5 py-2">
+        <RelativePeriodControl
+          options={relOptions}
           value={rule.dateRelativeOpt || ""}
-          onChange={(e) => onChange({ dateRelativeOpt: e.target.value })}
-          className={selectCls}
-        >
-          <option value="">(Any time)</option>
-          {relOptions.map((o) => <option key={o} value={o}>{o}</option>)}
-        </select>
-        {isNInput(rule.dateRelativeOpt || "") && (
-          <input
-            type="number" min={1} value={rule.dateRelativeN || 1}
-            onChange={(e) => onChange({ dateRelativeN: Math.max(1, Number(e.target.value) || 1) })}
-            className={selectCls}
-          />
-        )}
+          n={rule.dateRelativeN || 1}
+          onChange={(opt) => onChange({ dateRelativeOpt: opt })}
+          onNChange={(n) => onChange({ dateRelativeN: n })}
+        />
       </div>
     )
   } else if (isDateField && dateMode === "range") {
     const op = rule.dateRangeOp ?? "after"
+    // The builder can limit the dates a viewer may pick ("Specified date range").
+    const limited = rule.vfRangeLimit === "specified"
+    const minD = limited && rule.vfRangeFrom ? rule.vfRangeFrom : undefined
+    const maxD = limited && rule.vfRangeTo ? rule.vfRangeTo : undefined
+    const clamp = (v: string) => (!v ? v : minD && v < minD ? minD : maxD && v > maxD ? maxD : v)
     body = (
       <div className="px-2.5 py-2 flex flex-col gap-1.5">
         <select
@@ -10431,16 +10522,21 @@ function ViewFilterCard({ rule, baseRules, source, fields, aggregations, rangeCo
           <option value="between">Between</option>
         </select>
         <input
-          type="date" value={rule.dateFrom || ""}
-          onChange={(e) => onChange({ dateFrom: e.target.value })}
+          type="date" value={rule.dateFrom || ""} min={minD} max={maxD}
+          onChange={(e) => onChange({ dateFrom: clamp(e.target.value) })}
           className={selectCls}
         />
         {op === "between" && (
           <input
-            type="date" value={rule.dateTo || ""}
-            onChange={(e) => onChange({ dateTo: e.target.value })}
+            type="date" value={rule.dateTo || ""} min={rule.dateFrom || minD} max={maxD}
+            onChange={(e) => onChange({ dateTo: clamp(e.target.value) })}
             className={selectCls}
           />
+        )}
+        {(minD || maxD) && (
+          <p className="text-[10px] text-gray-400">
+            {minD && maxD ? `${fmtCalDate(minD)} – ${fmtCalDate(maxD)}` : minD ? `From ${fmtCalDate(minD)}` : `Until ${fmtCalDate(maxD!)}`}
+          </p>
         )}
       </div>
     )
