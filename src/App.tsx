@@ -238,7 +238,7 @@ const MODULES: Module[] = [
     iconType: "account",
     canBeSource: true,
     fields: [
-      { name: "Company Name", type: "text" },
+      { name: "Account Name", type: "text" },
       { name: "Account Owner", type: "person" },
       { name: "ARR", type: "money" },
       { name: "Account Stage", type: "text" },
@@ -260,19 +260,20 @@ const MODULES: Module[] = [
       { name: "Budget Name", type: "text" },
       { name: "Project Budget", type: "money" },
       { name: "Budget Tracked Minutes", type: "hours" },
-      { name: "Budget Remaining Minutes", type: "hours" },
+      { name: "Remaining Hours", type: "hours" },
       { name: "Estimate At Completion", type: "money" },
       { name: "Revenue Recognition Type", type: "text" },
       { name: "Budgeted Hours", type: "hours" },
       { name: "Billing Method", type: "text" },
       { name: "Is Default", type: "boolean" },
       { name: "Budget End Date", type: "date" },
+      { name: "Actual Completed Date", type: "date" },
       { name: "Budget Start Date", type: "date" },
       { name: "Budget Actual Cost", type: "money" },
       { name: "Budget Actual Revenue", type: "money" },
       { name: "Budget Estimated Cost", type: "money" },
       { name: "Budget Estimated Revenue", type: "money" },
-      { name: "Status", type: "text" },
+      { name: "Budget Status", type: "text" },
       { name: "Budget Actual Time Cost", type: "money" },
       { name: "Budget Estimated Time Cost", type: "money" },
       { name: "Budget Actual Expense Cost", type: "money" },
@@ -285,7 +286,7 @@ const MODULES: Module[] = [
       { name: "Period End Date", type: "date" },
       { name: "Period Revenue", type: "money" },
       { name: "Period Budget", type: "money" },
-      { name: "Budget Current Period Total Time Tracked", type: "hours" },
+      { name: "Period tracked time", type: "hours" },
       { name: "Created At", type: "date" },
       { name: "Updated At", type: "date" },
     ],
@@ -309,7 +310,7 @@ const MODULES: Module[] = [
     iconType: "people",
     canBeSource: true,
     fields: [
-      { name: "Team member name", type: "person" },
+      { name: "Team member Name", type: "person" },
       { name: "Cost rate", type: "money" },
       { name: "Team member type", type: "text" },
       { name: "Team member status", type: "text" },
@@ -836,7 +837,7 @@ function getCurrentUserName(): string {
     // Default to the owner of the first project rather than the first name on the list: the
     // first name owns nothing in the sample data, so a "my projects" report would open empty
     // and read as broken.
-    const fallback = String(PEOPLE_BY_ID[PROJECTS[0]?.ownerId]?.["Team member name"] ?? PERSON_NAMES[0])
+    const fallback = String(PEOPLE_BY_ID[PROJECTS[0]?.ownerId]?.["Team member Name"] ?? PERSON_NAMES[0])
     try { CURRENT_USER_NAME = localStorage.getItem(CURRENT_USER_KEY) || fallback }
     catch { CURRENT_USER_NAME = fallback }
   }
@@ -1213,7 +1214,8 @@ interface FormulaDef {
 // Final V2 field names (2026-11-26): a field that exists in today's Custom Reports keeps its V1
 // name exactly; new fields use V2's names. Keys are the previous "Module::Field" names.
 const FIELD_RENAMES: Record<string, string> = {
- "Account::Company name": "Company Name",
+ "Account::Company name": "Account Name",
+ "Account::Company Name": "Account Name",
  "Account::Company type": "Company Type",
  "Account::Is active": "Is Active",
  "Account::Is strategic": "Is Strategic",
@@ -1361,7 +1363,11 @@ const FIELD_RENAMES: Record<string, string> = {
  "Budget::Current period no.": "Current Period Number",
  "Budget::Current period start": "Period Start Date",
  "Budget::Current period end": "Period End Date",
- "Budget::Current period tracked time": "Budget Current Period Total Time Tracked",
+ "Budget::Current period tracked time": "Period tracked time",
+ "Budget::Budget Current Period Total Time Tracked": "Period tracked time",
+ "Budget::Budget Remaining Minutes": "Remaining Hours",
+ "Budget::Status": "Budget Status",
+ "People::Team member name": "Team member Name",
  "Project::Project status": "Status",
  "Project::Actual end date": "Actual Completed Date",
  "Project::Last status update": "Last Project Update",
@@ -2735,6 +2741,8 @@ BUDGETS.forEach((b) => {
   const periodStart = addDays(subStart, (periodNo - 1) * 30)
   const periodEntries = tasks.flatMap((t) => TIME_BY_TASK[t.id] ?? []).filter((e) => e["Created date"] >= periodStart)
   b["Status"] = status === "Completed" || status === "Cancelled" ? "Completed" : status === "Not Started" ? "Proposed" : "Active"
+  // When the budget actually ended — only set once it is completed, as the product shows it.
+  b["Actual Completed Date"] = b["Status"] === "Completed" ? b["Budget End Date"] : null
   b["Actual time cost"] = b["Budget Actual Cost"]
   b["Estimated time cost"] = b["Budget Estimated Cost"]
   b["Actual expense cost"] = tasks.reduce((s, t) => s + sumBy(EXPENSE_BY_TASK[t.id] ?? [], "Amount"), 0)
@@ -2878,7 +2886,7 @@ const ROLE_GRAIN: Record<string, string> = {
 }
 const roleFkKey = (grain: string, target: string, role: string) => `${grain}|${target}|${role}`
 
-const PEOPLE_BY_NAME: Record<string, Row> = Object.fromEntries(PEOPLE.map((p) => [p["Team member name"], p]))
+const PEOPLE_BY_NAME: Record<string, Row> = Object.fromEntries(PEOPLE.map((p) => [p["Team member Name"], p]))
 
 // The person (or people) a record names in this role. An array for a one-to-many role.
 function personsForRow(grainModule: string, row: Row, role: PersonRole): Row | Row[] | undefined {
