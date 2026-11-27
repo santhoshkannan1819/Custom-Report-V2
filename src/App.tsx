@@ -4540,23 +4540,63 @@ function computeTabularData(
   const tlWindow = combinedTimelineWindow(filterRules, viewFilterRules)
   const tlWindowFor = (item: PivotItem) => (tlWindow && followsTimeline(item, tlRule) ? tlWindow : null)
 
-  const groupLabelers = fields.groupBy.map((item) =>
+  // Timeline in Group by works as it does in a pivot's Rows: it isn't a value a record has, so it
+  // doesn't label records — it lays each record out once per period its time-tracked columns have
+  // records in. Columns the Timeline doesn't split (no date of their own, or exempted) show once,
+  // on a leading row with no period label, and are never repeated under each period.
+  const tlAt = fields.groupBy.findIndex((c) => c.field === TIMELINE_KEY)
+  const tlItem = tlAt >= 0 ? fields.groupBy[tlAt] : null
+  const tlGran = (tlItem && groupByAggregations[tlItem.id]) || "Month & Year"
+  const splitCols = fields.columns.filter((c) => followsTimeline(c, tlRule))
+  // Numbers the Timeline doesn't split (Budgeted Hours) never sit under a period: they go on the
+  // leading row. Text, date, person and Yes/No columns describe the record, so — like Rows fields
+  // in a pivot — they show on every row.
+  const isUnsplitNumber = (c: PivotItem) =>
+    !followsTimeline(c, tlRule) && (isFormulaKey(c.field) || isNumericType(getFieldType(c.field)))
+  const hasUnsplitCols = fields.columns.some(isUnsplitNumber)
+  const tlSplits = !!tlItem && splitCols.length > 0
+
+  const labelItems = fields.groupBy.filter((c) => c.field !== TIMELINE_KEY)
+  const groupLabelers = labelItems.map((item) =>
     buildLabeler(grainModule, filtered, item, groupByAggregations, rangeConfigs, lookupPaths, tlWindowFor(item)))
 
   const compareKey = (a: number | string, b: number | string) =>
     typeof a === "number" && typeof b === "number" ? a - b : String(a).localeCompare(String(b))
 
+  type Slot = { label: string; sortKey: number; window: DateWindow | null; unsplit: boolean }
+  const slotsFor = (row: Row): Slot[] => {
+    if (!tlItem) return [{ label: "", sortKey: 0, window: null, unsplit: false }]
+    if (!tlSplits) return [{ label: "All time", sortKey: 0, window: null, unsplit: false }]
+    const starts = new Set<number>()
+    splitCols.forEach((item) => metricRecordTimes(grainModule, row, item.field).forEach((t) => {
+      if (!tlWindow || tlWindow(t)) starts.add(periodStart(new Date(t), tlGran).getTime())
+    }))
+    const periods: Slot[] = [...starts].map((t) => {
+      const p = periodOf(t, tlGran)
+      return { label: p.label, sortKey: t, window: spanWindow(p.window), unsplit: false }
+    })
+    // A record with no time still keeps its row, so "all projects" stays all of them.
+    if (hasUnsplitCols || periods.length === 0) periods.unshift({ label: "", sortKey: -Infinity, window: null, unsplit: true })
+    return periods
+  }
+
   // Sort by the group tuple so rows sharing a group are contiguous — that contiguity is what
   // lets the renderer span a group's label cell down its rows.
-  const decorated = filtered.map((row) => ({
-    row,
-    labels: groupLabelers.map((l) => l.label(row)),
-    sortKeys: groupLabelers.map((l) => l.sortKey(row)),
-  }))
-  if (groupLabelers.length > 0) {
+  const decorated = filtered.flatMap((row) => {
+    const labels = groupLabelers.map((l) => l.label(row))
+    const sortKeys: (number | string)[] = groupLabelers.map((l) => l.sortKey(row))
+    return slotsFor(row).map((slot) => {
+      const ls = [...labels], ks = [...sortKeys]
+      if (tlItem) { ls.splice(tlAt, 0, slot.label); ks.splice(tlAt, 0, slot.sortKey) }
+      return { row, slot, labels: ls, sortKeys: ks }
+    })
+  })
+  if (fields.groupBy.length > 0) {
     const dir = groupSortDir === "desc" ? -1 : 1
     decorated.sort((a, b) => {
       for (let i = 0; i < a.sortKeys.length; i++) {
+        // The leading no-period row stays first whichever way the groups are sorted, as in a pivot.
+        if (i === tlAt && a.slot.unsplit !== b.slot.unsplit) return a.slot.unsplit ? -1 : 1
         const c = compareKey(a.sortKeys[i], b.sortKeys[i])
         if (c !== 0) return c * dir
       }
@@ -4564,10 +4604,23 @@ function computeTabularData(
     })
   }
 
-  const rows: TabularRow[] = decorated.slice(0, TABULAR_ROW_CAP).map(({ row, labels }) => ({
+  const built: (TabularRow & { unsplit: boolean })[] = decorated.map(({ row, slot, labels }) => ({
+    unsplit: tlSplits && slot.unsplit,
     groupLabels: labels,
     cells: fields.columns.map((item) => {
-      const raw = resolveFieldForRow(grainModule, row, item.field, tlWindowFor(item), lookupPaths[item.id])
+      let window = tlWindowFor(item)
+      if (tlSplits) {
+        const follows = followsTimeline(item, tlRule)
+        // Time-tracked numbers show only on period rows; other numbers only on the leading row.
+        if (follows && slot.unsplit) return { raw: null, text: "" }
+        if (isUnsplitNumber(item) && !slot.unsplit) return { raw: null, text: "" }
+        if (follows) {
+          window = intersectWindows(slot.window, tlWindow)
+          // Nothing recorded in this period: blank, not a zero that reads as a real figure.
+          if (!metricRecordTimes(grainModule, row, item.field).some((t) => !window || window(t))) return { raw: null, text: "" }
+        }
+      }
+      const raw = resolveFieldForRow(grainModule, row, item.field, window, lookupPaths[item.id])
       let text = tabularCellText(raw, item, fieldFormats)
       // Simpler than the pivot's version of this setting: a tabular row IS one record, so its
       // currency is unambiguous — no mixed-currency group to suppress the tag for.
@@ -4578,8 +4631,20 @@ function computeTabularData(
       return { raw, text }
     }),
   }))
+  // The leading no-period rows carry values that belong above the rows' own records (a project's
+  // Budgeted Hours on every one of its time entries). Identical ones collapse into one, so each
+  // project's budget shows once — as it does in a pivot.
+  const seen = new Set<string>()
+  const deduped = built.filter((r) => {
+    if (!r.unsplit) return true
+    const key = [...r.groupLabels, ...r.cells.map((c) => c.text)].join("␟")
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+  const rows: TabularRow[] = deduped.slice(0, TABULAR_ROW_CAP).map(({ groupLabels, cells }) => ({ groupLabels, cells }))
 
-  return { grainModule, rows, totalCount: decorated.length }
+  return { grainModule, rows, totalCount: deduped.length }
 }
 
 // formatCellValue only knows numbers, and a flat table shows dates, text and booleans too —
@@ -11505,9 +11570,12 @@ function TabularBuilder() {
   const listKey = (z: TabularZoneKey) => (z === "tabGroupBy" ? "groupBy" : "columns") as keyof TabularFields
 
   const addField = (zone: TabularZoneKey, field: string, type: FieldType) => {
-    // A flat list has one row per record, so there is nothing to split by period. The Timeline
-    // still works here as a filter.
-    if (field === TIMELINE_KEY) return
+    // Timeline groups records by period (as in a pivot's Rows), so it belongs in Group by only;
+    // a click from the field browser lands it there. It needs a time-tracked field first.
+    if (field === TIMELINE_KEY) {
+      if (timelineBlocked) return
+      zone = "tabGroupBy"
+    }
     // A formula is a number worked out per record — a column, never a group.
     if (isFormulaKey(field) && zone === "tabGroupBy") return
     // One appearance per field. Both shelves feed the same flat row, so a second copy would
@@ -11524,7 +11592,8 @@ function TabularBuilder() {
     // Only a grouping field gets a modifier; a column shows its raw value.
     if (zone === "tabGroupBy") {
       let mod: string | undefined
-      if (isNumericType(type)) mod = "Dimension"
+      if (field === TIMELINE_KEY) mod = "Month & Year"
+      else if (isNumericType(type)) mod = "Dimension"
       else if (type === "date") mod = "Quarter & Year"
       if (mod) setAggregations((prev) => ({ ...prev, [id]: mod! }))
     }
@@ -11546,6 +11615,7 @@ function TabularBuilder() {
   const moveField = (from: TabularZoneKey, to: TabularZoneKey, id: string) => {
     const fk = listKey(from), tk = listKey(to)
     if (to === "tabGroupBy" && fields[fk].some((it) => it.id === id && isFormulaKey(it.field))) return
+    if (to === "tabColumns" && fields[fk].some((it) => it.id === id && it.field === TIMELINE_KEY)) return
     setFields((prev) => {
       const item = prev[fk].find((it) => it.id === id)
       if (!item) return prev
